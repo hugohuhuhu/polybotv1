@@ -1,0 +1,282 @@
+﻿<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Polymarket 錯價監看台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v17" />
+  </head>
+  <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+    <div class="ambient ambient-c"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <p class="eyebrow">POLYMARKET MISPRICING MONITOR</p>
+        <h1>Polymarket 錯價監看台</h1>
+        <p class="subtitle">集中查看掃描結果、交易前置檢查、已成交紀錄與目前風控狀態。</p>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="status-chip" id="statusChip">
+          <span class="status-dot"></span>
+          <span id="statusText">等待同步</span>
+        </div>
+        <button class="scan-button" id="scanButton" type="button">立即掃描</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="risk-banner hidden" id="riskBanner"></section>
+
+      <section class="hero-card">
+        <div>
+          <p class="hero-label">控制中心</p>
+          <h2>把掃描、風控與交易紀錄集中在同一個遠端面板</h2>
+          <p class="hero-copy">
+            這個頁面會固定自動刷新，讓你在瀏覽器直接看目前市場探索、候選機會、執行紀錄與資料持久化狀態。
+          </p>
+        </div>
+
+        <div class="hero-meta">
+          <div class="hero-meta-card">
+            <span>自動刷新</span>
+            <strong id="refreshLabel">{{ refresh_sec }} 秒</strong>
+            <small class="countdown-copy" id="scanCountdownLabel">尚未同步</small>
+            <div class="countdown-bar" aria-hidden="true">
+              <span id="scanCountdownBar"></span>
+            </div>
+          </div>
+          <div class="hero-meta-card">
+            <span>最後更新</span>
+            <strong id="lastUpdatedLabel">尚未同步</strong>
+          </div>
+          <div class="hero-meta-card">
+            <span>持久化後端</span>
+            <strong id="persistenceLabel">等待同步</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel execution-panel">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">執行紀錄</p>
+            <h3>委託狀態</h3>
+          </div>
+        </div>
+        <div class="feed-list execution-list" id="executionFeed">
+          <p class="empty-block">尚未有執行事件。</p>
+        </div>
+      </section>
+
+      <section class="panel trade-journal-panel">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">交易紀錄</p>
+            <h3>已成交交易與獲利估算</h3>
+          </div>
+          <p class="panel-note">一打開頁面就先看到最近成交、未平倉與累計已實現損益。</p>
+        </div>
+        <div class="trade-pnl-card">
+          <span>pUSD 餘額變化</span>
+          <strong id="tradePnlValue">-</strong>
+          <p id="tradePnlMeta">目前沒有任何交易紀錄</p>
+          <small id="tradePnlNote">若尚未成交，這個區塊會保持空白提示。</small>
+        </div>
+        <div class="feed-list" id="positionFeed">
+          <p class="empty-block">目前沒有任何交易。</p>
+        </div>
+      </section>
+
+      <section class="control-strip">
+        <article class="control-card" id="tradingCard">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">交易控制</p>
+              <h3>監看與交易開關</h3>
+            </div>
+            <p class="panel-note">watch、Live、自動下單與緊急停止都集中在這裡。</p>
+          </div>
+          <div class="armed-indicator hidden" id="armedIndicator" aria-live="polite">
+            <span class="armed-indicator__icon" aria-hidden="true">
+              <span class="armed-indicator__pulse"></span>
+            </span>
+            <div>
+              <strong>武裝成功</strong>
+              <p>背景監看命中可交易機會時，會直接走真實執行流程。</p>
+            </div>
+          </div>
+          <p class="control-copy" id="tradingSummary">目前是純掃描模式，尚未啟用 Live 交易。</p>
+          <p class="control-copy" id="riskSummaryNote">風控摘要尚未同步。</p>
+          <div class="toggle-grid">
+            <article class="toggle-card">
+              <span class="toggle-card__label">watch</span>
+              <p class="toggle-card__note">控制背景自動掃描是否持續運行。</p>
+              <button class="control-button watch-toggle" id="watchToggle" type="button">啟動 watch</button>
+            </article>
+            <article class="toggle-card">
+              <span class="toggle-card__label">Live</span>
+              <p class="toggle-card__note">決定是否允許真實送單。</p>
+              <button class="control-button" id="liveTradingToggle" type="button">啟用 Live 模式</button>
+            </article>
+            <article class="toggle-card">
+              <span class="toggle-card__label">自動下單</span>
+              <p class="toggle-card__note">掃描命中後是否自動執行交易。</p>
+              <button class="control-button caution" id="autoExecuteToggle" type="button">啟用自動下單</button>
+            </article>
+            <article class="toggle-card toggle-card--emergency">
+              <span class="toggle-card__label">緊急停止</span>
+              <p class="toggle-card__note">立即阻擋所有 Live 送單。</p>
+              <button class="control-button emergency" id="killSwitchToggle" type="button">緊急停止</button>
+            </article>
+          </div>
+        </article>
+
+        <article class="control-card">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">錢包狀態</p>
+              <h3>私鑰對應錢包</h3>
+            </div>
+            <p class="panel-note">後端只讀地址與餘額，不會把私鑰送到瀏覽器。</p>
+          </div>
+          <p class="control-copy" id="walletStatusNote">尚未輸入私鑰</p>
+          <div class="wallet-grid">
+            <article class="wallet-item wallet-item-wide">
+              <span>錢包地址</span>
+              <strong id="walletAddress">-</strong>
+            </article>
+            <article class="wallet-item">
+              <span>POL Gas</span>
+              <strong id="walletPol">-</strong>
+            </article>
+            <article class="wallet-item">
+              <span>USDC</span>
+              <strong id="walletUsdc">-</strong>
+            </article>
+            <article class="wallet-item">
+              <span>pUSD</span>
+              <strong id="walletPusd">-</strong>
+            </article>
+          </div>
+        </article>
+
+        <article class="control-card preflight-card">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">LIVE PREFLIGHT</p>
+              <h3>交易前置檢查</h3>
+            </div>
+            <p class="panel-note">只做檢查，不會自動 approve、wrap 或送單。</p>
+          </div>
+          <p class="control-copy" id="preflightSummary">等待前置檢查同步。</p>
+          <div class="preflight-list" id="preflightList">
+            <p class="empty-block">尚未建立檢查報告。</p>
+          </div>
+        </article>
+      </section>
+
+      <section class="summary-grid" id="summaryGrid">
+        <article class="metric-card">
+          <span class="metric-label">已探索市場</span>
+          <strong class="metric-value">-</strong>
+          <p class="metric-footnote">等待資料</p>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <section class="panel panel-wide">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">核心結果</p>
+              <h3>候選機會列表</h3>
+            </div>
+            <p class="panel-note">依淨邊際、信心與可成交量排序。</p>
+          </div>
+          <div class="criteria-funnel" id="criteriaFunnel" aria-label="候選機會篩選漏斗">
+            <article class="criteria-stage">
+              <div>
+                <span>等待掃描資料</span>
+                <p>完成下一輪掃描後，這裡會依序顯示每一關剩下多少市場。</p>
+              </div>
+              <div class="criteria-count">
+                <strong>-</strong>
+                <small>尚未同步</small>
+              </div>
+            </article>
+          </div>
+          <div class="table-shell">
+            <table class="opportunity-table">
+              <thead>
+                <tr>
+                  <th>策略</th>
+                  <th>市場</th>
+                  <th>淨邊際</th>
+                  <th>流動性</th>
+                  <th>信心</th>
+                  <th>建議</th>
+                </tr>
+              </thead>
+              <tbody id="opportunityRows">
+                <tr>
+                  <td colspan="6" class="empty-cell">目前沒有候選機會，請先執行一次掃描。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">策略熱區</p>
+              <h3>策略分布</h3>
+            </div>
+          </div>
+          <div class="strategy-stack" id="strategyStack">
+            <p class="empty-block">尚未有策略統計資料。</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">最近警示</p>
+              <h3>警示紀錄</h3>
+            </div>
+          </div>
+          <div class="feed-list" id="alertFeed">
+            <p class="empty-block">尚未送出任何警示。</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">市場覆蓋</p>
+              <h3>高流動性市場</h3>
+            </div>
+          </div>
+          <div class="market-list" id="marketList">
+            <p class="empty-block">尚未同步市場資料。</p>
+          </div>
+        </section>
+      </section>
+
+      <section class="footer-card">
+        <p id="persistenceNote">等待持久化狀態同步。</p>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v17" defer></script>
+  </body>
+</html>
+

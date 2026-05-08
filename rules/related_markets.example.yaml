@@ -1,0 +1,24 @@
+rules:
+  - rule_id: "microstrategy_q1_lte_q2"
+    description: "較早截止日期的事件不應高於較晚截止日期"
+    kind: "less_than_or_equal"
+    left:
+      slug: "microstrategy-sells-any-bitcoin-by-march-31-2026"
+      outcome: "Yes"
+    right:
+      slug: "microstrategy-sells-any-bitcoin-by-june-30-2026"
+      outcome: "Yes"
+    tolerance: 0.01
+
+  - rule_id: "party_nominee_branches_lte_party"
+    description: "各候選分支總和不應高於整體政黨勝出市場"
+    kind: "sum_less_than_or_equal"
+    components:
+      - slug: "candidate-a-wins-primary"
+        outcome: "Yes"
+      - slug: "candidate-b-wins-primary"
+        outcome: "Yes"
+    total:
+      slug: "party-wins-primary"
+      outcome: "Yes"
+    tolerance: 0.02

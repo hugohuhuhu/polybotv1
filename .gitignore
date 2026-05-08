@@ -1,0 +1,9 @@
+.env
+data/*.db
+data/*.db-*
+data/
+scanner.db
+runtime-logs/
+__pycache__/
+.pytest_cache/
+*.pyc
