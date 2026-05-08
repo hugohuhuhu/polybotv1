@@ -1276,14 +1276,25 @@ class ScannerRepository:
         }
 
     def live_risk_summary(self) -> dict[str, Any]:
+        live_statuses = (
+            "SUBMITTED",
+            "CONFIRMED",
+            "MATCHED",
+            "FILLED",
+            "MINED",
+            "REDEEMED",
+            "SETTLED_LOST",
+        )
+        placeholders = ",".join("?" for _ in live_statuses)
         row = self.connection.fetchone(
-            """
+            f"""
             SELECT COUNT(*) AS live_orders_today,
                    COALESCE(SUM(requested_size * target_price), 0.0) AS live_notional_today
             FROM live_trades
             WHERE created_at >= ?
+              AND UPPER(status) IN ({placeholders})
             """,
-            (self._today_start_iso(),),
+            (self._today_start_iso(), *live_statuses),
         )
         return row or {
             "live_orders_today": 0,
