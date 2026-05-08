@@ -35,7 +35,7 @@ WATCH_PID_FILE = RUNTIME_LOG_DIR / "watch.pid"
 WATCH_SUPERVISOR_PID_FILE = RUNTIME_LOG_DIR / "watch-supervisor.pid"
 WATCH_SCRIPT_PATH = BASE_DIR.parent / "scripts" / "watch-supervisor.ps1"
 DASHBOARD_COMPONENT_TIMEOUT_SEC = 2.5
-DASHBOARD_DB_TIMEOUT_SEC = 2.5
+DASHBOARD_DB_TIMEOUT_SEC = 8.0
 LIVE_FILL_SYNC_INTERVAL_SEC = 60.0
 
 
@@ -991,13 +991,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
-        watch_status = watch_status_payload({})
+        summary: dict[str, Any] = {}
+        try:
+            with repository_scope() as repo:
+                summary = repo.dashboard_summary()
+        except Exception:
+            summary = {}
+        watch_status = watch_status_payload(summary)
         return JSONResponse(
             {
                 "status": "ok",
                 "scan_in_progress": app.state.scan_lock.locked(),
-                "latest_snapshot_at": None,
-                "latest_alert_at": None,
+                "latest_snapshot_at": summary.get("latest_snapshot_at"),
+                "latest_alert_at": summary.get("latest_alert_at"),
                 "persistence_backend": current_settings.persistence_backend,
                 "watch": watch_status,
             }

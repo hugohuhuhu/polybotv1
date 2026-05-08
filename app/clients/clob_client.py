@@ -45,16 +45,18 @@ class ClobClient:
                     )
                 except httpx.HTTPError:
                     if attempt == retries - 1:
-                        raise
+                        return None
                     await asyncio.sleep(backoff)
                     backoff *= 2
         return None
 
     async def get_order_books(self, token_ids: Iterable[str]) -> dict[str, OrderBookSnapshot]:
         tasks = [self.get_order_book(token_id) for token_id in token_ids]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         books: dict[str, OrderBookSnapshot] = {}
         for result in results:
+            if isinstance(result, Exception):
+                continue
             if result is not None:
                 books[result.token_id] = result
         return books
