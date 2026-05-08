@@ -56,6 +56,7 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $sqlitePath) -Force | Out-Null
 $env:DASHBOARD_REFRESH_SEC = "30"
 $env:SQLITE_PATH = $sqlitePath
+$env:MAX_DAILY_LIVE_ORDERS = "21"
 $env:AUTO_REDEEM_ENABLED = "true"
 $env:AUTO_REDEEM_REFRESH_SEC = "300"
 $env:AUTO_REDEEM_MIN_USDCE = "0.01"
