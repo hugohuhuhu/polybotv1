@@ -276,6 +276,83 @@ def test_kill_switch_route_disarms_runtime_controls(tmp_path, monkeypatch) -> No
     assert blocked_live.json()["detail"] == "kill_switch_enabled"
 
 
+def test_finish_work_disarms_and_cancels_open_orders(tmp_path, monkeypatch) -> None:
+    class FakeLiveTrader:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+
+        async def get_open_orders(self) -> list[dict]:
+            return [{"id": "0xremote"}]
+
+        async def cancel_orders(self, order_ids: list[str]) -> dict:
+            self.cancelled = order_ids
+            return {"cancelled": len(order_ids)}
+
+    async def fake_wallet_status(_settings):
+        return {
+            "configured": True,
+            "address": "0x1111111111111111111111111111111111111111",
+            "status": "ok",
+            "message": "ok",
+            "balances": [],
+        }
+
+    async def fake_preflight(_settings, *, verify_clob_credentials=True):
+        return FakePreflightReport(ready=True)
+
+    monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
+    monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    sqlite_path = tmp_path / "finish-work.db"
+    app = create_app(
+        Settings(
+            SQLITE_PATH=str(sqlite_path),
+            POLYMARKET_PRIVATE_KEY="0x" + "1" * 64,
+            ENABLE_LIVE_TRADING=True,
+            LIVE_AUTO_EXECUTE=True,
+        )
+    )
+    fake_trader = FakeLiveTrader()
+    app.state.live_trader = fake_trader
+    connection = connect_db(sqlite_path)
+    with connection.transaction():
+        connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "finish-test",
+                1,
+                "BUY",
+                "token",
+                "market",
+                "Up",
+                0.98,
+                5.0,
+                "0xlocal",
+                "submitted",
+                "{}",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    connection.close()
+    client = TestClient(app)
+
+    response = client.post("/api/actions/trading/finish")
+
+    assert response.status_code == 200
+    payload = response.json()["payload"]
+    assert payload["trading"]["live_trading_enabled"] is False
+    assert payload["trading"]["auto_execute_enabled"] is False
+    assert set(fake_trader.cancelled) == {"0xlocal", "0xremote"}
+    connection = connect_db(sqlite_path)
+    row = connection.fetchone("SELECT status FROM live_trades WHERE order_id = ?", ("0xlocal",))
+    connection.close()
+    assert row["status"] == "cancelled"
+
+
 def test_trading_toggle_blocks_when_preflight_fails(tmp_path, monkeypatch) -> None:
     async def fake_wallet_status(_settings):
         return {

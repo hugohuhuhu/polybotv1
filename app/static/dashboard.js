@@ -16,6 +16,7 @@ const killSwitchToggle = document.getElementById("killSwitchToggle");
 const watchToggle = document.getElementById("watchToggle");
 const liveTradingToggle = document.getElementById("liveTradingToggle");
 const autoExecuteToggle = document.getElementById("autoExecuteToggle");
+const finishWorkButton = document.getElementById("finishWorkButton");
 const tradingCard = document.getElementById("tradingCard");
 const armedIndicator = document.getElementById("armedIndicator");
 const armedIndicatorTitle = armedIndicator?.querySelector("strong");
@@ -81,6 +82,9 @@ const TEXT = {
   autoOff: "\u555f\u7528\u81ea\u52d5\u4e0b\u55ae",
   killOn: "\u89e3\u9664\u7dca\u6025\u505c\u6b62",
   killOff: "\u7dca\u6025\u505c\u6b62",
+  finishWork: "\u6536\u5de5",
+  finishingWork: "\u6536\u5de5\u4e2d",
+  finishWorkDone: "\u6536\u5de5\u5b8c\u6210\uff1a\u5df2\u64a4\u55ae\u4e26\u505c\u6b62\u7e7c\u7e8c\u4e0b\u55ae",
   privateKeyMissing: "\u5c1a\u672a\u8f38\u5165\u79c1\u9470",
   walletLoaded: "\u5df2\u8b80\u53d6\u9322\u5305\u5730\u5740\u8207\u4ee3\u5e63\u9918\u984d",
   walletMissing: "\u5c1a\u672a\u8f38\u5165\u79c1\u9470",
@@ -441,6 +445,7 @@ function setControlBusy(isBusy) {
   liveTradingToggle.disabled = isBusy || liveTradingToggle.dataset.locked === "true";
   autoExecuteToggle.disabled = isBusy || autoExecuteToggle.dataset.locked === "true";
   killSwitchToggle.disabled = isBusy;
+  finishWorkButton.disabled = isBusy;
   watchToggle.disabled = isBusy || watchToggle.dataset.busy === "true";
   scanButton.disabled = isBusy || scanButton.dataset.busy === "true";
 }
@@ -1115,6 +1120,32 @@ async function toggleAction(path, loadingText, successText) {
   }
 }
 
+async function finishWork() {
+  setControlBusy(true);
+  finishWorkButton.textContent = TEXT.finishingWork;
+  setStatus("", TEXT.finishingWork);
+  try {
+    const response = await fetch("/api/actions/trading/finish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      applyDashboardPayload(body.payload);
+      setStatus("warn", body.error || TEXT.updateFailed);
+      return;
+    }
+    applyDashboardPayload(body.payload);
+    await loadDashboard();
+    setStatus("hot", TEXT.finishWorkDone);
+  } catch (_error) {
+    setStatus("warn", TEXT.updateFailed);
+  } finally {
+    finishWorkButton.textContent = TEXT.finishWork;
+    setControlBusy(false);
+  }
+}
+
 async function triggerScan() {
   scanButton.dataset.busy = "true";
   scanButton.disabled = true;
@@ -1198,6 +1229,10 @@ autoExecuteToggle.addEventListener("click", () => {
 
 killSwitchToggle.addEventListener("click", () => {
   void toggleAction("/api/actions/risk/kill-switch", "\u66f4\u65b0\u7dca\u6025\u505c\u6b62\u4e2d", "\u98a8\u63a7\u958b\u95dc\u5df2\u66f4\u65b0");
+});
+
+finishWorkButton.addEventListener("click", () => {
+  void finishWork();
 });
 
 watchToggle.addEventListener("click", () => {

@@ -55,6 +55,26 @@ def _wallet_balance(wallet: dict[str, Any], symbol: str) -> float | None:
     return None
 
 
+def _extract_order_ids(payload: object) -> list[str]:
+    ids: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key in ("id", "order_id", "orderId", "hash"):
+                order_id = value.get(key)
+                if isinstance(order_id, str) and order_id.startswith("0x"):
+                    ids.append(order_id)
+            for nested in value.values():
+                visit(nested)
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    return list(dict.fromkeys(ids))
+
+
 def _trade_journal_payload(
     repository: ScannerRepository,
     settings: Settings,
@@ -1078,6 +1098,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         )
         return JSONResponse({"status": "ok", "payload": action_payload("Runtime controls updated.")})
+
+    @app.post("/api/actions/trading/finish")
+    async def api_finish_work() -> JSONResponse:
+        await set_runtime_controls_quick(
+            TradingControls(
+                live_trading_enabled=False,
+                auto_execute_enabled=False,
+                kill_switch_enabled=False,
+            )
+        )
+        cancelled_count = 0
+        cancel_error = None
+        order_ids: list[str] = []
+        with repository_scope() as repo:
+            order_ids.extend(repo.active_live_order_ids())
+        try:
+            live_trader: PolymarketLiveTradingAdapter = app.state.live_trader
+            open_orders = await asyncio.wait_for(live_trader.get_open_orders(), timeout=DASHBOARD_DB_TIMEOUT_SEC)
+            order_ids.extend(_extract_order_ids(open_orders))
+            order_ids = list(dict.fromkeys(order_ids))
+            if order_ids:
+                await asyncio.wait_for(live_trader.cancel_orders(order_ids), timeout=DASHBOARD_DB_TIMEOUT_SEC)
+                with repository_scope() as repo:
+                    cancelled_count = repo.mark_live_orders_cancelled(order_ids)
+        except Exception as exc:
+            cancel_error = str(exc)
+
+        with repository_scope() as repo:
+            repo.save_execution_event(
+                source="dashboard",
+                mode="live",
+                opportunity_id=None,
+                status="finish_failed" if cancel_error else "finish_completed",
+                message=(
+                    f"收工失敗：{cancel_error}"
+                    if cancel_error
+                    else f"收工完成：已關閉 Live / 自動下單，撤單 {cancelled_count} 筆。"
+                ),
+                details={"order_ids": order_ids, "cancelled_count": cancelled_count, "error": cancel_error},
+            )
+        if cancel_error:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": cancel_error,
+                    "payload": action_payload("收工已停止繼續下單，但撤單狀態需要人工確認。"),
+                },
+                status_code=502,
+            )
+        return JSONResponse({"status": "ok", "payload": action_payload("收工完成。")})
 
     @app.post("/api/actions/watch")
     async def api_toggle_watch() -> JSONResponse:

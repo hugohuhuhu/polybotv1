@@ -326,6 +326,20 @@ class ScannerRepository:
             )
         return int(getattr(cursor, "rowcount", 0) or 0)
 
+    def active_live_order_ids(self, limit: int = 200) -> list[str]:
+        rows = self.connection.fetchall(
+            """
+            SELECT order_id
+            FROM live_trades
+            WHERE order_id IS NOT NULL
+              AND UPPER(status) IN ('SUBMITTED', 'PENDING', 'OPEN', 'CANCEL_REQUESTED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [str(row["order_id"]) for row in rows if str(row["order_id"] or "").strip()]
+
     def near_close_active_orders_for_market(
         self,
         *,
