@@ -400,6 +400,8 @@ class ScannerRepository:
             for fill in fills:
                 fill_id = str(fill.get("id") or "").strip()
                 user_fill = fill
+                local_order = None
+                selected_maker_order = False
                 maker_orders = fill.get("maker_orders")
                 if wallet and isinstance(maker_orders, list):
                     for maker_order in maker_orders:
@@ -408,7 +410,34 @@ class ScannerRepository:
                         maker_address = str(maker_order.get("maker_address") or "").lower().strip()
                         if maker_address == wallet:
                             user_fill = {**fill, **maker_order}
+                            selected_maker_order = True
                             break
+                if user_fill is fill and isinstance(maker_orders, list):
+                    for maker_order in maker_orders:
+                        if not isinstance(maker_order, dict):
+                            continue
+                        maker_order_id = str(maker_order.get("order_id") or "").strip()
+                        if not maker_order_id:
+                            continue
+                        local_order = self.connection.fetchone(
+                            """
+                            SELECT id, market_slug, outcome_label
+                            FROM live_trades
+                            WHERE order_id = ?
+                            LIMIT 1
+                            """,
+                            (maker_order_id,),
+                        )
+                        if local_order:
+                            user_fill = {**fill, **maker_order}
+                            selected_maker_order = True
+                            break
+                if isinstance(maker_orders, list) and user_fill is fill:
+                    fill_maker = str(fill.get("maker_address") or "").lower().strip()
+                    if wallet and fill_maker != wallet:
+                        continue
+                    if not wallet:
+                        continue
                 order_id = str(user_fill.get("order_id") or user_fill.get("taker_order_id") or fill_id).strip()
                 token_id = str(user_fill.get("asset_id") or user_fill.get("token_id") or "").strip()
                 action = str(user_fill.get("side") or "").upper().strip()
@@ -417,19 +446,22 @@ class ScannerRepository:
                     continue
                 exists = self.connection.fetchone(
                     """
-                    SELECT id
+                    SELECT id, opportunity_id, order_id, status
                     FROM live_trades
                     WHERE opportunity_id = ? OR order_id = ?
                     LIMIT 1
                     """,
                     (f"clob-fill:{fill_id}", order_id),
                 )
-                if exists:
-                    continue
 
                 try:
                     price = float(user_fill.get("price") or 0.0)
-                    size = float(user_fill.get("size") or user_fill.get("matched_amount") or 0.0)
+                    size_source = (
+                        user_fill.get("matched_amount")
+                        if selected_maker_order and user_fill.get("matched_amount") is not None
+                        else user_fill.get("size") or user_fill.get("matched_amount")
+                    )
+                    size = float(size_source or 0.0)
                 except (TypeError, ValueError):
                     continue
                 if price <= 0 or size <= 0:
@@ -443,6 +475,44 @@ class ScannerRepository:
                         created_at = datetime.fromtimestamp(float(match_time), tz=timezone.utc).isoformat()
                     except (TypeError, ValueError, OSError):
                         created_at = self._now().isoformat()
+
+                if local_order:
+                    market_slug = str(local_order["market_slug"])
+                    outcome_label = str(local_order["outcome_label"])
+                if exists:
+                    existing_status = str(exists["status"] or "").upper()
+                    if existing_status in {"REDEEMED", "SETTLED_LOST", "MISATTRIBUTED_FILL_IGNORED"}:
+                        continue
+                    if str(exists["order_id"] or "") == order_id:
+                        self.connection.execute(
+                            """
+                            UPDATE live_trades
+                            SET action = ?,
+                                token_id = ?,
+                                market_slug = ?,
+                                outcome_label = ?,
+                                target_price = ?,
+                                requested_size = ?,
+                                status = ?,
+                                response_json = ?,
+                                created_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                action,
+                                token_id,
+                                market_slug,
+                                outcome_label,
+                                price,
+                                size,
+                                status,
+                                json.dumps(fill),
+                                created_at,
+                                exists["id"],
+                            ),
+                        )
+                        inserted += 1
+                    continue
 
                 self.connection.execute(
                     """

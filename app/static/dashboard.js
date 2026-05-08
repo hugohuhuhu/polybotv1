@@ -668,6 +668,14 @@ function renderTradeJournal(positions, tradeJournal) {
     tradeJournal?.pusd_balance_delta === null || tradeJournal?.pusd_balance_delta === undefined
       ? null
       : Number(tradeJournal.pusd_balance_delta);
+  const accountEquityDelta =
+    tradeJournal?.account_equity_delta === null || tradeJournal?.account_equity_delta === undefined
+      ? null
+      : Number(tradeJournal.account_equity_delta);
+  const openMarketValue =
+    tradeJournal?.open_market_value === null || tradeJournal?.open_market_value === undefined
+      ? null
+      : Number(tradeJournal.open_market_value);
   const pusdBaseline =
     tradeJournal?.pusd_pnl_baseline === null || tradeJournal?.pusd_pnl_baseline === undefined
       ? null
@@ -692,18 +700,18 @@ function renderTradeJournal(positions, tradeJournal) {
     0,
   );
 
-  const headlinePnl = pusdBalanceDelta ?? totalPnl;
+  const headlinePnl = accountEquityDelta ?? totalPnl;
   tradePnlValue.textContent = `${formatSignedToken(headlinePnl)} pUSD`;
   tradePnlValue.classList.toggle("positive", headlinePnl > 0);
   tradePnlValue.classList.toggle("negative", headlinePnl < 0);
   tradePnlMeta.textContent =
-    pusdBalanceDelta === null
+    accountEquityDelta === null
       ? `\u4ea4\u6613\u5e33\u672c ${formatSignedToken(totalPnl)} pUSD\uff0c\u5df2\u5be6\u73fe ${formatSignedToken(realizedPnl)} pUSD`
-      : `pUSD \u9918\u984d\u8b8a\u5316 ${formatSignedToken(pusdBalanceDelta)} pUSD\uff0c\u4ea4\u6613\u5e33\u672c ${formatSignedToken(totalPnl)} pUSD`;
+      : `\u6de8\u503c\u8b8a\u5316 ${formatSignedToken(accountEquityDelta)} pUSD\uff0c\u73fe\u91d1\u8b8a\u5316 ${formatSignedToken(pusdBalanceDelta ?? 0)} pUSD`;
   tradePnlNote.textContent =
     pusdBaseline === null
       ? `\u4eca\u65e5\u5df2\u5be6\u73fe ${formatSignedToken(todayPnl)} pUSD\uff0c\u7d2f\u8a08 ${formatNumber(totalTrades)} \u7b46\u6210\u4ea4\uff0c\u672a\u5e73\u5009 ${formatToken(openSize)} \u80a1\u3002`
-      : `\u57fa\u6e96 ${formatToken(pusdBaseline)} pUSD\uff0c\u4eca\u65e5\u5df2\u5be6\u73fe ${formatSignedToken(todayPnl)} pUSD\uff0c\u672a\u5e73\u5009 ${formatToken(openSize)} \u80a1\u3002`;
+      : `\u57fa\u6e96 ${formatToken(pusdBaseline)} pUSD\uff0c\u672a\u5e73\u5009\u4f30\u503c ${formatToken(openMarketValue ?? 0)} pUSD\uff0c\u4eca\u65e5\u5df2\u5be6\u73fe ${formatSignedToken(todayPnl)} pUSD\u3002`;
 
   positionFeed.innerHTML = groups
     .map((group) => {

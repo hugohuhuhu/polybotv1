@@ -64,9 +64,18 @@ def _trade_journal_payload(
     pusd_balance = _wallet_balance(wallet, "pUSD")
     if settings.pusd_pnl_baseline is not None and pusd_balance is not None:
         baseline = float(settings.pusd_pnl_baseline)
+        open_market_value = sum(
+            float(group.get("current_value") or 0.0)
+            for group in repository.live_trade_groups(limit=50)
+            if float(group.get("open_size") or 0.0) > 1e-9
+        )
+        account_equity_estimate = pusd_balance + open_market_value
         payload["pusd_balance"] = pusd_balance
         payload["pusd_pnl_baseline"] = baseline
         payload["pusd_balance_delta"] = pusd_balance - baseline
+        payload["open_market_value"] = open_market_value
+        payload["account_equity_estimate"] = account_equity_estimate
+        payload["account_equity_delta"] = account_equity_estimate - baseline
     return payload
 
 
