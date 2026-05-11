@@ -8,6 +8,8 @@ const lastUpdatedLabel = document.getElementById("lastUpdatedLabel");
 const refreshLabel = document.getElementById("refreshLabel");
 const scanCountdownLabel = document.getElementById("scanCountdownLabel");
 const scanCountdownBar = document.getElementById("scanCountdownBar");
+const heartbeatLabel = document.getElementById("heartbeatLabel");
+const heartbeatList = document.getElementById("heartbeatList");
 const persistenceLabel = document.getElementById("persistenceLabel");
 const persistenceNote = document.getElementById("persistenceNote");
 const riskBanner = document.getElementById("riskBanner");
@@ -36,6 +38,7 @@ const opportunityRows = document.getElementById("opportunityRows");
 const strategyStack = document.getElementById("strategyStack");
 const alertFeed = document.getElementById("alertFeed");
 const executionFeed = document.getElementById("executionFeed");
+const executionOrderFeed = document.getElementById("executionOrderFeed");
 const positionFeed = document.getElementById("positionFeed");
 const tradePnlValue = document.getElementById("tradePnlValue");
 const tradePnlMeta = document.getElementById("tradePnlMeta");
@@ -49,6 +52,8 @@ const TEXT = {
   noStrategies: "\u5c1a\u672a\u6709\u7b56\u7565\u7d71\u8a08\u8cc7\u6599\u3002",
   noAlerts: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u8b66\u793a\u3002",
   noExecutions: "\u5c1a\u672a\u6709\u57f7\u884c\u4e8b\u4ef6\u3002",
+  noLiveOrders: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u771f\u5be6\u59d4\u8a17\u3002",
+  noHeartbeats: "\u5c1a\u672a\u6709 watch \u5fc3\u8df3\u3002",
   noTrades: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u3002",
   noTradeRecords: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u7d00\u9304",
   noMarkets: "\u5c1a\u672a\u540c\u6b65\u5e02\u5834\u8cc7\u6599\u3002",
@@ -253,6 +258,9 @@ function strategyLabel(strategyType) {
 function executionStatusLabel(status) {
   const mapping = {
     submitted: "\u5df2\u9001\u51fa",
+    open: "open",
+    matched: "matched",
+    finished: "finished",
     duplicate_claim: "\u91cd\u8907\u8a8d\u9818",
     risk_blocked: "\u98a8\u63a7\u963b\u64cb",
     preflight_blocked: "\u524d\u6aa2\u963b\u64cb",
@@ -262,10 +270,72 @@ function executionStatusLabel(status) {
     failed: "\u5931\u6557",
     cancelled: "\u5df2\u53d6\u6d88",
     filled: "\u5df2\u6210\u4ea4",
+    finish_completed: "\u6536\u5de5\u5b8c\u6210",
+    finish_failed: "\u6536\u5de5\u5931\u6557",
   };
   return mapping[status] || status || "-";
 }
 
+function liveOrderStatusClass(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "open" || normalized === "matched" || normalized === "finished") {
+    return "ok";
+  }
+  if (normalized === "cancelled") {
+    return "neutral";
+  }
+  return "problem";
+}
+
+function riskReasonLabel(item) {
+  const message = String(item?.message || "");
+  const mapping = [
+    [/same-market exposure limit/i, "\u540c\u5e02\u5834\u66dd\u96aa\u5df2\u9054\u4e0a\u9650"],
+    [/total exposure limit/i, "Near-close \u7e3d\u66dd\u96aa\u5df2\u9054\u4e0a\u9650"],
+    [/daily live notional/i, "\u4eca\u65e5 Live \u91d1\u984d\u4e0a\u9650"],
+    [/daily live order/i, "\u4eca\u65e5 Live \u7b46\u6578\u4e0a\u9650"],
+    [/max_notional_per_plan/i, "\u55ae\u7b46\u91d1\u984d\u4e0a\u9650"],
+    [/kill switch/i, "Kill switch \u5df2\u555f\u52d5"],
+    [/paper signals/i, "paper signal \u6578\u91cf\u5c1a\u672a\u9054\u6a19"],
+    [/disabled.*paper observation|paper observation only/i, "\u7b56\u7565\u4ecd\u662f paper-only"],
+    [/no positive notional/i, "\u59d4\u8a17\u91d1\u984d\u4e0d\u662f\u6b63\u6578"],
+  ];
+  const match = mapping.find(([pattern]) => pattern.test(message));
+  return match ? match[1] : message || "\u98a8\u63a7\u689d\u4ef6\u672a\u901a\u904e";
+}
+
+function riskEventDetail(item) {
+  const details = item?.details || {};
+  if (item?.status === "preflight_blocked") {
+    const reasons = Array.isArray(details.blocking_reasons) ? details.blocking_reasons : [];
+    const cleanReasons = reasons
+      .map((reason) => String(reason || ""))
+      .filter(Boolean)
+      .map((reason) => {
+        if (/Polygon RPC|POL|pUSD|allowance|approve/i.test(reason)) {
+          return reason;
+        }
+        return "\u9322\u5305 / RPC / pUSD \u524d\u7f6e\u6aa2\u67e5\u672a\u901a\u904e";
+      });
+    return cleanReasons.length
+      ? `\u89f8\u767c\uff1a${cleanReasons.join("\uff0c")}`
+      : "\u89f8\u767c\uff1aLive \u4ea4\u6613\u524d\u7f6e\u6aa2\u67e5\u672a\u901a\u904e";
+  }
+  if (item?.status !== "risk_blocked") {
+    return executionEventPresentation(item).message;
+  }
+  const parts = [`\u89f8\u767c\uff1a${riskReasonLabel(item)}`];
+  if (details.estimated_notional !== undefined) {
+    parts.push(`\u672c\u55ae ${formatToken(details.estimated_notional)} pUSD`);
+  }
+  if (details.projected_daily_notional !== undefined) {
+    parts.push(`\u63a8\u4f30\u7d2f\u8a08 ${formatToken(details.projected_daily_notional)} pUSD`);
+  }
+  if (details.projected_daily_orders !== undefined) {
+    parts.push(`\u63a8\u4f30\u7b46\u6578 ${formatNumber(details.projected_daily_orders)}`);
+  }
+  return parts.join("\uff0c");
+}
 function executionEventPresentation(item) {
   const armed = Boolean(latestTradingState?.armed);
 
@@ -305,7 +375,7 @@ function executionEventPresentation(item) {
 
 function readableMarketName(slug) {
   if (!slug) {
-    return "風控事件";
+    return "\u98a8\u63a7\u4e8b\u4ef6";
   }
   const parts = String(slug).split("-updown-");
   if (parts.length === 2) {
@@ -328,13 +398,13 @@ function executionEventSummary(item) {
   return {
     market: readableMarketName(leg.market_slug),
     time: formatTime(item?.created_at),
-    size: leg.requested_size ? `${formatToken(leg.requested_size)} 股` : notional ? `${formatToken(notional)} pUSD` : "-",
+    size: leg.requested_size ? `${formatToken(leg.requested_size)} \u80a1` : notional ? `${formatToken(notional)} pUSD` : "-",
     status: executionStatusLabel(item?.status),
     pillClass: executionEventPresentation(item).pillClass,
     outcome: leg.outcome_label ? ` / ${leg.outcome_label}` : "",
+    detail: riskEventDetail(item),
   };
 }
-
 function renderWatchIndicator(trading, watch, risk) {
   if (!armedIndicator || !armedIndicatorTitle || !armedIndicatorDetail) {
     return;
@@ -651,12 +721,54 @@ function renderExecutionEvents(events) {
         <article class="feed-item execution-item">
           <div class="execution-main">
             <strong>${escapeHtml(summary.market)}${escapeHtml(summary.outcome)}</strong>
+            <p>${escapeHtml(summary.detail)}</p>
             <time>${escapeHtml(summary.time)}</time>
           </div>
           <div class="execution-meta">
             <span>${escapeHtml(summary.size)}</span>
             <span class="feed-pill ${summary.pillClass}">${escapeHtml(summary.status)}</span>
           </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderLiveOrders(orders) {
+  if (!executionOrderFeed) {
+    return;
+  }
+  if (!orders?.length) {
+    executionOrderFeed.innerHTML = `<p class="empty-block">${TEXT.noLiveOrders}</p>`;
+    return;
+  }
+
+  executionOrderFeed.innerHTML = orders
+    .map((order) => {
+      const status = String(order.status || "unknown").toLowerCase();
+      const statusClass = liveOrderStatusClass(status);
+      const action = String(order.action || "").toUpperCase();
+      const valueLabel =
+        order.current_value === null || order.current_value === undefined
+          ? "-"
+          : `${formatToken(order.current_value)} pUSD`;
+      const pnlLabel =
+        order.pnl === null || order.pnl === undefined ? "-" : `${formatSignedToken(order.pnl)} pUSD`;
+      return `
+        <article class="order-card">
+          <header>
+            <div>
+              <strong>${escapeHtml(readableMarketName(order.market_slug))}</strong>
+              <p>${escapeHtml(order.outcome_label || "-")} · ${escapeHtml(action || "-")} ${formatToken(order.requested_size)} 股 @ ${formatToken(order.target_price)}</p>
+            </div>
+            <span class="feed-pill ${statusClass}">${escapeHtml(executionStatusLabel(status))}</span>
+          </header>
+          <div class="order-card__metrics">
+            <span>部位 ${formatToken(order.notional)} pUSD</span>
+            <span>面值 ${valueLabel}</span>
+            <span>損益 ${pnlLabel}</span>
+          </div>
+          <time>${formatTime(order.created_at)}</time>
         </article>
       `;
     })
@@ -1003,6 +1115,7 @@ function applyDashboardPayload(payload) {
   renderStrategies(payload.strategies || []);
   renderOpportunities(payload.opportunities || []);
   renderAlerts(payload.alerts || []);
+  renderLiveOrders(payload.live_orders || []);
   renderExecutionEvents(payload.execution_events || []);
   renderTradeJournal(payload.trade_groups || payload.positions || [], payload.trade_journal || payload.pnl || {});
   renderMarkets(payload.markets || []);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -300,12 +301,21 @@ def test_finish_work_disarms_and_cancels_open_orders(tmp_path, monkeypatch) -> N
     async def fake_preflight(_settings, *, verify_clob_credentials=True):
         return FakePreflightReport(ready=True)
 
+    stop_watch_called = False
+
+    def fake_stop_watch_process() -> bool:
+        nonlocal stop_watch_called
+        stop_watch_called = True
+        return True
+
     monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
     monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    monkeypatch.setattr("app.web._stop_watch_process", fake_stop_watch_process)
     sqlite_path = tmp_path / "finish-work.db"
     app = create_app(
         Settings(
             SQLITE_PATH=str(sqlite_path),
+            SQLITE_BACKUP_DIR=str(tmp_path / "backups"),
             POLYMARKET_PRIVATE_KEY="0x" + "1" * 64,
             ENABLE_LIVE_TRADING=True,
             LIVE_AUTO_EXECUTE=True,
@@ -346,11 +356,64 @@ def test_finish_work_disarms_and_cancels_open_orders(tmp_path, monkeypatch) -> N
     payload = response.json()["payload"]
     assert payload["trading"]["live_trading_enabled"] is False
     assert payload["trading"]["auto_execute_enabled"] is False
+    assert stop_watch_called is True
     assert set(fake_trader.cancelled) == {"0xlocal", "0xremote"}
     connection = connect_db(sqlite_path)
     row = connection.fetchone("SELECT status FROM live_trades WHERE order_id = ?", ("0xlocal",))
     connection.close()
     assert row["status"] == "cancelled"
+
+
+def test_scan_runs_auto_redeem_after_persisting_cycle(tmp_path, monkeypatch) -> None:
+    async def fake_wallet_status(_settings):
+        return {
+            "configured": True,
+            "address": "0x1111111111111111111111111111111111111111",
+            "status": "ok",
+            "message": "ok",
+            "balances": [],
+        }
+
+    async def fake_preflight(_settings, *, verify_clob_credentials=True):
+        return FakePreflightReport(ready=True)
+
+    async def fake_scan_cycle(_settings, *, limit=None, repository=None, previous_midpoints=None):
+        return SimpleNamespace(
+            events=[],
+            markets=[],
+            books={},
+            opportunities=[],
+            executed_at=datetime.now(timezone.utc),
+        )
+
+    class FakeRedeemResult:
+        status = "redeemed"
+        market_slug = "solana-up-or-down"
+        outcome_label = "Down"
+        redeemed_size = 5.0
+        message = "Redeemed and wrapped to pUSD."
+
+    redeem_calls = 0
+
+    def fake_redeem(_settings, _repo):
+        nonlocal redeem_calls
+        redeem_calls += 1
+        return [FakeRedeemResult()]
+
+    monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
+    monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    monkeypatch.setattr("app.web.execute_scan_cycle", fake_scan_cycle)
+    monkeypatch.setattr("app.web.persist_scan_cycle", lambda _repo, _result, _settings=None: None)
+    monkeypatch.setattr("app.web.run_auto_redeem_once", fake_redeem)
+    sqlite_path = tmp_path / "scan-redeem.db"
+    app = create_app(Settings(SQLITE_PATH=str(sqlite_path), POLYMARKET_PRIVATE_KEY="0x" + "1" * 64))
+    client = TestClient(app)
+
+    response = client.post("/api/actions/scan")
+
+    assert response.status_code == 200
+    assert redeem_calls == 1
+    assert response.json()["redeem_summary"][0]["status"] == "redeemed"
 
 
 def test_trading_toggle_blocks_when_preflight_fails(tmp_path, monkeypatch) -> None:

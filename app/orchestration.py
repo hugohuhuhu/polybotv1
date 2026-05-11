@@ -778,7 +778,7 @@ def _opportunity_tier_counts(opportunities: list[Opportunity]) -> tuple[int, int
     return actionable_count, candidate_count
 
 
-def persist_scan_cycle(repository: ScannerRepository, result: ScanCycleResult) -> None:
+def persist_scan_cycle(repository: ScannerRepository, result: ScanCycleResult, settings: Settings | None = None) -> None:
     actionable_count, candidate_count = _opportunity_tier_counts(result.opportunities)
     repository.save_markets(result.events, result.markets)
     repository.save_orderbooks(result.books.values())
@@ -799,6 +799,13 @@ def persist_scan_cycle(repository: ScannerRepository, result: ScanCycleResult) -
         positive_edge_candidates_24h=int(result.shortlist_diagnostics.get("positive_edge_candidates_24h", 0)),
         near_close_funnel=result.shortlist_diagnostics.get("near_close_funnel", []),
     )
+    if settings is not None:
+        repository.run_database_maintenance(
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+        )
 
 
 def persist_monitor_cycle(
@@ -806,6 +813,7 @@ def persist_monitor_cycle(
     result: ScanCycleResult,
     *,
     discovered_market_count: int,
+    settings: Settings | None = None,
 ) -> None:
     actionable_count, candidate_count = _opportunity_tier_counts(result.opportunities)
     repository.save_orderbooks(result.books.values())
@@ -826,3 +834,10 @@ def persist_monitor_cycle(
         positive_edge_candidates_24h=int(result.shortlist_diagnostics.get("positive_edge_candidates_24h", 0)),
         near_close_funnel=result.shortlist_diagnostics.get("near_close_funnel", []),
     )
+    if settings is not None:
+        repository.run_database_maintenance(
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+        )

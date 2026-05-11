@@ -108,6 +108,13 @@ def _ok(check_id: str, label: str, message: str, **kwargs: Any) -> PreflightChec
     return PreflightCheck(check_id=check_id, label=label, status="ok", message=message, **kwargs)
 
 
+def _exception_message(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return exc.__class__.__name__
+
+
 def _clob_v2_sdk_error() -> str | None:
     try:
         importlib.import_module("py_clob_client_v2")
@@ -162,7 +169,7 @@ async def _check_clob_clock(
         check = _warning(
             "clock_drift",
             "系統時間",
-            f"暫時無法讀取 CLOB 時間：{exc}",
+            f"暫時無法讀取 CLOB 時間：{_exception_message(exc)}",
             required=False,
         )
     _CLOCK_CHECK_CACHE[cache_key] = (monotonic(), check)
@@ -262,7 +269,7 @@ async def load_preflight_report(
             else:
                 checks.append(_ok("polygon_chain", "Polygon Chain ID", "RPC 已連到 Polygon 主網。", value=chain_id))
         except Exception as exc:
-            checks.append(_critical("polygon_chain", "Polygon Chain ID", f"Polygon RPC 讀取失敗：{exc}"))
+            checks.append(_critical("polygon_chain", "Polygon Chain ID", f"Polygon RPC 讀取失敗：{_exception_message(exc)}"))
 
         token_results = await asyncio.gather(
             fetch_native_balance(client, rpc_url, address),
@@ -272,7 +279,7 @@ async def load_preflight_report(
         )
 
         if isinstance(token_results[0], Exception):
-            checks.append(_critical("pol_balance", "POL Gas", f"POL 餘額讀取失敗：{token_results[0]}"))
+            checks.append(_critical("pol_balance", "POL Gas", f"POL 餘額讀取失敗：{_exception_message(token_results[0])}"))
         else:
             pol_balance = format_units(token_results[0], NATIVE_TOKEN_DECIMALS)
             if pol_balance < settings.min_pol_balance:
@@ -297,7 +304,7 @@ async def load_preflight_report(
                 )
 
         if isinstance(token_results[2], Exception):
-            checks.append(_critical("collateral_ready", "pUSD 餘額", f"pUSD 讀取失敗：{token_results[2]}"))
+            checks.append(_critical("collateral_ready", "pUSD 餘額", f"pUSD 讀取失敗：{_exception_message(token_results[2])}"))
         else:
             pusd_balance = format_units(token_results[2], TOKEN_DECIMALS)
             if pusd_balance < settings.min_trading_collateral:
@@ -322,7 +329,7 @@ async def load_preflight_report(
                 )
 
         if isinstance(token_results[1], Exception):
-            checks.append(_warning("usdce_balance", "USDC.e", f"USDC.e 讀取失敗：{token_results[1]}", required=False))
+            checks.append(_warning("usdce_balance", "USDC.e", f"USDC.e 讀取失敗：{_exception_message(token_results[1])}", required=False))
         else:
             usdc_e_balance = format_units(token_results[1], TOKEN_DECIMALS)
             checks.append(
@@ -363,7 +370,7 @@ async def load_preflight_report(
                 _warning(
                     "exchange_allowance",
                     "pUSD Exchange 授權",
-                    f"pUSD allowance 讀取失敗：{allowance_errors[0]}",
+                    f"pUSD allowance 讀取失敗：{_exception_message(allowance_errors[0])}",
                     required=False,
                 )
             )

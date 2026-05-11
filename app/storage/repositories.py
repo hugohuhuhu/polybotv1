@@ -46,6 +46,12 @@ class ScannerRepository:
     def _cutoff_iso(cls, *, hours: int) -> str:
         return (cls._now() - timedelta(hours=hours)).isoformat()
 
+    @staticmethod
+    def _minute_bucket(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat()[:16]
+
     def save_markets(self, events: Iterable[EventRecord], markets: Iterable[MarketRecord]) -> None:
         discovered_at = self._now().isoformat()
         _ = list(events)
@@ -95,24 +101,175 @@ class ScannerRepository:
     def save_orderbooks(self, books: Iterable[OrderBookSnapshot]) -> None:
         with self.connection.transaction():
             for book in books:
+                captured_at = to_isoformat(book.updated_at)
+                captured_minute = self._minute_bucket(book.updated_at)
                 self.connection.execute(
                     """
                     INSERT INTO orderbook_snapshots (
-                        token_id, market_id, best_bid, best_ask, midpoint, spread, bids_json, asks_json, captured_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        token_id, market_id, captured_minute, best_bid, best_ask, midpoint, spread,
+                        bids_json, asks_json, captured_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(token_id, captured_minute) DO UPDATE SET
+                        market_id=excluded.market_id,
+                        best_bid=excluded.best_bid,
+                        best_ask=excluded.best_ask,
+                        midpoint=excluded.midpoint,
+                        spread=excluded.spread,
+                        bids_json=excluded.bids_json,
+                        asks_json=excluded.asks_json,
+                        captured_at=excluded.captured_at
                     """,
                     (
                         book.token_id,
                         book.market_id,
+                        captured_minute,
                         book.best_bid,
                         book.best_ask,
                         book.midpoint,
                         book.spread,
                         json.dumps([level.model_dump() for level in book.bids]),
                         json.dumps([level.model_dump() for level in book.asks]),
-                        to_isoformat(book.updated_at),
+                        captured_at,
                     ),
                 )
+
+    def summarize_scan_cycles(self) -> int:
+        rows = self.connection.fetchall(
+            """
+            SELECT substr(executed_at, 1, 10) AS summary_date,
+                   COUNT(*) AS scan_cycle_count,
+                   MAX(discovered_market_count) AS max_discovered_market_count,
+                   MAX(monitored_market_count) AS max_monitored_market_count,
+                   COALESCE(SUM(book_count), 0) AS total_book_count,
+                   COALESCE(SUM(opportunity_count), 0) AS total_opportunity_count,
+                   COALESCE(SUM(actionable_count), 0) AS total_actionable_count,
+                   COALESCE(SUM(candidate_count), 0) AS total_candidate_count
+            FROM scan_cycles
+            GROUP BY substr(executed_at, 1, 10)
+            """
+        )
+        now_iso = self._now().isoformat()
+        with self.connection.transaction():
+            for row in rows:
+                self.connection.execute(
+                    """
+                    INSERT INTO daily_summaries (
+                        summary_date, scan_cycle_count, max_discovered_market_count,
+                        max_monitored_market_count, total_book_count, total_opportunity_count,
+                        total_actionable_count, total_candidate_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(summary_date) DO UPDATE SET
+                        scan_cycle_count=excluded.scan_cycle_count,
+                        max_discovered_market_count=excluded.max_discovered_market_count,
+                        max_monitored_market_count=excluded.max_monitored_market_count,
+                        total_book_count=excluded.total_book_count,
+                        total_opportunity_count=excluded.total_opportunity_count,
+                        total_actionable_count=excluded.total_actionable_count,
+                        total_candidate_count=excluded.total_candidate_count,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        row["summary_date"],
+                        int(row["scan_cycle_count"] or 0),
+                        int(row["max_discovered_market_count"] or 0),
+                        int(row["max_monitored_market_count"] or 0),
+                        int(row["total_book_count"] or 0),
+                        int(row["total_opportunity_count"] or 0),
+                        int(row["total_actionable_count"] or 0),
+                        int(row["total_candidate_count"] or 0),
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+        return len(rows)
+
+    def apply_retention(self, *, raw_days: int = 7, snapshot_days: int = 30) -> dict[str, int]:
+        raw_cutoff = (self._now() - timedelta(days=raw_days)).isoformat()
+        snapshot_cutoff = (self._now() - timedelta(days=snapshot_days)).isoformat()
+        deleted: dict[str, int] = {}
+        with self.connection.transaction():
+            for table, column, cutoff in (
+                ("orderbook_snapshots", "captured_at", raw_cutoff),
+                ("opportunities", "created_at", raw_cutoff),
+                ("alerts", "sent_at", raw_cutoff),
+                ("watch_heartbeats", "created_at", raw_cutoff),
+                ("scan_cycles", "executed_at", snapshot_cutoff),
+            ):
+                cursor = self.connection.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+                deleted[table] = int(getattr(cursor, "rowcount", 0) or 0)
+        return deleted
+
+    def _maintenance_state(self, key: str) -> str | None:
+        row = self.connection.fetchone("SELECT value FROM maintenance_state WHERE key = ?", (key,))
+        return str(row["value"]) if row else None
+
+    def _set_maintenance_state(self, key: str, value: str) -> None:
+        now_iso = self._now().isoformat()
+        with self.connection.transaction():
+            self.connection.execute(
+                """
+                INSERT INTO maintenance_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, now_iso),
+            )
+
+    def _state_due(self, key: str, interval_sec: int, now: datetime) -> bool:
+        value = self._maintenance_state(key)
+        if not value:
+            return True
+        try:
+            last_run = datetime.fromisoformat(value)
+        except ValueError:
+            return True
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(tzinfo=timezone.utc)
+        return (now - last_run.astimezone(timezone.utc)).total_seconds() >= interval_sec
+
+    def run_database_maintenance(
+        self,
+        *,
+        raw_retention_days: int = 7,
+        snapshot_retention_days: int = 30,
+        maintenance_interval_sec: int = 3600,
+        vacuum_interval_sec: int = 86400,
+        force: bool = False,
+        force_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        now = self._now()
+        if not force and not self._state_due("retention_last_run", maintenance_interval_sec, now):
+            return {"status": "skipped"}
+
+        summary_count = self.summarize_scan_cycles()
+        deleted = self.apply_retention(raw_days=raw_retention_days, snapshot_days=snapshot_retention_days)
+        optimized = False
+        vacuumed = False
+        optimize_error = None
+        vacuum_error = None
+        if self.connection.backend == "sqlite":
+            try:
+                self.connection.execute("PRAGMA optimize")
+                optimized = True
+            except Exception as exc:
+                optimize_error = str(exc)
+            if force_vacuum or self._state_due("vacuum_last_run", vacuum_interval_sec, now):
+                try:
+                    self.connection.execute("VACUUM")
+                    self._set_maintenance_state("vacuum_last_run", now.isoformat())
+                    vacuumed = True
+                except Exception as exc:
+                    vacuum_error = str(exc)
+        self._set_maintenance_state("retention_last_run", now.isoformat())
+        return {
+            "status": "completed",
+            "daily_summaries": summary_count,
+            "deleted": deleted,
+            "optimized": optimized,
+            "vacuumed": vacuumed,
+            "optimize_error": optimize_error,
+            "vacuum_error": vacuum_error,
+        }
 
     def save_opportunities(self, opportunities: Iterable[Opportunity]) -> None:
         with self.connection.transaction():
@@ -254,6 +411,50 @@ class ScannerRepository:
                     json.dumps(near_close_funnel or []),
                 ),
             )
+
+    def save_watch_heartbeat(
+        self,
+        *,
+        source: str,
+        state: str,
+        latest_scan_at: datetime | None = None,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self.connection.transaction():
+            self.connection.execute(
+                """
+                INSERT INTO watch_heartbeats (
+                    source, state, latest_scan_at, message, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    state,
+                    to_isoformat(latest_scan_at),
+                    message,
+                    json.dumps(details or {}),
+                    self._now().isoformat(),
+                ),
+            )
+
+    def recent_watch_heartbeats(self, limit: int = 6) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT source, state, latest_scan_at, message, details_json, created_at
+            FROM watch_heartbeats
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [
+            {
+                **row,
+                "details": self._load_json(row.get("details_json"), {}),
+            }
+            for row in rows
+        ]
 
     def recent_positive_edge_by_slug(self, *, hours: int, min_net_edge: float = 0.0) -> dict[str, int]:
         rows = self.connection.fetchall(
@@ -802,6 +1003,128 @@ class ScannerRepository:
             }
             for row in rows
         ]
+
+    @staticmethod
+    def _live_order_status_bucket(status: str) -> str:
+        normalized = str(status or "").upper()
+        if normalized in {"SUBMITTED", "PENDING", "OPEN", "CANCEL_REQUESTED"}:
+            return "open"
+        if normalized in {"CONFIRMED", "MATCHED", "FILLED", "MINED"}:
+            return "matched"
+        if normalized in {"CANCELLED", "EXPIRED", "FAILED", "CANCEL_UNCONFIRMED", "QUALIFICATION_CANCELLED", "REPRICE_CANCELLED"}:
+            return "cancelled"
+        if normalized in {"REDEEMED", "SETTLED_LOST"}:
+            return "finished"
+        return normalized.lower() or "unknown"
+
+    def recent_live_orders(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id,
+                   token_id,
+                   action,
+                   market_slug,
+                   outcome_label,
+                   target_price,
+                   requested_size,
+                   order_id,
+                   status,
+                   created_at
+            FROM live_trades
+            WHERE order_id IS NOT NULL
+              AND UPPER(status) NOT IN ('MISATTRIBUTED_FILL_IGNORED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        if not rows:
+            return []
+
+        token_ids = sorted({str(row["token_id"]) for row in rows if str(row.get("token_id") or "")})
+        latest_books: dict[str, dict[str, Any]] = {}
+        if token_ids:
+            placeholders = ",".join("?" for _ in token_ids)
+            book_rows = self.connection.fetchall(
+                f"""
+                SELECT obs.token_id,
+                       obs.best_bid,
+                       obs.best_ask,
+                       obs.midpoint,
+                       obs.captured_at
+                FROM orderbook_snapshots obs
+                INNER JOIN (
+                    SELECT token_id, MAX(captured_at) AS captured_at
+                    FROM orderbook_snapshots
+                    WHERE token_id IN ({placeholders})
+                    GROUP BY token_id
+                ) latest
+                  ON latest.token_id = obs.token_id
+                 AND latest.captured_at = obs.captured_at
+                """,
+                tuple(token_ids),
+            )
+            latest_books = {str(row["token_id"]): row for row in book_rows}
+
+        orders: list[dict[str, Any]] = []
+        for row in rows:
+            price = float(row["target_price"] or 0.0)
+            size = float(row["requested_size"] or 0.0)
+            notional = price * size
+            status_bucket = self._live_order_status_bucket(str(row["status"] or ""))
+            action = str(row["action"] or "").upper()
+            response = self._load_json(row.get("response_json"), {})
+            book = latest_books.get(str(row.get("token_id") or ""))
+            current_price = None
+            if book:
+                if book.get("best_bid") is not None:
+                    current_price = float(book["best_bid"])
+                elif book.get("midpoint") is not None:
+                    current_price = float(book["midpoint"])
+                elif book.get("best_ask") is not None:
+                    current_price = float(book["best_ask"])
+
+            current_value = None
+            pnl = None
+            normalized_status = str(row["status"] or "").upper()
+            if action == "BUY":
+                if normalized_status == "REDEEMED":
+                    current_value = size
+                    pnl = size - notional
+                elif normalized_status == "SETTLED_LOST":
+                    current_value = 0.0
+                    pnl = -notional
+                elif status_bucket == "matched" and current_price is not None:
+                    current_value = current_price * size
+                    pnl = current_value - notional
+            elif action == "SELL" and status_bucket in {"matched", "finished"}:
+                current_value = notional
+                pnl = 0.0
+
+            orders.append(
+                {
+                    "opportunity_id": row["opportunity_id"],
+                    "token_id": row["token_id"],
+                    "action": action,
+                    "market_slug": row["market_slug"],
+                    "outcome_label": row["outcome_label"],
+                    "target_price": price,
+                    "requested_size": size,
+                    "notional": notional,
+                    "order_id": row["order_id"],
+                    "raw_status": row["status"],
+                    "status": status_bucket,
+                    "current_price": current_price,
+                    "current_price_at": book.get("captured_at") if book else None,
+                    "current_value": current_value,
+                    "pnl": pnl,
+                    "transaction_hash": response.get("transaction_hash"),
+                    "clob_fill_id": response.get("id"),
+                    "trader_side": response.get("trader_side"),
+                    "created_at": row["created_at"],
+                }
+            )
+        return orders
 
     def _estimated_live_trade_summary(
         self,

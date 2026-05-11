@@ -86,11 +86,6 @@ class LateResolutionScanner:
             winning_outcome = str(market.raw.get("near_close_crypto_winning_outcome") or "")
             if outcome_label.lower() != winning_outcome.lower():
                 return None
-            if (
-                float(market.raw.get("near_close_crypto_start_distance") or 0.0)
-                < self.settings.near_close_crypto_updown_min_start_distance
-            ):
-                return None
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
             max_spread = self.settings.near_close_crypto_updown_max_spread

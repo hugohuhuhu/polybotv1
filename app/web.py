@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import subprocess
@@ -16,12 +17,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.config import Settings, get_settings
+from app.clients.clob_client import ClobClient
 from app.models.runtime import TradingControls
 from app.orchestration import execute_scan_cycle, persist_scan_cycle
 from app.scanners.liquidity_filter import LiquidityFilter
 from app.services.preflight import load_preflight_report
+from app.services.redeemer import run_auto_redeem_once
 from app.services.wallet_status import load_wallet_status
+from app.storage.backups import backup_sqlite_database
 from app.storage.db import connect_db
+from app.storage.path_safety import path_sync_warning
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, create_authenticated_clob_v2_client
@@ -37,6 +42,32 @@ WATCH_SCRIPT_PATH = BASE_DIR.parent / "scripts" / "watch-supervisor.ps1"
 DASHBOARD_COMPONENT_TIMEOUT_SEC = 2.5
 DASHBOARD_DB_TIMEOUT_SEC = 8.0
 LIVE_FILL_SYNC_INTERVAL_SEC = 60.0
+
+
+async def _fetch_orderbooks_for_tokens(settings: Settings, token_ids: list[str]) -> dict[str, Any]:
+    clob = ClobClient(settings.clob_base_url, concurrency=min(max(len(token_ids), 1), settings.book_fetch_concurrency))
+    try:
+        return await clob.get_order_books(token_ids)
+    finally:
+        await clob.close()
+
+
+def refresh_open_position_orderbooks(repository: ScannerRepository, settings: Settings) -> int:
+    groups = repository.live_trade_groups(limit=50)
+    token_ids = sorted(
+        {
+            str(group.get("token_id") or "")
+            for group in groups
+            if float(group.get("open_size") or 0.0) > 1e-9 and str(group.get("token_id") or "")
+        }
+    )
+    if not token_ids:
+        return 0
+    books = asyncio.run(_fetch_orderbooks_for_tokens(settings, token_ids))
+    if not books:
+        return 0
+    repository.save_orderbooks(books.values())
+    return len(books)
 
 
 def _dashboard_strategy_variant(settings: Settings) -> str | None:
@@ -305,7 +336,8 @@ async def build_dashboard_payload(
     preflight: dict[str, Any] | None = None,
     wallet: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    persistence_warning = settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE"))
+    sqlite_warning = path_sync_warning(settings.sqlite_path) if settings.persistence_backend == "sqlite" else None
+    persistence_warning = bool(sqlite_warning) or (settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE")))
     summary = repository.dashboard_summary()
     strategy_variant = _dashboard_strategy_variant(settings)
     return {
@@ -317,7 +349,9 @@ async def build_dashboard_payload(
         ),
         "alerts": repository.recent_alerts(limit=8),
         "markets": repository.top_markets(limit=10, shortlist_only=strategy_variant == "near_close_maker"),
+        "watch_heartbeats": repository.recent_watch_heartbeats(limit=6),
         "execution_events": repository.recent_execution_events(limit=10),
+        "live_orders": repository.recent_live_orders(limit=20),
         "positions": repository.recent_live_positions(limit=10),
         "trade_groups": repository.live_trade_groups(limit=8),
         "open_positions": repository.open_live_positions(limit=12),
@@ -341,6 +375,9 @@ async def build_dashboard_payload(
         "persistence": {
             "backend": settings.persistence_backend,
             "cloud_warning": persistence_warning,
+            "warning": sqlite_warning,
+            "sqlite_path": str(settings.sqlite_path),
+            "backup_dir": str(settings.sqlite_backup_dir),
         },
     }
 
@@ -360,6 +397,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.dashboard_db_task = None
     app.state.watch_task = None
     app.state.watch_stop_event = None
+    app.state.auto_redeem_task = None
+    app.state.auto_redeem_stop_event = None
     app.state.watch_action_lock = asyncio.Lock()
     app.state.watch_started_at = None
     app.state.watch_latest_scan_at = None
@@ -483,7 +522,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def sync_live_fills_to_db() -> int:
         if not (current_settings.polymarket_private_key or "").strip():
             return 0
-        client = create_authenticated_clob_v2_client(current_settings)
+        live_trader: PolymarketLiveTradingAdapter | None = getattr(app.state, "live_trader", None)
+        if live_trader is not None:
+            live_trader.settings = current_settings
+            client = live_trader._get_authenticated_client()
+        else:
+            client = create_authenticated_clob_v2_client(current_settings)
         fills = client.get_trades()
         if not isinstance(fills, list):
             return 0
@@ -617,8 +661,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     repository=repo,
                 )
             )
-            persist_scan_cycle(repo, result)
+            persist_scan_cycle(repo, result, current_settings)
+            run_auto_redeem_for_scan(repo, trigger="embedded_watch")
+            controls = load_controls(repo)
+            execution_summary, updated_controls = asyncio.run(
+                execute_live_from_scan(
+                    repo,
+                    opportunities=getattr(result, "opportunities", []),
+                    controls=controls,
+                )
+            )
+            if updated_controls is not controls:
+                app.state.controls_override = updated_controls
+            repo.save_watch_heartbeat(
+                source="dashboard",
+                state="running",
+                latest_scan_at=getattr(result, "executed_at", None),
+                message="watch scan completed",
+                details={
+                    "monitored_markets": len(getattr(result, "shortlisted_markets", []) or []),
+                    "book_count": len(getattr(result, "books", {}) or {}),
+                    "opportunity_count": len(getattr(result, "opportunities", []) or []),
+                    "live_attempted_count": int(execution_summary.get("attempted_count", 0) or 0),
+                    "live_submitted_count": int(execution_summary.get("submitted_count", 0) or 0),
+                },
+            )
         return getattr(result, "executed_at", datetime.now(timezone.utc))
+
+    def run_background_auto_redeem_once() -> list[dict[str, Any]]:
+        try:
+            sync_live_fills_to_db()
+        except Exception as exc:
+            with repository_scope() as repo:
+                repo.save_execution_event(
+                    source="auto-redeem",
+                    mode="live",
+                    opportunity_id=None,
+                    status="fill_sync_failed",
+                    message=str(exc),
+                    details={"trigger": "background_auto_redeem"},
+                )
+        with repository_scope() as repo:
+            return run_auto_redeem_for_scan(repo, trigger="background_auto_redeem")
+
+    async def background_auto_redeem_loop(stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            if current_settings.auto_redeem_enabled:
+                await asyncio.to_thread(run_background_auto_redeem_once)
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=max(int(current_settings.auto_redeem_refresh_sec), 60),
+                )
+            except TimeoutError:
+                pass
 
     async def embedded_watch_loop(stop_event: asyncio.Event) -> None:
         app.state.watch_started_at = datetime.now(timezone.utc)
@@ -631,12 +727,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.watch_last_error = None
                 except Exception as exc:
                     app.state.watch_last_error = f"watch 掃描失敗：{exc}"
+                    try:
+                        with repository_scope() as repo:
+                            repo.save_watch_heartbeat(
+                                source="dashboard",
+                                state="error",
+                                message=str(exc),
+                            )
+                    except Exception:
+                        pass
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=current_settings.scan_interval_sec)
                 except TimeoutError:
                     pass
         finally:
             app.state.watch_stop_event = None
+
+    @app.on_event("startup")
+    async def start_background_auto_redeem() -> None:
+        stop_event = asyncio.Event()
+        app.state.auto_redeem_stop_event = stop_event
+        app.state.auto_redeem_task = asyncio.create_task(background_auto_redeem_loop(stop_event))
+
+    @app.on_event("shutdown")
+    async def stop_background_auto_redeem() -> None:
+        stop_event = app.state.auto_redeem_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        task = app.state.auto_redeem_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def fallback_dashboard_payload(
         *,
@@ -683,7 +805,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "opportunities": [],
             "alerts": [],
             "markets": [],
+            "watch_heartbeats": [],
             "execution_events": [],
+            "live_orders": [],
             "positions": [],
             "trade_groups": [],
             "open_positions": [],
@@ -742,6 +866,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def load_dashboard_payload_from_db(preflight: dict[str, Any], wallet: dict[str, Any]) -> dict[str, Any]:
         with repository_scope() as repo:
             controls = load_controls(repo)
+            try:
+                refresh_open_position_orderbooks(repo, current_settings)
+            except Exception as exc:
+                repo.save_execution_event(
+                    source="dashboard",
+                    mode="live",
+                    opportunity_id=None,
+                    status="price_refresh_failed",
+                    message=f"開倉部位即時價格刷新失敗：{exc}",
+                    details={"component": "open_position_orderbook_refresh"},
+                )
             if (
                 current_settings.require_live_preflight
                 and not preflight.get("stale")
@@ -756,7 +891,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         kill_switch_enabled=controls.kill_switch_enabled,
                     ),
                 )
-            persistence_warning = current_settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE"))
+            sqlite_warning = (
+                path_sync_warning(current_settings.sqlite_path)
+                if current_settings.persistence_backend == "sqlite"
+                else None
+            )
+            persistence_warning = bool(sqlite_warning) or (
+                current_settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE"))
+            )
             summary = repo.dashboard_summary()
             strategy_variant = _dashboard_strategy_variant(current_settings)
             return {
@@ -768,7 +910,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
                 "alerts": repo.recent_alerts(limit=8),
                 "markets": repo.top_markets(limit=10, shortlist_only=strategy_variant == "near_close_maker"),
+                "watch_heartbeats": repo.recent_watch_heartbeats(limit=6),
                 "execution_events": repo.recent_execution_events(limit=10),
+                "live_orders": repo.recent_live_orders(limit=20),
                 "positions": repo.recent_live_positions(limit=10),
                 "trade_groups": repo.live_trade_groups(limit=8),
                 "open_positions": repo.open_live_positions(limit=12),
@@ -792,6 +936,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "persistence": {
                     "backend": current_settings.persistence_backend,
                     "cloud_warning": persistence_warning,
+                    "warning": sqlite_warning,
+                    "sqlite_path": str(current_settings.sqlite_path),
+                    "backup_dir": str(current_settings.sqlite_backup_dir),
                 },
             }
 
@@ -1006,6 +1153,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             current_controls,
         )
 
+    def run_auto_redeem_for_scan(repo: ScannerRepository, *, trigger: str) -> list[dict[str, Any]]:
+        try:
+            redeem_results = run_auto_redeem_once(current_settings, repo)
+        except Exception as exc:
+            repo.save_execution_event(
+                source="auto-redeem",
+                mode="live",
+                opportunity_id=None,
+                status="failed",
+                message=str(exc),
+                details={"trigger": trigger},
+            )
+            return [
+                {
+                    "status": "failed",
+                    "message": str(exc),
+                    "trigger": trigger,
+                }
+            ]
+        summaries: list[dict[str, Any]] = []
+        for redeem_result in redeem_results:
+            summaries.append(
+                {
+                    "status": redeem_result.status,
+                    "market_slug": redeem_result.market_slug,
+                    "outcome_label": redeem_result.outcome_label,
+                    "redeemed_size": redeem_result.redeemed_size,
+                    "message": redeem_result.message,
+                    "trigger": trigger,
+                }
+            )
+        return summaries
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(
@@ -1110,6 +1290,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         cancelled_count = 0
         cancel_error = None
+        backup_result = None
+        backup_error = None
         order_ids: list[str] = []
         with repository_scope() as repo:
             order_ids.extend(repo.active_live_order_ids())
@@ -1124,25 +1306,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     cancelled_count = repo.mark_live_orders_cancelled(order_ids)
         except Exception as exc:
             cancel_error = str(exc)
+        watch_stopped = _stop_watch_process()
+        try:
+            backup_result = await asyncio.to_thread(backup_sqlite_database, current_settings, label="finish")
+        except Exception as exc:
+            backup_error = str(exc)
 
         with repository_scope() as repo:
             repo.save_execution_event(
                 source="dashboard",
                 mode="live",
                 opportunity_id=None,
-                status="finish_failed" if cancel_error else "finish_completed",
+                status="finish_failed" if (cancel_error or backup_error) else "finish_completed",
                 message=(
                     f"收工失敗：{cancel_error}"
                     if cancel_error
                     else f"收工完成：已關閉 Live / 自動下單，撤單 {cancelled_count} 筆。"
                 ),
-                details={"order_ids": order_ids, "cancelled_count": cancelled_count, "error": cancel_error},
+                details={
+                    "order_ids": order_ids,
+                    "cancelled_count": cancelled_count,
+                    "error": cancel_error,
+                    "watch_stopped": watch_stopped,
+                    "backup": backup_result,
+                    "backup_error": backup_error,
+                },
             )
-        if cancel_error:
+        if cancel_error or backup_error:
             return JSONResponse(
                 {
                     "status": "error",
-                    "error": cancel_error,
+                    "error": cancel_error or backup_error,
                     "payload": action_payload("收工已停止繼續下單，但撤單狀態需要人工確認。"),
                 },
                 status_code=502,
@@ -1174,7 +1368,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     limit=limit or current_settings.dashboard_scan_limit,
                     repository=repo,
                 )
-                persist_scan_cycle(repo, result)
+                persist_scan_cycle(repo, result, current_settings)
+                redeem_summary = run_auto_redeem_for_scan(repo, trigger="dashboard_scan")
                 controls = load_controls(repo)
                 execution_summary, controls = await execute_live_from_scan(
                     repo,
@@ -1189,7 +1384,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     wallet=await dashboard_wallet_status(),
                 )
         payload["scan_in_progress"] = app.state.scan_lock.locked()
-        return JSONResponse({"status": "ok", "payload": payload, "execution_summary": execution_summary})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "payload": payload,
+                "execution_summary": execution_summary,
+                "redeem_summary": redeem_summary,
+            }
+        )
 
     return app
 

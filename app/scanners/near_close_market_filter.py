@@ -145,9 +145,7 @@ def classify_near_close_market(market: MarketRecord) -> NearCloseMarketDecision:
             winning_outcome = market.raw.get("near_close_crypto_winning_outcome")
             if distance is None or winning_outcome not in {"Up", "Down"}:
                 return NearCloseMarketDecision(False, "crypto_updown_missing_proxy_price")
-            if float(distance) < 0.0025:
-                return NearCloseMarketDecision(False, "crypto_updown_too_close")
-            return NearCloseMarketDecision(True, "crypto_updown_proxy_far_from_start", "crypto_updown")
+            return NearCloseMarketDecision(True, "crypto_updown_proxy_price_ready", "crypto_updown")
 
         distance = market.raw.get("near_close_crypto_strike_distance")
         winning_outcome = market.raw.get("near_close_crypto_winning_outcome")

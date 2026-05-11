@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.storage.path_safety import default_backup_dir, default_local_sqlite_path
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -23,10 +25,12 @@ class Settings(BaseSettings):
         alias="WS_MARKET_URL",
     )
     database_url: str | None = Field(default=None, alias="DATABASE_URL")
-    sqlite_path: Path = Field(
-        default=Path("C:/Users/hug0x/Desktop/polymarket-scanner-data/polymarket_scanner.db"),
-        alias="SQLITE_PATH",
-    )
+    sqlite_path: Path = Field(default_factory=default_local_sqlite_path, alias="SQLITE_PATH")
+    sqlite_backup_dir: Path = Field(default_factory=default_backup_dir, alias="SQLITE_BACKUP_DIR")
+    db_raw_retention_days: int = Field(default=7, alias="DB_RAW_RETENTION_DAYS")
+    db_snapshot_retention_days: int = Field(default=30, alias="DB_SNAPSHOT_RETENTION_DAYS")
+    db_maintenance_interval_sec: int = Field(default=3600, alias="DB_MAINTENANCE_INTERVAL_SEC")
+    db_vacuum_interval_sec: int = Field(default=86400, alias="DB_VACUUM_INTERVAL_SEC")
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")
     min_net_edge: float = Field(default=0.015, alias="MIN_NET_EDGE")
@@ -76,12 +80,12 @@ class Settings(BaseSettings):
         alias="LATE_RESOLUTION_MAX_MINUTES_TO_RESOLUTION",
     )
     near_close_maker_enabled: bool = Field(default=True, alias="NEAR_CLOSE_MAKER_ENABLED")
-    near_close_maker_live_enabled: bool = Field(default=False, alias="NEAR_CLOSE_MAKER_LIVE_ENABLED")
+    near_close_maker_live_enabled: bool = Field(default=True, alias="NEAR_CLOSE_MAKER_LIVE_ENABLED")
     near_close_scan_pool_enabled: bool = Field(default=True, alias="NEAR_CLOSE_SCAN_POOL_ENABLED")
     near_close_scan_event_limit: int = Field(default=750, alias="NEAR_CLOSE_SCAN_EVENT_LIMIT")
     near_close_scan_pool_limit: int = Field(default=30, alias="NEAR_CLOSE_SCAN_POOL_LIMIT")
     near_close_scan_lookahead_minutes: float = Field(default=75.0, alias="NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES")
-    near_close_min_paper_signals_for_live: int = Field(default=100, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
+    near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
     near_close_max_bid_price: float = Field(default=0.97, alias="NEAR_CLOSE_MAX_BID_PRICE")
@@ -92,7 +96,7 @@ class Settings(BaseSettings):
     near_close_min_depth: float = Field(default=20.0, alias="NEAR_CLOSE_MIN_DEPTH")
     near_close_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_ORDER_SIZE")
     near_close_max_market_exposure: float = Field(default=5.0, alias="NEAR_CLOSE_MAX_MARKET_EXPOSURE")
-    near_close_max_total_exposure: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_TOTAL_EXPOSURE")
+    near_close_max_total_exposure: float = Field(default=25.0, alias="NEAR_CLOSE_MAX_TOTAL_EXPOSURE")
     near_close_daily_loss_limit: float = Field(default=2.0, alias="NEAR_CLOSE_DAILY_LOSS_LIMIT")
     near_close_max_consecutive_losses: int = Field(default=2, alias="NEAR_CLOSE_MAX_CONSECUTIVE_LOSSES")
     near_close_gtd_seconds: int = Field(default=1800, alias="NEAR_CLOSE_GTD_SECONDS")
@@ -133,11 +137,11 @@ class Settings(BaseSettings):
         default=0.002,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE",
     )
-    near_close_crypto_updown_min_best_ask: float = Field(default=0.75, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
-    near_close_crypto_updown_min_midpoint: float = Field(default=0.60, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT")
-    near_close_crypto_updown_max_spread: float = Field(default=0.04, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD")
+    near_close_crypto_updown_min_best_ask: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
+    near_close_crypto_updown_min_midpoint: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT")
+    near_close_crypto_updown_max_spread: float = Field(default=0.05, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD")
     near_close_crypto_updown_max_bid_price: float = Field(
-        default=0.988,
+        default=0.97,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE",
     )
     near_close_crypto_updown_min_depth: float = Field(
@@ -209,9 +213,9 @@ class Settings(BaseSettings):
     max_daily_paper_notional: float = Field(default=5000.0, alias="MAX_DAILY_PAPER_NOTIONAL")
     max_daily_paper_trades: int = Field(default=250, alias="MAX_DAILY_PAPER_TRADES")
     max_daily_live_notional: float = Field(default=1000.0, alias="MAX_DAILY_LIVE_NOTIONAL")
-    max_daily_live_orders: int = Field(default=20, alias="MAX_DAILY_LIVE_ORDERS")
+    max_daily_live_orders: int = Field(default=42, alias="MAX_DAILY_LIVE_ORDERS")
 
-    @field_validator("sqlite_path", "related_rules_path", mode="before")
+    @field_validator("sqlite_path", "sqlite_backup_dir", "related_rules_path", mode="before")
     @classmethod
     def _expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser()

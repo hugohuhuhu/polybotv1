@@ -307,7 +307,24 @@ def run_auto_redeem_once(
                 _ctf_balance_data(wallet, token_id),
             )
             if balance_units <= 0:
-                result.message = "No conditional token balance to redeem."
+                repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
+                repository.save_execution_event(
+                    source="auto-redeem",
+                    mode="live",
+                    opportunity_id=str(candidate.get("opportunity_id") or ""),
+                    status="redeemed",
+                    message="Winning conditional token has no wallet balance; marking local position complete.",
+                    details={
+                        "market_slug": result.market_slug,
+                        "outcome_label": result.outcome_label,
+                        "token_id": token_id,
+                        "condition_id": condition_id,
+                        "ctf_units": balance_units,
+                        "reason": "no_conditional_token_balance",
+                    },
+                )
+                result.status = "redeemed"
+                result.message = "No conditional token balance to redeem; local position marked complete."
                 results.append(result)
                 continue
             usdce_before = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)

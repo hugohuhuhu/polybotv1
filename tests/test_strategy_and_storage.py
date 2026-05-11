@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 
 from app.models.core import (
@@ -69,6 +69,72 @@ def test_ranker_puts_higher_score_first() -> None:
         ]
     )
     assert ranked[0].opportunity_id == "high"
+
+
+def test_orderbook_snapshots_dedupe_by_token_and_minute(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "dedupe.db"))
+    captured_at = datetime(2026, 5, 10, 1, 2, 10, tzinfo=timezone.utc)
+    first = OrderBookSnapshot(
+        token_id="token-a",
+        market_id="market-a",
+        bids=[BookLevel(price=0.47, size=100)],
+        asks=[BookLevel(price=0.49, size=100)],
+        updated_at=captured_at,
+    )
+    second = first.model_copy(
+        update={
+            "bids": [BookLevel(price=0.48, size=100)],
+            "asks": [BookLevel(price=0.50, size=100)],
+            "updated_at": captured_at + timedelta(seconds=25),
+        }
+    )
+
+    repository.save_orderbooks([first, second])
+
+    row = repository.connection.fetchone(
+        "SELECT COUNT(*) AS count, MAX(best_bid) AS best_bid FROM orderbook_snapshots WHERE token_id = ?",
+        ("token-a",),
+    )
+    repository.connection.close()
+    assert row["count"] == 1
+    assert row["best_bid"] == 0.48
+
+
+def test_database_maintenance_keeps_daily_summary_and_prunes_raw_rows(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "maintenance.db"))
+    now = datetime.now(timezone.utc)
+    old_raw = (now - timedelta(days=8)).isoformat()
+    old_snapshot = (now - timedelta(days=31)).isoformat()
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO orderbook_snapshots (
+                token_id, market_id, captured_minute, best_bid, best_ask, midpoint, spread,
+                bids_json, asks_json, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("token-old", "market-old", old_raw[:16], 0.1, 0.2, 0.15, 0.1, "[]", "[]", old_raw),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO scan_cycles (
+                executed_at, discovered_market_count, monitored_market_count, book_count,
+                opportunity_count, actionable_count, candidate_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (old_snapshot, 12, 3, 2, 1, 1, 0),
+        )
+
+    result = repository.run_database_maintenance(force=True, force_vacuum=False)
+
+    raw_count = repository.connection.fetchone("SELECT COUNT(*) AS count FROM orderbook_snapshots")
+    scan_count = repository.connection.fetchone("SELECT COUNT(*) AS count FROM scan_cycles")
+    summary_count = repository.connection.fetchone("SELECT COUNT(*) AS count FROM daily_summaries")
+    repository.connection.close()
+    assert result["status"] == "completed"
+    assert raw_count["count"] == 0
+    assert scan_count["count"] == 0
+    assert summary_count["count"] == 1
 
 
 def test_execution_planner_and_paper_simulator_fill_buy_basket() -> None:

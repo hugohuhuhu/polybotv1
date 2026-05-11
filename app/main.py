@@ -22,6 +22,7 @@ from app.orchestration import (
 from app.scanners.liquidity_filter import LiquidityFilter
 from app.services.preflight import PreflightReport, load_preflight_report
 from app.services.redeemer import run_auto_redeem_once
+from app.storage.backups import backup_sqlite_database
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
@@ -232,12 +233,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket mispricing scanner")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("discover", "scan", "watch", "backfill", "report", "serve"):
+    for command in ("discover", "scan", "watch", "backfill", "report", "serve", "maintain-db", "backup-db"):
         subparser = subparsers.add_parser(command, help=f"Run {command} command")
         if command in {"discover", "scan", "watch", "backfill"}:
             subparser.add_argument("--limit", type=int, default=None, help="Max events to process")
         if command == "serve":
             subparser.add_argument("--reload", action="store_true", help="Enable local auto reload")
+        if command == "maintain-db":
+            subparser.add_argument("--vacuum", action="store_true", help="Force SQLite VACUUM")
+        if command == "backup-db":
+            subparser.add_argument("--label", default="manual", help="Backup filename label")
     return parser
 
 
@@ -256,7 +261,26 @@ async def cmd_scan(settings: Settings, args: argparse.Namespace) -> None:
     with closing(connect_db(settings)) as connection:
         repository = ScannerRepository(connection)
         result = await execute_scan_cycle(settings, limit=args.limit, repository=repository)
-        persist_scan_cycle(repository, result)
+        persist_scan_cycle(repository, result, settings)
+        try:
+            redeem_results = run_auto_redeem_once(settings, repository)
+        except Exception as exc:
+            repository.save_execution_event(
+                source="auto-redeem",
+                mode="live",
+                opportunity_id=None,
+                status="failed",
+                message=str(exc),
+                details={"trigger": "scan"},
+            )
+            logger.warning("Auto redeem failed during scan", context={"error": str(exc)})
+        else:
+            for redeem_result in redeem_results:
+                if redeem_result.status == "redeemed":
+                    console.print_message(
+                        f"Redeemed {redeem_result.market_slug} / {redeem_result.outcome_label}: "
+                        f"{redeem_result.redeemed_size:.4f} shares."
+                    )
     console.show_discovery_summary(result.events, result.markets)
     console.show_opportunities(result.opportunities)
 
@@ -317,7 +341,18 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
         for snapshot in initial.books.values():
             book_state.upsert_snapshot(snapshot)
         repository.get_trading_controls(default_controls)
-        persist_scan_cycle(repository, initial)
+        persist_scan_cycle(repository, initial, settings)
+        repository.save_watch_heartbeat(
+            source="watch",
+            state="running",
+            latest_scan_at=initial.executed_at,
+            message="watch initial scan completed",
+            details={
+                "monitored_markets": len(initial.shortlisted_markets),
+                "book_count": len(initial.books),
+                "opportunity_count": len(initial.opportunities),
+            },
+        )
         current_shortlist = initial.shortlisted_markets
         current_shortlist_diagnostics = initial.shortlist_diagnostics
         last_discovered_market_count = len(initial.markets)
@@ -348,7 +383,7 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
                     current_shortlist_diagnostics = cycle.shortlist_diagnostics
                     last_discovered_market_count = len(cycle.markets)
                     last_discovery_loop_time = loop_time
-                    persist_scan_cycle(repository, cycle)
+                    persist_scan_cycle(repository, cycle, settings)
                     console.show_discovery_summary(cycle.events, cycle.markets)
                 else:
                     cycle = await execute_monitor_cycle(
@@ -361,7 +396,20 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
                         repository,
                         cycle,
                         discovered_market_count=last_discovered_market_count,
+                        settings=settings,
                     )
+                repository.save_watch_heartbeat(
+                    source="watch",
+                    state="running",
+                    latest_scan_at=cycle.executed_at,
+                    message="watch scan completed",
+                    details={
+                        "refresh_discovery": refresh_discovery,
+                        "monitored_markets": len(cycle.shortlisted_markets),
+                        "book_count": len(cycle.books),
+                        "opportunity_count": len(cycle.opportunities),
+                    },
+                )
 
                 # Refresh the monitored universe every cycle so watch pool follows the latest shortlist.
                 book_state.books = {}
@@ -717,6 +765,30 @@ def cmd_report(settings: Settings) -> None:
         console.print(f"Alert to fill latency: {latency if latency is not None else 'N/A'} sec")
 
 
+def cmd_maintain_db(settings: Settings, args: argparse.Namespace) -> None:
+    from rich.console import Console
+
+    console = Console()
+    with closing(connect_db(settings)) as connection:
+        repository = ScannerRepository(connection)
+        result = repository.run_database_maintenance(
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+            force=True,
+            force_vacuum=bool(args.vacuum),
+        )
+    console.print(result)
+
+
+def cmd_backup_db(settings: Settings, args: argparse.Namespace) -> None:
+    from rich.console import Console
+
+    result = backup_sqlite_database(settings, label=args.label)
+    Console().print(result)
+
+
 def cmd_serve(settings: Settings, args: argparse.Namespace) -> None:
     import uvicorn
 
@@ -739,6 +811,10 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await cmd_backfill(settings, args)
     elif args.command == "report":
         cmd_report(settings)
+    elif args.command == "maintain-db":
+        cmd_maintain_db(settings, args)
+    elif args.command == "backup-db":
+        cmd_backup_db(settings, args)
 
 
 def main() -> None:
