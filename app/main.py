@@ -3,35 +3,167 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
+import sqlite3
 from contextlib import closing
-from time import time
+from datetime import datetime, timezone
+from pathlib import Path
+from time import sleep, time
+from typing import Any
 
 from app.alerts.console_alerts import ConsoleAlerts
 from app.alerts.telegram_alerts import TelegramAlerts
+from app.clients.clob_client import ClobClient
 from app.clients.websocket_client import MarketWebSocketClient, OrderBookState
 from app.config import Settings, get_settings
+from app.models.core import ExecutionLeg, ExecutionPlan
 from app.models.runtime import TradingControls
 from app.orchestration import (
     collect_previous_midpoints,
-    execute_monitor_cycle,
     execute_scan_cycle,
-    persist_monitor_cycle,
     persist_scan_cycle,
     shortlist_markets,
 )
 from app.scanners.liquidity_filter import LiquidityFilter
 from app.services.preflight import PreflightReport, load_preflight_report
 from app.services.redeemer import run_auto_redeem_once
+from app.storage.backups import backup_sqlite_database
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter
+from app.strategy.near_close_order_manager import NearCloseOrderManager
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
 from app.utils.logging_utils import configure_logging, get_logger
 
 
 logger = get_logger(__name__)
+RUNTIME_LOG_DIR = Path(__file__).resolve().parent.parent / "runtime-logs"
+WATCH_PID_FILE = RUNTIME_LOG_DIR / "watch.pid"
+WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
+
+
+def _read_pid(pid_file: Path) -> int | None:
+    try:
+        raw = pid_file.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _pid_running(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _watch_pid_guard() -> None:
+    RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+    existing_pid = _read_pid(WATCH_PID_FILE)
+    if existing_pid and existing_pid != current_pid and _pid_running(existing_pid):
+        raise RuntimeError(f"watch is already running (pid {existing_pid}).")
+    WATCH_PID_FILE.write_text(str(current_pid), encoding="ascii")
+    try:
+        yield
+    finally:
+        if _read_pid(WATCH_PID_FILE) == current_pid:
+            with contextlib.suppress(OSError):
+                WATCH_PID_FILE.unlink()
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def _touch_watch_liveness() -> None:
+    with contextlib.suppress(OSError):
+        RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        WATCH_LIVENESS_FILE.write_text(datetime.now(timezone.utc).isoformat(), encoding="ascii")
+
+
+def _save_watch_heartbeat(
+    settings: Settings,
+    *,
+    state: str,
+    message: str,
+    latest_scan_at: datetime | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    for attempt in range(3):
+        try:
+            with closing(connect_db(settings)) as connection:
+                ScannerRepository(connection).save_watch_heartbeat(
+                    source="watch",
+                    state=state,
+                    latest_scan_at=latest_scan_at,
+                    message=message,
+                    details=details,
+                )
+            return
+        except Exception as exc:
+            if not _is_sqlite_lock_error(exc) or attempt == 2:
+                logger.debug("watch heartbeat write skipped", context={"state": state, "error": str(exc)})
+                return
+            sleep(0.1 * (attempt + 1))
+
+
+async def _watch_delay(
+    settings: Settings,
+    *,
+    message: str = "watch delay before next scan",
+    details: dict[str, Any] | None = None,
+) -> None:
+    delay_started_at = datetime.now(timezone.utc)
+    delay_until_ts = time() + settings.watch_timeout_retry_sec
+    delay_until = datetime.fromtimestamp(delay_until_ts, tz=timezone.utc)
+    _save_watch_heartbeat(
+        settings,
+        state="delay",
+        message=message,
+        latest_scan_at=None,
+        details={
+            "phase": "delay",
+            "delay_started_at": delay_started_at.isoformat(),
+            "delay_until": delay_until.isoformat(),
+            "delay_sec": settings.watch_timeout_retry_sec,
+            "scan_timeout_sec": settings.watch_scan_timeout_sec,
+            **(details or {}),
+        },
+    )
+    while True:
+        _touch_watch_liveness()
+        remaining = delay_until_ts - time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 5.0))
 
 
 def _is_near_close_opportunity(opportunity: object) -> bool:
@@ -55,6 +187,113 @@ def _split_cancel_response(order_ids: list[str], response: object) -> tuple[list
     if not canceled_ids and not uncertain_ids:
         return order_ids, []
     return canceled_ids, uncertain_ids
+
+
+async def _execute_near_close_taker_exits(
+    *,
+    repository: ScannerRepository,
+    live_trader: PolymarketLiveTradingAdapter,
+    settings: Settings,
+    watch_books: dict[str, object],
+) -> list[dict[str, object]]:
+    manager = NearCloseOrderManager(settings)
+    exits: list[dict[str, object]] = []
+    for group in repository.near_close_stop_exit_groups(limit=50):
+        if float(group.get("open_size") or 0.0) <= 1e-9:
+            continue
+        token_id = str(group.get("token_id") or "")
+        market_slug = str(group.get("market_slug") or "")
+        if "updown" not in market_slug:
+            continue
+        book = watch_books.get(token_id)
+        if book is None or not manager.taker_exit_required(book=book):
+            continue
+        target_price = manager.taker_exit_price(book=book)
+        if target_price is None or target_price <= 0:
+            continue
+        size = float(group.get("open_size") or 0.0)
+        plan = ExecutionPlan(
+            opportunity_id=f"stop-exit:{market_slug}:{token_id}",
+            summary=f"Taker stop exit on {market_slug} at {target_price:.4f}",
+            legs=[
+                ExecutionLeg(
+                    action="SELL",
+                    token_id=token_id,
+                    market_slug=market_slug,
+                    outcome_label=str(group.get("outcome_label") or "Outcome"),
+                    target_price=target_price,
+                    size=size,
+                    order_type="FAK",
+                    post_only=False,
+                    metadata={
+                        "strategy_variant": "near_close_stop_exit",
+                        "stop_trigger_price": settings.near_close_taker_exit_price,
+                        "stop_reference_price": target_price,
+                    },
+                )
+            ],
+            max_slippage_bps=10.0,
+            cancel_conditions=["Stop exit should take immediately available liquidity."],
+            requires_manual_approval=False,
+            live_trading_allowed=True,
+            strategy_type="near_close_stop_exit",
+            metadata={"market_slug": market_slug, "token_id": token_id},
+        )
+        live_result = await live_trader.execute(plan)
+        repository.save_live_execution(live_result)
+        repository.save_execution_event(
+            source="watch",
+            mode="live",
+            opportunity_id=plan.opportunity_id,
+            status=live_result.status,
+            message=live_result.message,
+            details={
+                "stop_trigger_price": settings.near_close_taker_exit_price,
+                "reference_price": target_price,
+                "market_slug": market_slug,
+                "token_id": token_id,
+                "legs": [leg.model_dump() for leg in live_result.leg_results],
+            },
+        )
+        exits.append(
+            {
+                "market_slug": market_slug,
+                "token_id": token_id,
+                "status": live_result.status,
+                "reference_price": target_price,
+                "size": size,
+            }
+        )
+    return exits
+
+
+def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
+    token_ids: list[str] = []
+    for group in repository.near_close_stop_exit_groups(limit=50):
+        if float(group.get("open_size") or 0.0) <= 1e-9:
+            continue
+        token_id = str(group.get("token_id") or "").strip()
+        if token_id:
+            token_ids.append(token_id)
+    return list(dict.fromkeys(token_ids))
+
+
+async def _fetch_open_position_books(
+    *,
+    settings: Settings,
+    repository: ScannerRepository,
+) -> dict[str, object]:
+    token_ids = _open_position_token_ids(repository)
+    if not token_ids:
+        return {}
+    clob = ClobClient(
+        settings.clob_base_url,
+        concurrency=min(max(len(token_ids), 1), settings.book_fetch_concurrency),
+    )
+    try:
+        return await clob.get_order_books(token_ids)
+    finally:
+        await clob.close()
 
 
 async def _manage_near_close_reprice(
@@ -135,7 +374,11 @@ async def _manage_near_close_reprice(
 
     canceled_ids, uncertain_ids = _split_cancel_response(stale_order_ids, cancel_response)
     updated = repository.mark_live_orders_cancelled(canceled_ids, status="reprice_cancelled")
-    uncertain_updated = repository.mark_live_orders_cancelled(uncertain_ids, status="cancel_unconfirmed")
+    uncertain_updated = repository.mark_live_orders_cancelled(
+        uncertain_ids,
+        status="cancel_unconfirmed",
+        cancel_response=cancel_response,
+    )
     repository.save_execution_event(
         source="watch",
         mode="live",
@@ -210,7 +453,11 @@ async def _cancel_unqualified_near_close_orders(
 
     canceled_ids, uncertain_ids = _split_cancel_response(cancel_ids, cancel_response)
     updated = repository.mark_live_orders_cancelled(canceled_ids, status="qualification_cancelled")
-    uncertain_updated = repository.mark_live_orders_cancelled(uncertain_ids, status="cancel_unconfirmed")
+    uncertain_updated = repository.mark_live_orders_cancelled(
+        uncertain_ids,
+        status="cancel_unconfirmed",
+        cancel_response=cancel_response,
+    )
     repository.save_execution_event(
         source="watch",
         mode="live",
@@ -232,12 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket mispricing scanner")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("discover", "scan", "watch", "backfill", "report", "serve"):
+    for command in ("discover", "scan", "watch", "backfill", "report", "serve", "maintain-db", "backup-db"):
         subparser = subparsers.add_parser(command, help=f"Run {command} command")
         if command in {"discover", "scan", "watch", "backfill"}:
             subparser.add_argument("--limit", type=int, default=None, help="Max events to process")
         if command == "serve":
             subparser.add_argument("--reload", action="store_true", help="Enable local auto reload")
+        if command == "maintain-db":
+            subparser.add_argument("--vacuum", action="store_true", help="Force SQLite VACUUM")
+        if command == "backup-db":
+            subparser.add_argument("--label", default="manual", help="Backup filename label")
     return parser
 
 
@@ -256,12 +507,37 @@ async def cmd_scan(settings: Settings, args: argparse.Namespace) -> None:
     with closing(connect_db(settings)) as connection:
         repository = ScannerRepository(connection)
         result = await execute_scan_cycle(settings, limit=args.limit, repository=repository)
-        persist_scan_cycle(repository, result)
+        persist_scan_cycle(repository, result, settings)
+        try:
+            redeem_results = run_auto_redeem_once(settings, repository)
+        except Exception as exc:
+            repository.save_execution_event(
+                source="auto-redeem",
+                mode="live",
+                opportunity_id=None,
+                status="failed",
+                message=str(exc),
+                details={"trigger": "scan"},
+            )
+            logger.warning("Auto redeem failed during scan", context={"error": str(exc)})
+        else:
+            for redeem_result in redeem_results:
+                if redeem_result.status == "redeemed":
+                    console.print_message(
+                        f"Redeemed {redeem_result.market_slug} / {redeem_result.outcome_label}: "
+                        f"{redeem_result.redeemed_size:.4f} shares."
+                    )
     console.show_discovery_summary(result.events, result.markets)
     console.show_opportunities(result.opportunities)
 
 
 async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
+    with _watch_pid_guard():
+        await _cmd_watch_impl(settings, args)
+
+
+async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
+    _touch_watch_liveness()
     console = ConsoleAlerts()
     telegram = TelegramAlerts(settings.telegram_bot_token, settings.telegram_chat_id)
     paper = PaperTradeSimulator(settings.fees_bps)
@@ -273,10 +549,6 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
     websocket_task: asyncio.Task[None] | None = None
     subscribed_asset_ids: list[str] = []
     book_state = OrderBookState()
-    current_shortlist = []
-    current_shortlist_diagnostics: dict[str, object] = {}
-    last_discovered_market_count = 0
-    last_discovery_loop_time = 0.0
     last_redeem_loop_time = 0.0
 
     async def get_preflight(*, force: bool = False) -> PreflightReport:
@@ -311,67 +583,211 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
         websocket_client = MarketWebSocketClient(settings.ws_market_url, book_state.handle_message)
         websocket_task = asyncio.create_task(websocket_client.subscribe_forever(normalized_asset_ids))
 
-    with closing(connect_db(settings)) as connection:
-        repository = ScannerRepository(connection)
-        initial = await execute_scan_cycle(settings, limit=args.limit, repository=repository)
-        for snapshot in initial.books.values():
-            book_state.upsert_snapshot(snapshot)
-        repository.get_trading_controls(default_controls)
-        persist_scan_cycle(repository, initial)
-        current_shortlist = initial.shortlisted_markets
-        current_shortlist_diagnostics = initial.shortlist_diagnostics
-        last_discovered_market_count = len(initial.markets)
-        last_discovery_loop_time = asyncio.get_running_loop().time()
+    async def wait_with_scan_budget(awaitable: Any, loop_started_at: float) -> Any:
+        remaining = settings.watch_scan_timeout_sec - (asyncio.get_running_loop().time() - loop_started_at)
+        if remaining <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=remaining)
+
+    while True:
+        _touch_watch_liveness()
+        scan_started_at = datetime.now(timezone.utc)
+        loop_started_at = asyncio.get_running_loop().time()
+        _save_watch_heartbeat(
+            settings,
+            state="scanning",
+            message="watch initial scan started",
+            details={
+                "phase": "scanning",
+                "scan_started_at": scan_started_at.isoformat(),
+                "timeout_sec": settings.watch_scan_timeout_sec,
+                "delay_sec": settings.watch_timeout_retry_sec,
+            },
+        )
+        try:
+            with closing(connect_db(settings)) as connection:
+                repository = ScannerRepository(connection)
+                initial = await wait_with_scan_budget(
+                    execute_scan_cycle(settings, limit=args.limit, repository=repository),
+                    loop_started_at,
+                )
+                for snapshot in initial.books.values():
+                    book_state.upsert_snapshot(snapshot)
+                open_position_books = await wait_with_scan_budget(
+                    _fetch_open_position_books(settings=settings, repository=repository),
+                    loop_started_at,
+                )
+                for snapshot in open_position_books.values():
+                    book_state.upsert_snapshot(snapshot)
+                repository.get_trading_controls(default_controls)
+                try:
+                    persist_scan_cycle(repository, initial, settings)
+                    repository.save_watch_heartbeat(
+                        source="watch",
+                        state="running",
+                        latest_scan_at=initial.executed_at,
+                        message="watch initial scan completed",
+                        details={
+                            "phase": "completed",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "scan_completed_at": initial.executed_at.isoformat(),
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                            "scan_timeout_sec": settings.watch_scan_timeout_sec,
+                            "monitored_markets": len(initial.shortlisted_markets),
+                            "book_count": len(initial.books),
+                            "opportunity_count": len(initial.opportunities),
+                        },
+                    )
+                except Exception as exc:
+                    if not _is_sqlite_lock_error(exc):
+                        raise
+                    logger.warning("watch initial persistence skipped because SQLite is locked: %s", exc)
+            break
+        except TimeoutError:
+            with contextlib.suppress(Exception):
+                with closing(connect_db(settings)) as connection:
+                    ScannerRepository(connection).save_watch_heartbeat(
+                        source="watch",
+                        state="timeout",
+                        message=(
+                            f"watch initial scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
+                            f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
+                        ),
+                        details={
+                            "phase": "timeout",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "timeout_sec": settings.watch_scan_timeout_sec,
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                        },
+                    )
+            await _watch_delay(
+                settings,
+                message="watch initial scan timed out; delaying before the next scan",
+                details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
+            )
     console.show_discovery_summary(initial.events, initial.markets)
     console.show_opportunities(initial.opportunities[:10])
-    await ensure_websocket(list(initial.books.keys()))
+    await ensure_websocket(list(book_state.books.keys()))
 
     try:
         previous_midpoints = collect_previous_midpoints(book_state.books)
         while True:
-            await asyncio.sleep(settings.scan_interval_sec)
+            await _watch_delay(settings)
+            _touch_watch_liveness()
+            scan_started_at = datetime.now(timezone.utc)
+            loop_started_at = asyncio.get_running_loop().time()
+            loop_time = loop_started_at
+            _save_watch_heartbeat(
+                settings,
+                state="scanning",
+                message="watch scan started",
+                details={
+                    "phase": "scanning",
+                    "scan_started_at": scan_started_at.isoformat(),
+                    "timeout_sec": settings.watch_scan_timeout_sec,
+                    "delay_sec": settings.watch_timeout_retry_sec,
+                },
+            )
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
-                loop_time = asyncio.get_running_loop().time()
-                refresh_discovery = (
-                    not current_shortlist
-                    or (loop_time - last_discovery_loop_time) >= settings.discovery_refresh_sec
-                )
-                if refresh_discovery:
-                    cycle = await execute_scan_cycle(
+                try:
+                    cycle = await wait_with_scan_budget(
+                        execute_scan_cycle(
+                            settings,
+                            limit=args.limit,
+                            previous_midpoints=previous_midpoints,
+                            repository=repository,
+                        ),
+                        loop_started_at,
+                    )
+                except TimeoutError:
+                    repository.save_watch_heartbeat(
+                        source="watch",
+                        state="timeout",
+                        message=(
+                            f"watch scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
+                            f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
+                        ),
+                        details={
+                            "phase": "timeout",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "timeout_sec": settings.watch_scan_timeout_sec,
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                        },
+                    )
+                    await _watch_delay(
                         settings,
-                        limit=args.limit,
-                        previous_midpoints=previous_midpoints,
-                        repository=repository,
+                        message="watch scan timed out; delaying before the next scan",
+                        details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
                     )
-                    current_shortlist = cycle.shortlisted_markets
-                    current_shortlist_diagnostics = cycle.shortlist_diagnostics
-                    last_discovered_market_count = len(cycle.markets)
-                    last_discovery_loop_time = loop_time
-                    persist_scan_cycle(repository, cycle)
-                    console.show_discovery_summary(cycle.events, cycle.markets)
-                else:
-                    cycle = await execute_monitor_cycle(
-                        settings,
-                        current_shortlist,
-                        previous_midpoints=previous_midpoints,
-                        shortlist_diagnostics=current_shortlist_diagnostics,
+                    continue
+                try:
+                    persist_scan_cycle(repository, cycle, settings)
+                except Exception as exc:
+                    if not _is_sqlite_lock_error(exc):
+                        raise
+                    logger.warning("watch persistence skipped because SQLite is locked: %s", exc)
+                console.show_discovery_summary(cycle.events, cycle.markets)
+                try:
+                    repository.save_watch_heartbeat(
+                        source="watch",
+                        state="running",
+                        latest_scan_at=scan_started_at,
+                        message="watch scan completed",
+                        details={
+                            "phase": "completed",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "scan_completed_at": cycle.executed_at.isoformat(),
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                            "scan_timeout_sec": settings.watch_scan_timeout_sec,
+                            "refresh_discovery": True,
+                            "monitored_markets": len(cycle.shortlisted_markets),
+                            "book_count": len(cycle.books),
+                            "opportunity_count": len(cycle.opportunities),
+                        },
                     )
-                    persist_monitor_cycle(
-                        repository,
-                        cycle,
-                        discovered_market_count=last_discovered_market_count,
-                    )
+                except Exception as exc:
+                    if not _is_sqlite_lock_error(exc):
+                        raise
+                    logger.warning("watch heartbeat skipped because SQLite is locked: %s", exc)
 
                 # Refresh the monitored universe every cycle so watch pool follows the latest shortlist.
                 book_state.books = {}
                 for snapshot in cycle.books.values():
                     book_state.upsert_snapshot(snapshot)
-                await ensure_websocket(list(cycle.books.keys()))
-                previous_midpoints = collect_previous_midpoints(book_state.books)
 
                 controls = repository.get_trading_controls(default_controls)
                 runtime_settings = controls.apply(settings)
+                try:
+                    open_position_books = await wait_with_scan_budget(
+                        _fetch_open_position_books(settings=runtime_settings, repository=repository),
+                        loop_started_at,
+                    )
+                except TimeoutError:
+                    repository.save_watch_heartbeat(
+                        source="watch",
+                        state="timeout",
+                        message=(
+                            f"watch open-position scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
+                            f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
+                        ),
+                        details={
+                            "phase": "timeout",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "timeout_sec": settings.watch_scan_timeout_sec,
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                        },
+                    )
+                    await _watch_delay(
+                        settings,
+                        message="watch open-position scan timed out; delaying before the next scan",
+                        details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
+                    )
+                    continue
+                for snapshot in open_position_books.values():
+                    book_state.upsert_snapshot(snapshot)
+                await ensure_websocket(list(book_state.books.keys()))
+                previous_midpoints = collect_previous_midpoints(book_state.books)
                 planner = ExecutionPlanner(max_leg_size=runtime_settings.live_max_order_size)
                 risk_manager = RiskManager(runtime_settings)
                 liquidity_filter = LiquidityFilter(runtime_settings)
@@ -432,6 +848,23 @@ async def cmd_watch(settings: Settings, args: argparse.Namespace) -> None:
                         repository=repository,
                         live_trader=live_trader,
                     )
+                    try:
+                        await _execute_near_close_taker_exits(
+                            repository=repository,
+                            live_trader=live_trader,
+                            settings=runtime_settings,
+                            watch_books=book_state.books,
+                        )
+                    except Exception as exc:
+                        repository.save_execution_event(
+                            source="watch",
+                            mode="live",
+                            opportunity_id=None,
+                            status="stop_exit_failed",
+                            message=str(exc),
+                            details={"trigger_price": runtime_settings.near_close_taker_exit_price},
+                        )
+                        logger.warning("Near-close taker exit failed", context={"error": str(exc)})
 
                 for opportunity in cycle.opportunities:
                     if not liquidity_filter.is_alert_eligible(opportunity):
@@ -717,6 +1150,30 @@ def cmd_report(settings: Settings) -> None:
         console.print(f"Alert to fill latency: {latency if latency is not None else 'N/A'} sec")
 
 
+def cmd_maintain_db(settings: Settings, args: argparse.Namespace) -> None:
+    from rich.console import Console
+
+    console = Console()
+    with closing(connect_db(settings)) as connection:
+        repository = ScannerRepository(connection)
+        result = repository.run_database_maintenance(
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+            force=True,
+            force_vacuum=bool(args.vacuum),
+        )
+    console.print(result)
+
+
+def cmd_backup_db(settings: Settings, args: argparse.Namespace) -> None:
+    from rich.console import Console
+
+    result = backup_sqlite_database(settings, label=args.label)
+    Console().print(result)
+
+
 def cmd_serve(settings: Settings, args: argparse.Namespace) -> None:
     import uvicorn
 
@@ -739,6 +1196,10 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await cmd_backfill(settings, args)
     elif args.command == "report":
         cmd_report(settings)
+    elif args.command == "maintain-db":
+        cmd_maintain_db(settings, args)
+    elif args.command == "backup-db":
+        cmd_backup_db(settings, args)
 
 
 def main() -> None:

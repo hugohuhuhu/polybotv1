@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -9,6 +10,8 @@ BALANCE_OF_SELECTOR = "70a08231"
 ALLOWANCE_SELECTOR = "dd62ed3e"
 TOKEN_DECIMALS = 6
 NATIVE_TOKEN_DECIMALS = 18
+RPC_RETRY_ATTEMPTS = 3
+RPC_RETRY_DELAY_SEC = 0.25
 
 
 def encode_address_param(address: str) -> str:
@@ -31,12 +34,26 @@ async def rpc_call(
         "method": method,
         "params": params,
     }
-    response = await client.post(rpc_url, json=payload)
-    response.raise_for_status()
-    body = response.json()
-    if body.get("error"):
-        raise ValueError(f"Polygon RPC error: {body['error']}")
-    return body.get("result")
+    last_error: Exception | None = None
+    for attempt in range(1, RPC_RETRY_ATTEMPTS + 1):
+        try:
+            response = await client.post(rpc_url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+            if body.get("error"):
+                raise ValueError(f"Polygon RPC error: {body['error']}")
+            return body.get("result")
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            last_error = exc
+            if attempt >= RPC_RETRY_ATTEMPTS:
+                break
+            await asyncio.sleep(RPC_RETRY_DELAY_SEC * attempt)
+    if last_error is not None:
+        error_text = str(last_error).strip() or last_error.__class__.__name__
+        raise RuntimeError(
+            f"Polygon RPC {method} failed after {RPC_RETRY_ATTEMPTS} attempts: {error_text}"
+        ) from last_error
+    raise RuntimeError(f"Polygon RPC {method} failed without a response.")
 
 
 async def fetch_chain_id(client: httpx.AsyncClient, rpc_url: str) -> int:

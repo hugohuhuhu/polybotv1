@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from threading import Lock
 from typing import Any
 
@@ -160,6 +160,20 @@ def normalize_market_order_amount(action: str, shares: float, price: float) -> f
     raise ValueError(f"Unsupported action: {action}")
 
 
+def normalize_limit_order_price(action: str, price: float, tick_size: str | float | None) -> float:
+    normalized_action = action.upper()
+    if normalized_action not in {"BUY", "SELL"}:
+        raise ValueError(f"Unsupported action: {action}")
+    tick = Decimal(str(tick_size or "0.01"))
+    if tick <= 0:
+        tick = Decimal("0.01")
+    value = Decimal(str(max(price, 0.0)))
+    rounding = ROUND_DOWN if normalized_action == "BUY" else ROUND_UP
+    units = (value / tick).to_integral_value(rounding=rounding)
+    normalized = units * tick
+    return float(normalized.quantize(tick))
+
+
 def _normalize_balance_allowance_payload(payload: dict[str, Any]) -> AllowanceSnapshot:
     raw_allowances = payload.get("allowances") or {}
     allowances = {
@@ -265,6 +279,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                 neg_risk = self._resolve_neg_risk(client, leg.token_id, order_book)
                 options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
                 side = Side.BUY if leg.action.upper() == "BUY" else Side.SELL
+                normalized_price = normalize_limit_order_price(leg.action, float(leg.target_price), tick_size)
                 exchange_address = self.settings.polymarket_exchange_spender_address
 
                 collateral_status = None
@@ -273,7 +288,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                     submitted_size = normalize_market_order_amount(
                         leg.action,
                         desired_shares,
-                        float(leg.target_price),
+                        normalized_price,
                     )
                     if submitted_size <= 0:
                         raise LiveTradingError("Market order amount rounded down to zero.")
@@ -287,7 +302,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                             token_id=leg.token_id,
                             amount=float(submitted_size),
                             side=side,
-                            price=float(leg.target_price),
+                            price=normalized_price,
                             order_type=self._order_type_enum(leg_order_type),
                             user_usdc_balance=collateral_status.balance if collateral_status else 0.0,
                         ),
@@ -302,7 +317,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                     order = client.create_order(
                         OrderArgs(
                             token_id=leg.token_id,
-                            price=float(leg.target_price),
+                            price=normalized_price,
                             size=float(submitted_size),
                             side=side,
                             expiration=self._expiration_timestamp(leg),
@@ -331,6 +346,9 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                     **raw_response,
                     "desired_shares": desired_shares,
                     "submitted_size": submitted_size,
+                    "submitted_price": normalized_price,
+                    "requested_price": float(leg.target_price),
+                    "resolved_tick_size": tick_size,
                     "required_collateral": required_collateral,
                     "expected_shares": expected_shares,
                     "exchange_address": exchange_address,
@@ -353,7 +371,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                         token_id=leg.token_id,
                         market_slug=leg.market_slug,
                         outcome_label=leg.outcome_label,
-                        target_price=float(leg.target_price),
+                        target_price=normalized_price,
                         requested_size=float(desired_shares),
                         order_id=str(order_id) if order_id is not None else None,
                         status="submitted",
@@ -444,10 +462,26 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
         return getattr(order_book, field_name, None)
 
     def _resolve_tick_size(self, client: ClobClient, token_id: str, order_book: object) -> str:
-        tick_size = self._book_field(order_book, "tick_size")
-        if tick_size:
-            return str(tick_size)
-        return str(client.get_tick_size(token_id))
+        candidates: list[Decimal] = []
+        book_tick = self._book_field(order_book, "tick_size")
+        client_tick = None
+        if hasattr(client, "get_tick_size"):
+            try:
+                client_tick = client.get_tick_size(token_id)
+            except Exception:
+                client_tick = None
+        for value in (book_tick, client_tick):
+            if value is None:
+                continue
+            try:
+                tick = Decimal(str(value))
+            except Exception:
+                continue
+            if tick > 0:
+                candidates.append(tick)
+        if not candidates:
+            return "0.01"
+        return str(max(candidates))
 
     def _resolve_neg_risk(self, client: ClobClient, token_id: str, order_book: object) -> bool:
         neg_risk = self._book_field(order_book, "neg_risk")

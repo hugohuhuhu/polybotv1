@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+import time
+import warnings
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Iterator, Sequence
 
 from app.config import Settings
+from app.storage.path_safety import path_sync_warning
 
 try:
     import psycopg
@@ -40,6 +43,7 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id TEXT NOT NULL,
     market_id TEXT,
+    captured_minute TEXT NOT NULL DEFAULT '',
     best_bid REAL,
     best_ask REAL,
     midpoint REAL,
@@ -97,6 +101,35 @@ CREATE TABLE IF NOT EXISTS scan_cycles (
     opportunity_count INTEGER NOT NULL,
     actionable_count INTEGER NOT NULL,
     candidate_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    summary_date TEXT PRIMARY KEY,
+    scan_cycle_count INTEGER NOT NULL DEFAULT 0,
+    max_discovered_market_count INTEGER NOT NULL DEFAULT 0,
+    max_monitored_market_count INTEGER NOT NULL DEFAULT 0,
+    total_book_count INTEGER NOT NULL DEFAULT 0,
+    total_opportunity_count INTEGER NOT NULL DEFAULT 0,
+    total_actionable_count INTEGER NOT NULL DEFAULT 0,
+    total_candidate_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watch_heartbeats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    state TEXT NOT NULL,
+    latest_scan_at TEXT,
+    message TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS live_trades (
@@ -171,6 +204,7 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     id BIGSERIAL PRIMARY KEY,
     token_id TEXT NOT NULL,
     market_id TEXT,
+    captured_minute TEXT NOT NULL DEFAULT '',
     best_bid DOUBLE PRECISION,
     best_ask DOUBLE PRECISION,
     midpoint DOUBLE PRECISION,
@@ -228,6 +262,35 @@ CREATE TABLE IF NOT EXISTS scan_cycles (
     opportunity_count INTEGER NOT NULL,
     actionable_count INTEGER NOT NULL,
     candidate_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    summary_date TEXT PRIMARY KEY,
+    scan_cycle_count INTEGER NOT NULL DEFAULT 0,
+    max_discovered_market_count INTEGER NOT NULL DEFAULT 0,
+    max_monitored_market_count INTEGER NOT NULL DEFAULT 0,
+    total_book_count INTEGER NOT NULL DEFAULT 0,
+    total_opportunity_count INTEGER NOT NULL DEFAULT 0,
+    total_actionable_count INTEGER NOT NULL DEFAULT 0,
+    total_candidate_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watch_heartbeats (
+    id BIGSERIAL PRIMARY KEY,
+    source TEXT NOT NULL,
+    state TEXT NOT NULL,
+    latest_scan_at TEXT,
+    message TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS live_trades (
@@ -290,7 +353,19 @@ class DatabaseSession:
         return statement
 
     def execute(self, statement: str, params: Sequence[Any] | None = None) -> Any:
-        return self.connection.execute(self._sql(statement), tuple(params or ()))
+        sql = self._sql(statement)
+        parameters = tuple(params or ())
+        attempts = 6 if self.backend == "sqlite" else 1
+        delay_sec = 0.15
+        for attempt in range(attempts):
+            try:
+                return self.connection.execute(sql, parameters)
+            except sqlite3.OperationalError as exc:
+                if self.backend != "sqlite" or not _is_sqlite_lock_error(exc) or attempt >= attempts - 1:
+                    raise
+                time.sleep(delay_sec)
+                delay_sec = min(delay_sec * 2, 2.0)
+        raise RuntimeError("unreachable database execute retry state")
 
     def fetchone(self, statement: str, params: Sequence[Any] | None = None) -> dict[str, Any] | None:
         cursor = self.execute(statement, params)
@@ -320,8 +395,9 @@ class DatabaseSession:
             with self.connection.transaction():
                 yield
             return
-        with self.connection:
-            yield
+        with _sqlite_write_lock:
+            with self.connection:
+                yield
 
     @staticmethod
     def _normalize_row(row: Any) -> dict[str, Any] | None:
@@ -374,6 +450,48 @@ def _ensure_indexes(session: DatabaseSession) -> None:
         "CREATE INDEX IF NOT EXISTS idx_live_trades_created_at ON live_trades (created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_paper_trades_created_at ON paper_trades (created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_markets_dashboard ON markets (active, closed, liquidity DESC, discovered_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_watch_heartbeats_created_at ON watch_heartbeats (created_at DESC, id DESC)",
+    ]
+    with session.transaction():
+        for statement in statements:
+            session.execute(statement)
+
+
+def _backfill_orderbook_minutes(session: DatabaseSession) -> None:
+    if "captured_minute" not in _table_columns(session, "orderbook_snapshots"):
+        return
+    with session.transaction():
+        session.execute(
+            """
+            UPDATE orderbook_snapshots
+            SET captured_minute = substr(captured_at, 1, 16)
+            WHERE captured_minute = '' OR captured_minute IS NULL
+            """
+        )
+
+
+def _dedupe_orderbook_snapshots(session: DatabaseSession) -> None:
+    if session.backend != "sqlite":
+        return
+    with session.transaction():
+        session.execute(
+            """
+            DELETE FROM orderbook_snapshots
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM orderbook_snapshots
+                GROUP BY token_id, captured_minute
+            )
+            """
+        )
+
+
+def _ensure_unique_indexes(session: DatabaseSession) -> None:
+    statements = [
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_orderbook_token_minute
+        ON orderbook_snapshots (token_id, captured_minute)
+        """,
     ]
     with session.transaction():
         for statement in statements:
@@ -435,10 +553,20 @@ def _initialize_schema(session: DatabaseSession) -> None:
         column_name="near_close_funnel_json",
         definition="TEXT NOT NULL DEFAULT '[]'",
     )
+    _ensure_column(
+        session,
+        table_name="orderbook_snapshots",
+        column_name="captured_minute",
+        definition="TEXT NOT NULL DEFAULT ''",
+    )
+    _backfill_orderbook_minutes(session)
+    _dedupe_orderbook_snapshots(session)
     _ensure_indexes(session)
+    _ensure_unique_indexes(session)
 
 
 _sqlite_init_lock = Lock()
+_sqlite_write_lock = RLock()
 _initialized_sqlite_paths: set[Path] = set()
 _required_sqlite_tables = {
     "markets",
@@ -447,10 +575,13 @@ _required_sqlite_tables = {
     "alerts",
     "paper_trades",
     "scan_cycles",
+    "daily_summaries",
     "live_trades",
     "runtime_controls",
     "execution_claims",
     "execution_audit_log",
+    "maintenance_state",
+    "watch_heartbeats",
 }
 _required_scan_cycle_columns = {
     "executed_at",
@@ -473,7 +604,12 @@ _required_scan_cycle_columns = {
 def _configure_sqlite_connection(connection: sqlite3.Connection) -> None:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 1000")
+    connection.execute("PRAGMA busy_timeout = 30000")
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
 
 
 def _is_sqlite_corruption_error(exc: Exception) -> bool:
@@ -557,9 +693,12 @@ def connect_db(target: Settings | Path) -> DatabaseSession:
         sqlite_path = target
 
     sqlite_path = Path(sqlite_path).expanduser()
+    warning = path_sync_warning(sqlite_path)
+    if warning:
+        warnings.warn(warning, RuntimeWarning, stacklevel=2)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        connection = sqlite3.connect(sqlite_path, timeout=1.0, check_same_thread=False)
+        connection = sqlite3.connect(sqlite_path, timeout=30.0, check_same_thread=False)
         _configure_sqlite_connection(connection)
         session = DatabaseSession("sqlite", connection)
         _initialize_sqlite_database(session, sqlite_path.resolve())
@@ -572,7 +711,7 @@ def connect_db(target: Settings | Path) -> DatabaseSession:
         if not _is_sqlite_corruption_error(exc):
             raise
         _quarantine_sqlite_database(sqlite_path.resolve())
-        connection = sqlite3.connect(sqlite_path, timeout=1.0, check_same_thread=False)
+        connection = sqlite3.connect(sqlite_path, timeout=30.0, check_same_thread=False)
         _configure_sqlite_connection(connection)
         session = DatabaseSession("sqlite", connection)
         _initialize_sqlite_database(session, sqlite_path.resolve())

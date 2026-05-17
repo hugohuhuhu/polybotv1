@@ -80,6 +80,19 @@ class NearCloseOrderManager:
             return True
         return bool(book.best_bid is not None and book.best_bid < self.settings.near_close_hard_stop_bid)
 
+    def taker_exit_required(self, *, book: OrderBookSnapshot) -> bool:
+        reference_price = book.best_bid if book.best_bid is not None else book.midpoint
+        if reference_price is None:
+            return False
+        return reference_price <= self.settings.near_close_taker_exit_price
+
+    def taker_exit_price(self, *, book: OrderBookSnapshot) -> float | None:
+        if book.best_bid is not None:
+            return float(book.best_bid)
+        if book.midpoint is not None:
+            return float(book.midpoint)
+        return None
+
     def emergency_worst_price(self, *, book: OrderBookSnapshot, entry_price: float) -> float | None:
         if book.best_bid is None:
             return None

@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v17" />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v25" />
   </head>
   <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
     <div class="ambient ambient-a"></div>
@@ -41,17 +41,94 @@
           <p class="hero-label">控制中心</p>
           <h2>把掃描、風控與交易紀錄集中在同一個遠端面板</h2>
           <p class="hero-copy">
-            這個頁面會固定自動刷新，讓你在瀏覽器直接看目前市場探索、候選機會、執行紀錄與資料持久化狀態。
+            這個頁面會持續呈現市場探索、候選機會、執行紀錄與資料持久化狀態。
           </p>
+          <article class="hero-wallet-card">
+            <div class="hero-wallet-card__header">
+              <div>
+                <p class="panel-kicker">錢包狀態</p>
+                <strong>私鑰對應錢包</strong>
+              </div>
+              <span id="walletStatusNote">尚未輸入私鑰</span>
+            </div>
+            <div class="hero-wallet-address">
+              <span>錢包地址</span>
+              <strong id="walletAddress">-</strong>
+            </div>
+            <div class="hero-wallet-grid">
+              <article class="wallet-item">
+                <span>POL Gas</span>
+                <strong id="walletPol">-</strong>
+              </article>
+              <article class="wallet-item">
+                <span>pUSD</span>
+                <strong id="walletPusd">-</strong>
+              </article>
+              <article class="wallet-item">
+                <span>USDC</span>
+                <strong id="walletUsdc">-</strong>
+              </article>
+            </div>
+          </article>
         </div>
+
+        <article class="control-card hero-control-card" id="tradingCard">
+          <div class="panel-header hero-control-header">
+            <div>
+              <p class="panel-kicker">交易控制</p>
+              <h3>監看與交易開關</h3>
+            </div>
+            <p class="panel-note">watch、Live、自動下單與緊急停止集中在這裡。</p>
+          </div>
+          <div class="armed-indicator hidden" id="armedIndicator" aria-live="polite">
+            <span class="armed-indicator__icon" aria-hidden="true">
+              <span class="armed-indicator__pulse"></span>
+            </span>
+            <div>
+              <strong>武裝成功</strong>
+              <p>背景監看命中可交易機會時，會直接走真實執行流程。</p>
+            </div>
+          </div>
+          <p class="control-copy" id="tradingSummary">目前是純掃描模式，尚未啟用 Live 交易。</p>
+          <p class="control-copy" id="riskSummaryNote">風控摘要尚未同步。</p>
+          <div class="toggle-grid hero-toggle-grid">
+            <article class="toggle-card">
+              <span class="toggle-card__label">watch</span>
+              <button class="control-button watch-toggle" id="watchToggle" type="button">啟動 watch</button>
+            </article>
+            <article class="toggle-card">
+              <span class="toggle-card__label">Live</span>
+              <button class="control-button" id="liveTradingToggle" type="button">啟用 Live 模式</button>
+            </article>
+            <article class="toggle-card">
+              <span class="toggle-card__label">自動下單</span>
+              <button class="control-button caution" id="autoExecuteToggle" type="button">啟用自動下單</button>
+            </article>
+            <article class="toggle-card toggle-card--emergency">
+              <span class="toggle-card__label">緊急停止</span>
+              <button class="control-button emergency" id="killSwitchToggle" type="button">緊急停止</button>
+            </article>
+            <article class="toggle-card">
+              <span class="toggle-card__label">收工</span>
+              <button class="control-button caution" id="finishWorkButton" type="button">收工</button>
+            </article>
+          </div>
+        </article>
 
         <div class="hero-meta">
           <div class="hero-meta-card">
-            <span>自動刷新</span>
-            <strong id="refreshLabel">{{ refresh_sec }} 秒</strong>
+            <span>watch 流程</span>
+            <strong id="refreshLabel">掃描 → delay 30 秒 → 再次掃描</strong>
             <small class="countdown-copy" id="scanCountdownLabel">尚未同步</small>
             <div class="countdown-bar" aria-hidden="true">
               <span id="scanCountdownBar"></span>
+            </div>
+          </div>
+          <div class="hero-meta-card heartbeat-card">
+            <span>watch 心跳</span>
+            <strong id="heartbeatLabel">尚未同步</strong>
+            <div class="heartbeat-list" id="heartbeatList">
+              <small>等待下一次 watch 回報。</small>
             </div>
           </div>
           <div class="hero-meta-card">
@@ -72,8 +149,23 @@
             <h3>委託狀態</h3>
           </div>
         </div>
-        <div class="feed-list execution-list" id="executionFeed">
-          <p class="empty-block">尚未有執行事件。</p>
+        <div class="execution-split">
+          <article class="execution-column">
+            <header class="execution-column__header">
+              <span>已送出的單</span>
+            </header>
+            <div class="feed-list order-list" id="executionOrderFeed">
+              <p class="empty-block">尚未送出任何真實委託。</p>
+            </div>
+          </article>
+          <article class="execution-column">
+            <header class="execution-column__header">
+              <span>所有事件</span>
+            </header>
+            <div class="feed-list execution-list" id="executionFeed">
+              <p class="empty-block">尚未有執行事件。</p>
+            </div>
+          </article>
         </div>
       </section>
 
@@ -97,83 +189,6 @@
       </section>
 
       <section class="control-strip">
-        <article class="control-card" id="tradingCard">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">交易控制</p>
-              <h3>監看與交易開關</h3>
-            </div>
-            <p class="panel-note">watch、Live、自動下單與緊急停止都集中在這裡。</p>
-          </div>
-          <div class="armed-indicator hidden" id="armedIndicator" aria-live="polite">
-            <span class="armed-indicator__icon" aria-hidden="true">
-              <span class="armed-indicator__pulse"></span>
-            </span>
-            <div>
-              <strong>武裝成功</strong>
-              <p>背景監看命中可交易機會時，會直接走真實執行流程。</p>
-            </div>
-          </div>
-          <p class="control-copy" id="tradingSummary">目前是純掃描模式，尚未啟用 Live 交易。</p>
-          <p class="control-copy" id="riskSummaryNote">風控摘要尚未同步。</p>
-          <div class="toggle-grid">
-            <article class="toggle-card">
-              <span class="toggle-card__label">watch</span>
-              <p class="toggle-card__note">控制背景自動掃描是否持續運行。</p>
-              <button class="control-button watch-toggle" id="watchToggle" type="button">啟動 watch</button>
-            </article>
-            <article class="toggle-card">
-              <span class="toggle-card__label">Live</span>
-              <p class="toggle-card__note">決定是否允許真實送單。</p>
-              <button class="control-button" id="liveTradingToggle" type="button">啟用 Live 模式</button>
-            </article>
-            <article class="toggle-card">
-              <span class="toggle-card__label">自動下單</span>
-              <p class="toggle-card__note">掃描命中後是否自動執行交易。</p>
-              <button class="control-button caution" id="autoExecuteToggle" type="button">啟用自動下單</button>
-            </article>
-            <article class="toggle-card toggle-card--emergency">
-              <span class="toggle-card__label">緊急停止</span>
-              <p class="toggle-card__note">立即阻擋所有 Live 送單。</p>
-              <button class="control-button emergency" id="killSwitchToggle" type="button">緊急停止</button>
-            </article>
-            <article class="toggle-card">
-              <span class="toggle-card__label">收工</span>
-              <p class="toggle-card__note">撤掉所有掛單，並停止繼續下單。</p>
-              <button class="control-button caution" id="finishWorkButton" type="button">收工</button>
-            </article>
-          </div>
-        </article>
-
-        <article class="control-card">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">錢包狀態</p>
-              <h3>私鑰對應錢包</h3>
-            </div>
-            <p class="panel-note">後端只讀地址與餘額，不會把私鑰送到瀏覽器。</p>
-          </div>
-          <p class="control-copy" id="walletStatusNote">尚未輸入私鑰</p>
-          <div class="wallet-grid">
-            <article class="wallet-item wallet-item-wide">
-              <span>錢包地址</span>
-              <strong id="walletAddress">-</strong>
-            </article>
-            <article class="wallet-item">
-              <span>POL Gas</span>
-              <strong id="walletPol">-</strong>
-            </article>
-            <article class="wallet-item">
-              <span>USDC</span>
-              <strong id="walletUsdc">-</strong>
-            </article>
-            <article class="wallet-item">
-              <span>pUSD</span>
-              <strong id="walletPusd">-</strong>
-            </article>
-          </div>
-        </article>
-
         <article class="control-card preflight-card">
           <div class="panel-header">
             <div>
@@ -185,6 +200,21 @@
           <p class="control-copy" id="preflightSummary">等待前置檢查同步。</p>
           <div class="preflight-list" id="preflightList">
             <p class="empty-block">尚未建立檢查報告。</p>
+          </div>
+          <div class="parameter-panel" id="tradingParameterPanel">
+            <div class="parameter-panel__header">
+              <div>
+                <p class="panel-kicker">LIVE PARAMETERS</p>
+                <h4>下單參數與目前卡點</h4>
+              </div>
+              <span id="parameterSummary">等待參數同步</span>
+            </div>
+            <div class="parameter-diagnostics" id="parameterDiagnostics">
+              <p class="empty-block">尚未同步下單診斷。</p>
+            </div>
+            <div class="parameter-grid" id="tradingParameterGrid">
+              <p class="empty-block">尚未同步參數。</p>
+            </div>
           </div>
         </article>
       </section>
@@ -281,7 +311,7 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v17" defer></script>
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v25" defer></script>
   </body>
 </html>
 

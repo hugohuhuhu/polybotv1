@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.storage.path_safety import default_backup_dir, default_local_sqlite_path
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -23,10 +25,12 @@ class Settings(BaseSettings):
         alias="WS_MARKET_URL",
     )
     database_url: str | None = Field(default=None, alias="DATABASE_URL")
-    sqlite_path: Path = Field(
-        default=Path("C:/Users/hug0x/Desktop/polymarket-scanner-data/polymarket_scanner.db"),
-        alias="SQLITE_PATH",
-    )
+    sqlite_path: Path = Field(default_factory=default_local_sqlite_path, alias="SQLITE_PATH")
+    sqlite_backup_dir: Path = Field(default_factory=default_backup_dir, alias="SQLITE_BACKUP_DIR")
+    db_raw_retention_days: int = Field(default=7, alias="DB_RAW_RETENTION_DAYS")
+    db_snapshot_retention_days: int = Field(default=30, alias="DB_SNAPSHOT_RETENTION_DAYS")
+    db_maintenance_interval_sec: int = Field(default=3600, alias="DB_MAINTENANCE_INTERVAL_SEC")
+    db_vacuum_interval_sec: int = Field(default=86400, alias="DB_VACUUM_INTERVAL_SEC")
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")
     min_net_edge: float = Field(default=0.015, alias="MIN_NET_EDGE")
@@ -59,7 +63,9 @@ class Settings(BaseSettings):
     watch_long_tail_exception_spread: float = Field(default=0.02, alias="WATCH_LONG_TAIL_EXCEPTION_SPREAD")
     watch_long_tail_exception_liquidity: float = Field(default=5000.0, alias="WATCH_LONG_TAIL_EXCEPTION_LIQUIDITY")
     watch_positive_edge_lookback_hours: int = Field(default=24, alias="WATCH_POSITIVE_EDGE_LOOKBACK_HOURS")
-    scan_interval_sec: int = Field(default=60, alias="SCAN_INTERVAL_SEC")
+    scan_interval_sec: int = Field(default=30, alias="SCAN_INTERVAL_SEC")
+    watch_scan_timeout_sec: float = Field(default=60.0, alias="WATCH_SCAN_TIMEOUT_SEC")
+    watch_timeout_retry_sec: float = Field(default=30.0, alias="WATCH_TIMEOUT_RETRY_SEC")
     discovery_refresh_sec: int = Field(default=900, alias="DISCOVERY_REFRESH_SEC")
     book_fetch_concurrency: int = Field(default=5, alias="BOOK_FETCH_CONCURRENCY")
     min_minutes_to_resolution: int = Field(default=120, alias="MIN_MINUTES_TO_RESOLUTION")
@@ -76,14 +82,16 @@ class Settings(BaseSettings):
         alias="LATE_RESOLUTION_MAX_MINUTES_TO_RESOLUTION",
     )
     near_close_maker_enabled: bool = Field(default=True, alias="NEAR_CLOSE_MAKER_ENABLED")
-    near_close_maker_live_enabled: bool = Field(default=False, alias="NEAR_CLOSE_MAKER_LIVE_ENABLED")
+    near_close_maker_live_enabled: bool = Field(default=True, alias="NEAR_CLOSE_MAKER_LIVE_ENABLED")
     near_close_scan_pool_enabled: bool = Field(default=True, alias="NEAR_CLOSE_SCAN_POOL_ENABLED")
+    near_close_scan_crypto_updown_only: bool = Field(default=False, alias="NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY")
     near_close_scan_event_limit: int = Field(default=750, alias="NEAR_CLOSE_SCAN_EVENT_LIMIT")
     near_close_scan_pool_limit: int = Field(default=30, alias="NEAR_CLOSE_SCAN_POOL_LIMIT")
     near_close_scan_lookahead_minutes: float = Field(default=75.0, alias="NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES")
-    near_close_min_paper_signals_for_live: int = Field(default=100, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
+    near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
+    near_close_live_max_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
     near_close_max_bid_price: float = Field(default=0.97, alias="NEAR_CLOSE_MAX_BID_PRICE")
     near_close_min_best_ask: float = Field(default=0.98, alias="NEAR_CLOSE_MIN_BEST_ASK")
     near_close_min_midpoint: float = Field(default=0.975, alias="NEAR_CLOSE_MIN_MIDPOINT")
@@ -92,7 +100,8 @@ class Settings(BaseSettings):
     near_close_min_depth: float = Field(default=20.0, alias="NEAR_CLOSE_MIN_DEPTH")
     near_close_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_ORDER_SIZE")
     near_close_max_market_exposure: float = Field(default=5.0, alias="NEAR_CLOSE_MAX_MARKET_EXPOSURE")
-    near_close_max_total_exposure: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_TOTAL_EXPOSURE")
+    near_close_max_total_exposure: float = Field(default=25.0, alias="NEAR_CLOSE_MAX_TOTAL_EXPOSURE")
+    near_close_max_position_size: float = Field(default=10.0, alias="NEAR_CLOSE_MAX_POSITION_SIZE")
     near_close_daily_loss_limit: float = Field(default=2.0, alias="NEAR_CLOSE_DAILY_LOSS_LIMIT")
     near_close_max_consecutive_losses: int = Field(default=2, alias="NEAR_CLOSE_MAX_CONSECUTIVE_LOSSES")
     near_close_gtd_seconds: int = Field(default=1800, alias="NEAR_CLOSE_GTD_SECONDS")
@@ -104,6 +113,7 @@ class Settings(BaseSettings):
     near_close_soft_stop_offset: float = Field(default=0.005, alias="NEAR_CLOSE_SOFT_STOP_OFFSET")
     near_close_hard_stop_offset: float = Field(default=0.025, alias="NEAR_CLOSE_HARD_STOP_OFFSET")
     near_close_hard_stop_bid: float = Field(default=0.945, alias="NEAR_CLOSE_HARD_STOP_BID")
+    near_close_taker_exit_price: float = Field(default=0.52, alias="NEAR_CLOSE_TAKER_EXIT_PRICE")
     near_close_emergency_slippage: float = Field(default=0.01, alias="NEAR_CLOSE_EMERGENCY_SLIPPAGE")
     near_close_emergency_max_loss: float = Field(default=0.05, alias="NEAR_CLOSE_EMERGENCY_MAX_LOSS")
     near_close_crypto_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_ENABLED")
@@ -118,7 +128,7 @@ class Settings(BaseSettings):
     near_close_crypto_updown_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED")
     near_close_crypto_updown_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE")
     near_close_crypto_updown_min_minutes_to_end: float = Field(
-        default=1.5,
+        default=0.35,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END",
     )
     near_close_crypto_updown_max_minutes_to_end: float = Field(
@@ -133,11 +143,11 @@ class Settings(BaseSettings):
         default=0.002,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE",
     )
-    near_close_crypto_updown_min_best_ask: float = Field(default=0.75, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
-    near_close_crypto_updown_min_midpoint: float = Field(default=0.60, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT")
-    near_close_crypto_updown_max_spread: float = Field(default=0.04, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD")
+    near_close_crypto_updown_min_best_ask: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
+    near_close_crypto_updown_min_midpoint: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT")
+    near_close_crypto_updown_max_spread: float = Field(default=0.05, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD")
     near_close_crypto_updown_max_bid_price: float = Field(
-        default=0.988,
+        default=0.97,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE",
     )
     near_close_crypto_updown_min_depth: float = Field(
@@ -178,6 +188,7 @@ class Settings(BaseSettings):
     auto_redeem_enabled: bool = Field(default=True, alias="AUTO_REDEEM_ENABLED")
     auto_redeem_refresh_sec: int = Field(default=300, alias="AUTO_REDEEM_REFRESH_SEC")
     auto_redeem_min_usdce: float = Field(default=0.01, alias="AUTO_REDEEM_MIN_USDCE")
+    auto_redeem_wrap_allowance_usdce: float = Field(default=10000.0, alias="AUTO_REDEEM_WRAP_ALLOWANCE_USDCE")
     pusd_pnl_baseline: float | None = Field(default=20.55, alias="PUSD_PNL_BASELINE")
     clock_drift_cache_sec: int = Field(default=20, alias="CLOCK_DRIFT_CACHE_SEC")
     max_clock_drift_sec: int = Field(default=30, alias="MAX_CLOCK_DRIFT_SEC")
@@ -202,6 +213,10 @@ class Settings(BaseSettings):
         default="0x93070a847efEf7F70739046A929D47a521F5B8ee",
         alias="POLYMARKET_COLLATERAL_ONRAMP_ADDRESS",
     )
+    polymarket_data_api_base_url: str = Field(
+        default="https://data-api.polymarket.com",
+        alias="POLYMARKET_DATA_API_BASE_URL",
+    )
     live_order_type: str = Field(default="FOK", alias="LIVE_ORDER_TYPE")
     live_max_order_size: float = Field(default=25.0, alias="LIVE_MAX_ORDER_SIZE")
     risk_kill_switch: bool = Field(default=False, alias="RISK_KILL_SWITCH")
@@ -209,9 +224,9 @@ class Settings(BaseSettings):
     max_daily_paper_notional: float = Field(default=5000.0, alias="MAX_DAILY_PAPER_NOTIONAL")
     max_daily_paper_trades: int = Field(default=250, alias="MAX_DAILY_PAPER_TRADES")
     max_daily_live_notional: float = Field(default=1000.0, alias="MAX_DAILY_LIVE_NOTIONAL")
-    max_daily_live_orders: int = Field(default=20, alias="MAX_DAILY_LIVE_ORDERS")
+    max_daily_live_orders: int = Field(default=42, alias="MAX_DAILY_LIVE_ORDERS")
 
-    @field_validator("sqlite_path", "related_rules_path", mode="before")
+    @field_validator("sqlite_path", "sqlite_backup_dir", "related_rules_path", mode="before")
     @classmethod
     def _expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser()

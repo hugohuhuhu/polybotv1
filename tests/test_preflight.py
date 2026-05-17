@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+import httpx
+
 from app.config import Settings
 from app.services.preflight import PreflightCheck, load_preflight_report
 
@@ -98,3 +100,45 @@ def test_preflight_blocks_missing_v2_sdk_after_cutover(monkeypatch) -> None:
 
     assert report.ready is False
     assert any("py-clob-client-v2" in reason for reason in report.blocking_reasons)
+
+
+def test_preflight_reports_exception_class_when_message_is_empty(monkeypatch) -> None:
+    async def fake_chain_id(_client, _rpc_url):
+        return 137
+
+    async def fake_native(_client, _rpc_url, _wallet_address):
+        return 1_000_000_000_000_000_000
+
+    async def fake_balance(_client, _rpc_url, token_address, _wallet_address):
+        if token_address == Settings().polygon_pusd_token_address:
+            raise httpx.ReadTimeout("")
+        return 0
+
+    async def fake_allowance(_client, _rpc_url, _token_address, _wallet_address, _spender_address):
+        return 100_000_000
+
+    async def fake_clock(_client, _settings, _now):
+        return PreflightCheck(
+            check_id="clock_drift",
+            label="系統時間",
+            status="ok",
+            message="ok",
+            required=False,
+        )
+
+    monkeypatch.setattr("app.services.preflight.fetch_chain_id", fake_chain_id)
+    monkeypatch.setattr("app.services.preflight.fetch_native_balance", fake_native)
+    monkeypatch.setattr("app.services.preflight.fetch_erc20_balance", fake_balance)
+    monkeypatch.setattr("app.services.preflight.fetch_erc20_allowance", fake_allowance)
+    monkeypatch.setattr("app.services.preflight._check_clob_clock", fake_clock)
+    monkeypatch.setattr("app.services.preflight._clob_v2_sdk_error", lambda: None)
+
+    report = asyncio.run(
+        load_preflight_report(
+            Settings(POLYMARKET_PRIVATE_KEY="0x" + "1" * 64),
+            now=datetime(2026, 4, 29, tzinfo=timezone.utc),
+        )
+    )
+
+    assert report.ready is False
+    assert any("pUSD" in reason and "ReadTimeout" in reason for reason in report.blocking_reasons)

@@ -33,6 +33,27 @@ def _default_empty_balances(status: str) -> list[dict[str, Any]]:
     ]
 
 
+async def fetch_polymarket_portfolio_value(client: httpx.AsyncClient, base_url: str, address: str) -> float:
+    response = await client.get(f"{base_url.rstrip('/')}/value", params={"user": address})
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    return float(payload.get("value") or 0.0)
+
+
+async def fetch_polymarket_positions(client: httpx.AsyncClient, base_url: str, address: str) -> list[dict[str, Any]]:
+    response = await client.get(
+        f"{base_url.rstrip('/')}/positions",
+        params={"user": address, "limit": 500},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
 async def load_wallet_status(settings: Settings) -> dict[str, Any]:
     """Return private-key-derived wallet address and read-only token balances."""
 
@@ -80,12 +101,23 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             fetch_erc20_balance(client, rpc_url, token_address, address)
             for _, token_address in token_configs
         ]
-        results = await asyncio.gather(native_task, *token_tasks, return_exceptions=True)
+        portfolio_value_task = fetch_polymarket_portfolio_value(client, settings.polymarket_data_api_base_url, address)
+        portfolio_positions_task = fetch_polymarket_positions(client, settings.polymarket_data_api_base_url, address)
+        results = await asyncio.gather(
+            native_task,
+            *token_tasks,
+            portfolio_value_task,
+            portfolio_positions_task,
+            return_exceptions=True,
+        )
 
     balances: list[dict[str, Any]] = []
     error_count = 0
+    balance_results = results[: 1 + len(token_configs)]
+    portfolio_value_result = results[-2]
+    portfolio_positions_result = results[-1]
 
-    native_result = results[0]
+    native_result = balance_results[0]
     if isinstance(native_result, Exception):
         error_count += 1
         balances.append(_empty_balance("POL", status="rpc_error", note="Polygon RPC 讀取失敗"))
@@ -99,7 +131,7 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             }
         )
 
-    for (symbol, _), result in zip(token_configs, results[1:], strict=True):
+    for (symbol, _), result in zip(token_configs, balance_results[1:], strict=True):
         if isinstance(result, Exception):
             error_count += 1
             balances.append(_empty_balance(symbol, status="rpc_error", note="Polygon RPC 讀取失敗"))
@@ -113,7 +145,25 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             }
         )
 
-    if error_count == len(results):
+    portfolio = {
+        "position_value": None,
+        "status": "ok",
+        "source": "polymarket_data_api",
+        "note": None,
+    }
+    if isinstance(portfolio_value_result, Exception):
+        portfolio["status"] = "api_error"
+        portfolio["note"] = "Polymarket portfolio value read failed."
+    else:
+        portfolio["position_value"] = portfolio_value_result
+    if isinstance(portfolio_positions_result, Exception):
+        portfolio["positions"] = []
+        portfolio["positions_status"] = "api_error"
+    else:
+        portfolio["positions"] = portfolio_positions_result
+        portfolio["positions_status"] = "ok"
+
+    if error_count == len(balance_results):
         message = "已讀取錢包地址，但 Polygon RPC 暫時讀取失敗"
         status = "rpc_error"
     elif error_count:
@@ -129,4 +179,5 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
         "status": status,
         "message": message,
         "balances": balances,
+        "portfolio": portfolio,
     }

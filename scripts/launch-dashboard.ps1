@@ -4,7 +4,9 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $python = "C:\Users\hug0x\AppData\Local\Programs\Python\Python311\python.exe"
 $url = "http://127.0.0.1:8080"
-$sqlitePath = "C:\Users\hug0x\Desktop\polymarket-scanner-data\polymarket_scanner.db"
+$localDataRoot = Join-Path $env:LOCALAPPDATA "PolymarketScanner"
+$sqlitePath = Join-Path $localDataRoot "polymarket_scanner.db"
+$sqliteBackupDir = Join-Path $repoRoot "data"
 $logDir = Join-Path $repoRoot "runtime-logs"
 $serveStdoutLog = Join-Path $logDir "serve.stdout.log"
 $serveStderrLog = Join-Path $logDir "serve.stderr.log"
@@ -53,21 +55,26 @@ if (-not (Test-Path $entry)) {
 }
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-New-Item -ItemType Directory -Path (Split-Path -Parent $sqlitePath) -Force | Out-Null
+New-Item -ItemType Directory -Path $localDataRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $sqliteBackupDir -Force | Out-Null
 $env:DASHBOARD_REFRESH_SEC = "30"
 $env:SQLITE_PATH = $sqlitePath
-$env:MAX_DAILY_LIVE_ORDERS = "21"
+$env:SQLITE_BACKUP_DIR = $sqliteBackupDir
 $env:AUTO_REDEEM_ENABLED = "true"
 $env:AUTO_REDEEM_REFRESH_SEC = "300"
 $env:AUTO_REDEEM_MIN_USDCE = "0.01"
+$env:AUTO_REDEEM_WRAP_ALLOWANCE_USDCE = "10000"
 $env:NEAR_CLOSE_MAKER_LIVE_ENABLED = "true"
 $env:NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE = "0"
+$env:NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY = "true"
+$env:NEAR_CLOSE_MAX_POSITION_SIZE = "10"
 $env:NEAR_CLOSE_SCAN_EVENT_LIMIT = "750"
 $env:NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES = "75"
 $env:NEAR_CLOSE_ORDER_SIZE = "5"
 $env:NEAR_CLOSE_MAX_MARKET_EXPOSURE = "5"
-$env:NEAR_CLOSE_MAX_TOTAL_EXPOSURE = "15"
+$env:NEAR_CLOSE_MAX_TOTAL_EXPOSURE = "25"
 $env:NEAR_CLOSE_MAX_MINUTES_TO_END = "15"
+$env:NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END = "3"
 $env:NEAR_CLOSE_MIN_BEST_ASK = "0.98"
 $env:NEAR_CLOSE_MIN_MIDPOINT = "0.975"
 $env:NEAR_CLOSE_MAX_SPREAD = "0.025"
@@ -80,16 +87,19 @@ $env:NEAR_CLOSE_CRYPTO_ORDER_SIZE = "2"
 $env:NEAR_CLOSE_CRYPTO_MIN_STRIKE_DISTANCE = "0.02"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED = "true"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE = "5"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END = "1.5"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END = "0.35"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END = "45"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE = "0.003"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE = "0.002"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK = "0.75"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT = "0.60"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD = "0.04"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE = "0.988"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK = "0.84"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT = "0.84"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD = "0.05"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE = "0.970"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH = "10"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT = "0.003"
+$env:SCAN_INTERVAL_SEC = "30"
+$env:WATCH_SCAN_TIMEOUT_SEC = "60"
+$env:WATCH_TIMEOUT_RETRY_SEC = "30"
 
 Write-Host "[1/2] Starting dashboard..."
 Stop-WatchFromPidFiles

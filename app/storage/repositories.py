@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.models.core import EventRecord, LiveExecutionResult, MarketRecord, Opportunity, OrderBookSnapshot, PaperTradeResult
 from app.models.runtime import TradingControls
@@ -14,19 +16,23 @@ from app.utils.math_utils import to_isoformat
 class ScannerRepository:
     """Persistence helpers for scanner state, runtime controls, and execution audit data."""
 
+    ORDERBOOK_WRITE_BATCH_SIZE = 10
     NEAR_CLOSE_VARIANT_PATTERN = '%"strategy_variant": "near_close_maker"%'
     LIVE_JOURNAL_STATUSES = ("CONFIRMED", "MATCHED", "FILLED", "MINED", "REDEEMED", "SETTLED_LOST")
     NEAR_CLOSE_INACTIVE_ORDER_STATUSES = (
-        "cancel_requested",
-        "cancelled",
-        "expired",
-        "failed",
-        "filled",
-        "matched",
-        "cancel_unconfirmed",
-        "qualification_cancelled",
-        "reprice_cancelled",
-        "redeemed",
+        "CANCEL_REQUESTED",
+        "CANCELLED",
+        "EXPIRED",
+        "FAILED",
+        "FILLED",
+        "MATCHED",
+        "CONFIRMED",
+        "MINED",
+        "CANCEL_UNCONFIRMED",
+        "QUALIFICATION_CANCELLED",
+        "REPRICE_CANCELLED",
+        "REDEEMED",
+        "SETTLED_LOST",
     )
 
     def __init__(self, connection: DatabaseSession) -> None:
@@ -38,13 +44,19 @@ class ScannerRepository:
 
     @classmethod
     def _today_start_iso(cls) -> str:
-        now = cls._now()
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return day_start.isoformat()
+        local_now = cls._now().astimezone()
+        local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return local_day_start.astimezone(timezone.utc).isoformat()
 
     @classmethod
     def _cutoff_iso(cls, *, hours: int) -> str:
         return (cls._now() - timedelta(hours=hours)).isoformat()
+
+    @staticmethod
+    def _minute_bucket(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat()[:16]
 
     def save_markets(self, events: Iterable[EventRecord], markets: Iterable[MarketRecord]) -> None:
         discovered_at = self._now().isoformat()
@@ -93,26 +105,216 @@ class ScannerRepository:
                 )
 
     def save_orderbooks(self, books: Iterable[OrderBookSnapshot]) -> None:
+        pending = list(books)
+        if not pending:
+            return
+        batch_size = max(int(self.ORDERBOOK_WRITE_BATCH_SIZE), 1)
+        for offset in range(0, len(pending), batch_size):
+            with self.connection.transaction():
+                for book in pending[offset : offset + batch_size]:
+                    captured_at = to_isoformat(book.updated_at)
+                    captured_minute = self._minute_bucket(book.updated_at)
+                    self.connection.execute(
+                        """
+                        INSERT INTO orderbook_snapshots (
+                            token_id, market_id, captured_minute, best_bid, best_ask, midpoint, spread,
+                            bids_json, asks_json, captured_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(token_id, captured_minute) DO UPDATE SET
+                            market_id=excluded.market_id,
+                            best_bid=excluded.best_bid,
+                            best_ask=excluded.best_ask,
+                            midpoint=excluded.midpoint,
+                            spread=excluded.spread,
+                            bids_json=excluded.bids_json,
+                            asks_json=excluded.asks_json,
+                            captured_at=excluded.captured_at
+                        """,
+                        (
+                            book.token_id,
+                            book.market_id,
+                            captured_minute,
+                            book.best_bid,
+                            book.best_ask,
+                            book.midpoint,
+                            book.spread,
+                            json.dumps([level.model_dump() for level in book.bids]),
+                            json.dumps([level.model_dump() for level in book.asks]),
+                            captured_at,
+                        ),
+                    )
+
+    def summarize_scan_cycles(self) -> int:
+        rows = self.connection.fetchall(
+            """
+            SELECT substr(executed_at, 1, 10) AS summary_date,
+                   COUNT(*) AS scan_cycle_count,
+                   MAX(discovered_market_count) AS max_discovered_market_count,
+                   MAX(monitored_market_count) AS max_monitored_market_count,
+                   COALESCE(SUM(book_count), 0) AS total_book_count,
+                   COALESCE(SUM(opportunity_count), 0) AS total_opportunity_count,
+                   COALESCE(SUM(actionable_count), 0) AS total_actionable_count,
+                   COALESCE(SUM(candidate_count), 0) AS total_candidate_count
+            FROM scan_cycles
+            GROUP BY substr(executed_at, 1, 10)
+            """
+        )
+        now_iso = self._now().isoformat()
         with self.connection.transaction():
-            for book in books:
+            for row in rows:
                 self.connection.execute(
                     """
-                    INSERT INTO orderbook_snapshots (
-                        token_id, market_id, best_bid, best_ask, midpoint, spread, bids_json, asks_json, captured_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO daily_summaries (
+                        summary_date, scan_cycle_count, max_discovered_market_count,
+                        max_monitored_market_count, total_book_count, total_opportunity_count,
+                        total_actionable_count, total_candidate_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(summary_date) DO UPDATE SET
+                        scan_cycle_count=excluded.scan_cycle_count,
+                        max_discovered_market_count=excluded.max_discovered_market_count,
+                        max_monitored_market_count=excluded.max_monitored_market_count,
+                        total_book_count=excluded.total_book_count,
+                        total_opportunity_count=excluded.total_opportunity_count,
+                        total_actionable_count=excluded.total_actionable_count,
+                        total_candidate_count=excluded.total_candidate_count,
+                        updated_at=excluded.updated_at
                     """,
                     (
-                        book.token_id,
-                        book.market_id,
-                        book.best_bid,
-                        book.best_ask,
-                        book.midpoint,
-                        book.spread,
-                        json.dumps([level.model_dump() for level in book.bids]),
-                        json.dumps([level.model_dump() for level in book.asks]),
-                        to_isoformat(book.updated_at),
+                        row["summary_date"],
+                        int(row["scan_cycle_count"] or 0),
+                        int(row["max_discovered_market_count"] or 0),
+                        int(row["max_monitored_market_count"] or 0),
+                        int(row["total_book_count"] or 0),
+                        int(row["total_opportunity_count"] or 0),
+                        int(row["total_actionable_count"] or 0),
+                        int(row["total_candidate_count"] or 0),
+                        now_iso,
+                        now_iso,
                     ),
                 )
+        return len(rows)
+
+    def apply_retention(self, *, raw_days: int = 7, snapshot_days: int = 30) -> dict[str, int]:
+        raw_cutoff = (self._now() - timedelta(days=raw_days)).isoformat()
+        snapshot_cutoff = (self._now() - timedelta(days=snapshot_days)).isoformat()
+        deleted: dict[str, int] = {}
+        with self.connection.transaction():
+            for table, column, cutoff in (
+                ("orderbook_snapshots", "captured_at", raw_cutoff),
+                ("opportunities", "created_at", raw_cutoff),
+                ("alerts", "sent_at", raw_cutoff),
+                ("watch_heartbeats", "created_at", raw_cutoff),
+                ("scan_cycles", "executed_at", snapshot_cutoff),
+            ):
+                cursor = self.connection.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+                deleted[table] = int(getattr(cursor, "rowcount", 0) or 0)
+        return deleted
+
+    def _maintenance_state(self, key: str) -> str | None:
+        row = self.connection.fetchone("SELECT value FROM maintenance_state WHERE key = ?", (key,))
+        return str(row["value"]) if row else None
+
+    def _set_maintenance_state(self, key: str, value: str) -> None:
+        now_iso = self._now().isoformat()
+        with self.connection.transaction():
+            self.connection.execute(
+                """
+                INSERT INTO maintenance_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, now_iso),
+            )
+
+    def _state_due(self, key: str, interval_sec: int, now: datetime) -> bool:
+        value = self._maintenance_state(key)
+        if not value:
+            return True
+        try:
+            last_run = datetime.fromisoformat(value)
+        except ValueError:
+            return True
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(tzinfo=timezone.utc)
+        return (now - last_run.astimezone(timezone.utc)).total_seconds() >= interval_sec
+
+    def finalize_previous_scan_day_if_needed(
+        self,
+        *,
+        executed_at: datetime,
+        raw_retention_days: int = 7,
+        snapshot_retention_days: int = 30,
+        maintenance_interval_sec: int = 3600,
+        vacuum_interval_sec: int = 86400,
+    ) -> dict[str, Any]:
+        if executed_at.tzinfo is None:
+            executed_at = executed_at.replace(tzinfo=timezone.utc)
+        scan_date = executed_at.astimezone(timezone.utc).date().isoformat()
+        active_scan_date = self._maintenance_state("active_scan_date")
+        if not active_scan_date:
+            self._set_maintenance_state("active_scan_date", scan_date)
+            return {"status": "initialized", "scan_date": scan_date}
+        if active_scan_date == scan_date:
+            return {"status": "same_day", "scan_date": scan_date}
+
+        result = self.run_database_maintenance(
+            raw_retention_days=raw_retention_days,
+            snapshot_retention_days=snapshot_retention_days,
+            maintenance_interval_sec=maintenance_interval_sec,
+            vacuum_interval_sec=vacuum_interval_sec,
+            force=True,
+        )
+        self._set_maintenance_state("active_scan_date", scan_date)
+        return {
+            "status": "rolled_over",
+            "previous_scan_date": active_scan_date,
+            "scan_date": scan_date,
+            "maintenance": result,
+        }
+
+    def run_database_maintenance(
+        self,
+        *,
+        raw_retention_days: int = 7,
+        snapshot_retention_days: int = 30,
+        maintenance_interval_sec: int = 3600,
+        vacuum_interval_sec: int = 86400,
+        force: bool = False,
+        force_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        now = self._now()
+        if not force and not self._state_due("retention_last_run", maintenance_interval_sec, now):
+            return {"status": "skipped"}
+
+        summary_count = self.summarize_scan_cycles()
+        deleted = self.apply_retention(raw_days=raw_retention_days, snapshot_days=snapshot_retention_days)
+        optimized = False
+        vacuumed = False
+        optimize_error = None
+        vacuum_error = None
+        if self.connection.backend == "sqlite":
+            try:
+                self.connection.execute("PRAGMA optimize")
+                optimized = True
+            except Exception as exc:
+                optimize_error = str(exc)
+            if force_vacuum or self._state_due("vacuum_last_run", vacuum_interval_sec, now):
+                try:
+                    self.connection.execute("VACUUM")
+                    self._set_maintenance_state("vacuum_last_run", now.isoformat())
+                    vacuumed = True
+                except Exception as exc:
+                    vacuum_error = str(exc)
+        self._set_maintenance_state("retention_last_run", now.isoformat())
+        return {
+            "status": "completed",
+            "daily_summaries": summary_count,
+            "deleted": deleted,
+            "optimized": optimized,
+            "vacuumed": vacuumed,
+            "optimize_error": optimize_error,
+            "vacuum_error": vacuum_error,
+        }
 
     def save_opportunities(self, opportunities: Iterable[Opportunity]) -> None:
         with self.connection.transaction():
@@ -255,6 +457,50 @@ class ScannerRepository:
                 ),
             )
 
+    def save_watch_heartbeat(
+        self,
+        *,
+        source: str,
+        state: str,
+        latest_scan_at: datetime | None = None,
+        message: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self.connection.transaction():
+            self.connection.execute(
+                """
+                INSERT INTO watch_heartbeats (
+                    source, state, latest_scan_at, message, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    state,
+                    to_isoformat(latest_scan_at),
+                    message,
+                    json.dumps(details or {}),
+                    self._now().isoformat(),
+                ),
+            )
+
+    def recent_watch_heartbeats(self, limit: int = 6) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT source, state, latest_scan_at, message, details_json, created_at
+            FROM watch_heartbeats
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [
+            {
+                **row,
+                "details": self._load_json(row.get("details_json"), {}),
+            }
+            for row in rows
+        ]
+
     def recent_positive_edge_by_slug(self, *, hours: int, min_net_edge: float = 0.0) -> dict[str, int]:
         rows = self.connection.fetchall(
             """
@@ -310,21 +556,59 @@ class ScannerRepository:
                     ),
                 )
 
-    def mark_live_orders_cancelled(self, order_ids: list[str], *, status: str = "cancelled") -> int:
+    def mark_live_orders_cancelled(
+        self,
+        order_ids: list[str],
+        *,
+        status: str = "cancelled",
+        cancel_response: object | None = None,
+    ) -> int:
         cleaned = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
         if not cleaned:
             return 0
+        if cancel_response is None:
+            placeholders = ",".join("?" for _ in cleaned)
+            with self.connection.transaction():
+                cursor = self.connection.execute(
+                    f"""
+                    UPDATE live_trades
+                    SET status = ?
+                    WHERE order_id IN ({placeholders})
+                    """,
+                    (status, *cleaned),
+                )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+
         placeholders = ",".join("?" for _ in cleaned)
+        rows = self.connection.fetchall(
+            f"""
+            SELECT id, order_id, response_json
+            FROM live_trades
+            WHERE order_id IN ({placeholders})
+            """,
+            tuple(cleaned),
+        )
+        updated = 0
         with self.connection.transaction():
-            cursor = self.connection.execute(
-                f"""
-                UPDATE live_trades
-                SET status = ?
-                WHERE order_id IN ({placeholders})
-                """,
-                (status, *cleaned),
-            )
-        return int(getattr(cursor, "rowcount", 0) or 0)
+            for row in rows:
+                order_id = str(row["order_id"] or "")
+                response = self._load_json(row.get("response_json"), {})
+                if not isinstance(response, dict):
+                    response = {}
+                response["cancel_attempt"] = {
+                    "status": status,
+                    "detail": self._cancel_response_detail(cancel_response, order_id),
+                }
+                cursor = self.connection.execute(
+                    """
+                    UPDATE live_trades
+                    SET status = ?, response_json = ?
+                    WHERE id = ?
+                    """,
+                    (status, json.dumps(response), int(row["id"])),
+                )
+                updated += int(getattr(cursor, "rowcount", 0) or 0)
+        return updated
 
     def active_live_order_ids(self, limit: int = 200) -> list[str]:
         rows = self.connection.fetchall(
@@ -340,6 +624,132 @@ class ScannerRepository:
         )
         return [str(row["order_id"]) for row in rows if str(row["order_id"] or "").strip()]
 
+    def expire_open_orders_for_ended_markets(self) -> int:
+        live_statuses = ("SUBMITTED", "PENDING", "OPEN", "CANCEL_REQUESTED")
+        placeholders = ",".join("?" for _ in live_statuses)
+        rows = self.connection.fetchall(
+            f"""
+            SELECT live_trades.id,
+                   live_trades.market_slug,
+                   markets.end_date,
+                   markets.active,
+                   markets.closed
+            FROM live_trades
+            LEFT JOIN markets ON markets.slug = live_trades.market_slug
+            WHERE UPPER(live_trades.status) IN ({placeholders})
+            """,
+            live_statuses,
+        )
+        now = self._now()
+        stale_ids: list[int] = []
+        for row in rows:
+            ended = bool(row.get("closed")) or row.get("active") is False or row.get("active") == 0
+            end_date = row.get("end_date")
+            if end_date:
+                end_ts = self._parse_iso_timestamp(str(end_date))
+                ended = ended or (end_ts > 0 and end_ts <= now.timestamp())
+            slug_end_ts = self._parse_slug_end_timestamp(str(row.get("market_slug") or ""))
+            ended = ended or (slug_end_ts is not None and slug_end_ts <= now.timestamp())
+            if ended:
+                stale_ids.append(int(row["id"]))
+
+        if not stale_ids:
+            return 0
+        id_placeholders = ",".join("?" for _ in stale_ids)
+        with self.connection.transaction():
+            cursor = self.connection.execute(
+                f"""
+                UPDATE live_trades
+                SET status = 'expired'
+                WHERE id IN ({id_placeholders})
+                """,
+                stale_ids,
+            )
+        return int(getattr(cursor, "rowcount", 0) or 0)
+
+    @staticmethod
+    def _parse_slug_end_timestamp(slug: str) -> float | None:
+        epoch_match = re.search(r"-(\d{10})$", slug)
+        if epoch_match:
+            try:
+                return float(epoch_match.group(1))
+            except ValueError:
+                return None
+        et_match = re.search(
+            r"-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)-(\d{1,2})-(\d{4})-(\d{1,2})(am|pm)-et$",
+            slug,
+            flags=re.IGNORECASE,
+        )
+        if not et_match:
+            return None
+        month_lookup = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
+        month_text, day_text, year_text, hour_text, meridiem = et_match.groups()
+        hour = int(hour_text) % 12
+        if meridiem.lower() == "pm":
+            hour += 12
+        eastern = ZoneInfo("America/New_York")
+        end_dt = datetime(
+            int(year_text),
+            month_lookup[month_text.lower()],
+            int(day_text),
+            hour,
+            tzinfo=eastern,
+        )
+        return end_dt.timestamp()
+
+    @classmethod
+    def _is_market_ended(
+        cls,
+        slug: str,
+        *,
+        end_date: Any,
+        active: Any,
+        closed: Any,
+        now_ts: float,
+    ) -> bool:
+        if bool(closed) or active is False or active == 0:
+            return True
+        if end_date:
+            end_ts = cls._parse_iso_timestamp(str(end_date))
+            if end_ts > 0 and end_ts <= now_ts:
+                return True
+        slug_end_ts = cls._parse_slug_end_timestamp(slug)
+        return bool(slug_end_ts is not None and slug_end_ts <= now_ts)
+
+    @classmethod
+    def _market_status(cls, row: dict[str, Any], *, now_ts: float) -> dict[str, Any]:
+        raw = cls._load_json(row.get("raw_json"), {})
+        return {
+            "ended": cls._is_market_ended(
+                str(row.get("slug") or ""),
+                end_date=row.get("end_date"),
+                active=row.get("active"),
+                closed=row.get("closed"),
+                now_ts=now_ts,
+            ),
+            "winning_outcome": raw.get("near_close_crypto_winning_outcome"),
+        }
+
+    @staticmethod
+    def _settlement_price_for_outcome(outcome_label: str, winning_outcome: Any) -> float | None:
+        winner = str(winning_outcome or "").strip().lower()
+        if not winner:
+            return None
+        return 1.0 if str(outcome_label or "").strip().lower() == winner else 0.0
+
     def near_close_active_orders_for_market(
         self,
         *,
@@ -348,10 +758,10 @@ class ScannerRepository:
     ) -> list[dict[str, Any]]:
         inactive_placeholders = ",".join("?" for _ in self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES)
         query = f"""
-            SELECT order_id, token_id, market_slug, target_price, requested_size, status, response_json, created_at
+            SELECT order_id, token_id, market_slug, outcome_label, target_price, requested_size, status, response_json, created_at
             FROM live_trades
             WHERE response_json LIKE ?
-              AND status NOT IN ({inactive_placeholders})
+              AND UPPER(status) NOT IN ({inactive_placeholders})
         """
         params: list[Any] = [self.NEAR_CLOSE_VARIANT_PATTERN, *self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES]
         if market_slug:
@@ -375,6 +785,7 @@ class ScannerRepository:
                     "order_id": row["order_id"],
                     "token_id": row["token_id"],
                     "market_slug": row["market_slug"],
+                    "outcome_label": row["outcome_label"],
                     "target_price": float(row["target_price"] or 0.0),
                     "requested_size": float(row["requested_size"] or 0.0),
                     "status": row["status"],
@@ -384,6 +795,118 @@ class ScannerRepository:
                 }
             )
         return active_orders
+
+    @staticmethod
+    def _cancel_response_detail(cancel_response: object, order_id: str) -> object:
+        if not isinstance(cancel_response, dict):
+            return cancel_response
+        not_canceled = cancel_response.get("not_canceled")
+        if isinstance(not_canceled, dict) and order_id in not_canceled:
+            return not_canceled.get(order_id)
+        canceled = cancel_response.get("canceled")
+        if isinstance(canceled, list) and order_id in {str(item) for item in canceled}:
+            return "canceled"
+        return cancel_response
+
+    @staticmethod
+    def _cancel_detail_indicates_matched(response: dict[str, Any]) -> bool:
+        cancel_attempt = response.get("cancel_attempt")
+        if not isinstance(cancel_attempt, dict):
+            return False
+        detail = str(cancel_attempt.get("detail") or "").lower()
+        return "matched" in detail and ("can't be canceled" in detail or "cannot be canceled" in detail)
+
+    def _has_stop_exit_for_token(self, token_id: str) -> bool:
+        row = self.connection.fetchone(
+            """
+            SELECT 1
+            FROM live_trades
+            WHERE token_id = ?
+              AND UPPER(action) = 'SELL'
+              AND response_json LIKE '%"strategy_variant": "near_close_stop_exit"%'
+              AND UPPER(status) NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+            LIMIT 1
+            """,
+            (token_id,),
+        )
+        return row is not None
+
+    def near_close_stop_exit_groups(self, limit: int = 50) -> list[dict[str, Any]]:
+        groups = list(self.live_trade_groups(limit=limit))
+        seen = {
+            self._position_key(group.get("market_slug"), group.get("token_id"), group.get("outcome_label"))
+            for group in groups
+        }
+        rows = self.connection.fetchall(
+            """
+            SELECT token_id,
+                   action,
+                   market_slug,
+                   outcome_label,
+                   target_price,
+                   requested_size,
+                   order_id,
+                   status,
+                   response_json,
+                   created_at
+            FROM live_trades
+            WHERE response_json LIKE ?
+              AND UPPER(action) = 'BUY'
+              AND UPPER(status) = 'CANCEL_UNCONFIRMED'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN, max(limit * 4, limit)),
+        )
+        for row in rows:
+            response = self._load_json(row.get("response_json"), {})
+            if not isinstance(response, dict) or not self._cancel_detail_indicates_matched(response):
+                continue
+            token_id = str(row["token_id"] or "")
+            if not token_id or self._has_stop_exit_for_token(token_id):
+                continue
+            key = self._position_key(row["market_slug"], token_id, row["outcome_label"])
+            if key in seen:
+                continue
+            price = float(row["target_price"] or 0.0)
+            size = float(row["requested_size"] or 0.0)
+            if price <= 0 or size <= 0:
+                continue
+            groups.append(
+                {
+                    "market_slug": row["market_slug"],
+                    "outcome_label": row["outcome_label"],
+                    "token_id": token_id,
+                    "latest_at": row["created_at"],
+                    "latest_status": row["status"],
+                    "buy_size": size,
+                    "sell_size": 0.0,
+                    "redeemed_size": 0.0,
+                    "open_size": size,
+                    "open_cost_basis": price * size,
+                    "estimated_realized_pnl": 0.0,
+                    "entry_notional": price * size,
+                    "exit_notional": 0.0,
+                    "pending_match": True,
+                    "trades": [
+                        {
+                            "action": str(row["action"]).upper(),
+                            "status": row["status"],
+                            "price": price,
+                            "size": size,
+                            "notional": price * size,
+                            "order_id": row["order_id"],
+                            "created_at": row["created_at"],
+                        }
+                    ],
+                }
+            )
+            seen.add(key)
+        return sorted(groups, key=lambda item: str(item.get("latest_at") or ""), reverse=True)[:limit]
+
+    @staticmethod
+    def _position_key(market_slug: str, token_id: Any, outcome_label: Any) -> str:
+        return f"{market_slug}:{str(token_id or '')}:{str(outcome_label or '')}"
 
     def _market_for_token(self, token_id: str, outcome_label: str | None = None) -> tuple[str, str]:
         rows = self.connection.fetchall(
@@ -553,6 +1076,122 @@ class ScannerRepository:
                 inserted += 1
         return inserted
 
+    def save_polymarket_activity_trades(self, activities: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
+        inserted = 0
+        wallet = str(wallet_address or "").lower().strip()
+        with self.connection.transaction():
+            for activity in activities:
+                if str(activity.get("type") or "").upper().strip() != "TRADE":
+                    continue
+                proxy_wallet = str(activity.get("proxyWallet") or "").lower().strip()
+                if wallet and proxy_wallet and proxy_wallet != wallet:
+                    continue
+                token_id = str(activity.get("asset") or activity.get("asset_id") or activity.get("token_id") or "").strip()
+                action = str(activity.get("side") or "").upper().strip()
+                transaction_hash = str(activity.get("transactionHash") or activity.get("transaction_hash") or "").strip()
+                if not token_id or action not in {"BUY", "SELL"} or not transaction_hash:
+                    continue
+                try:
+                    price = float(activity.get("price") or 0.0)
+                    size = float(activity.get("size") or activity.get("matched_amount") or 0.0)
+                    timestamp = int(float(activity.get("timestamp") or 0))
+                except (TypeError, ValueError, OSError):
+                    continue
+                if price <= 0 or size <= 0 or timestamp <= 0:
+                    continue
+                created_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+                existing_tx = self.connection.fetchone(
+                    """
+                    SELECT id, status
+                    FROM live_trades
+                    WHERE response_json LIKE ?
+                    LIMIT 1
+                    """,
+                    (f"%{transaction_hash}%",),
+                )
+                if existing_tx:
+                    existing_status = str(existing_tx["status"] or "").upper()
+                    if existing_status in {"REDEEMED", "SETTLED_LOST", "MISATTRIBUTED_FILL_IGNORED"}:
+                        continue
+                    self.connection.execute(
+                        """
+                        UPDATE live_trades
+                        SET status = ?,
+                            response_json = ?,
+                            created_at = ?
+                        WHERE id = ?
+                        """,
+                        ("CONFIRMED", json.dumps(activity), created_at, existing_tx["id"]),
+                    )
+                    inserted += 1
+                    continue
+
+                local_order = self.connection.fetchone(
+                    """
+                    SELECT id, opportunity_id, order_id, market_slug, outcome_label
+                    FROM live_trades
+                    WHERE token_id = ?
+                      AND UPPER(action) = ?
+                      AND ABS(COALESCE(target_price, 0) - ?) < 0.0000001
+                      AND created_at <= ?
+                      AND UPPER(status) NOT IN ('REDEEMED', 'SETTLED_LOST', 'MISATTRIBUTED_FILL_IGNORED')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (token_id, action, price, created_at),
+                )
+                market_slug, outcome_label = self._market_for_token(token_id, str(activity.get("outcome") or "Unknown"))
+                if local_order:
+                    self.connection.execute(
+                        """
+                        UPDATE live_trades
+                        SET requested_size = ?,
+                            market_slug = ?,
+                            outcome_label = ?,
+                            status = ?,
+                            response_json = ?,
+                            created_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            size,
+                            str(local_order["market_slug"] or market_slug),
+                            str(local_order["outcome_label"] or outcome_label),
+                            "CONFIRMED",
+                            json.dumps(activity),
+                            created_at,
+                            local_order["id"],
+                        ),
+                    )
+                    inserted += 1
+                    continue
+
+                self.connection.execute(
+                    """
+                    INSERT INTO live_trades (
+                        opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                        target_price, requested_size, order_id, status, response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"data-api-trade:{transaction_hash}:{token_id}:{action}",
+                        1,
+                        action,
+                        token_id,
+                        str(activity.get("slug") or market_slug),
+                        str(activity.get("outcome") or outcome_label),
+                        price,
+                        size,
+                        f"data-api:{transaction_hash}:{token_id}:{action}",
+                        "CONFIRMED",
+                        json.dumps(activity),
+                        created_at,
+                    ),
+                )
+                inserted += 1
+        return inserted
+
     def redeem_candidate_live_trades(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(
             """
@@ -566,6 +1205,7 @@ class ScannerRepository:
                    requested_size,
                    order_id,
                    status,
+                   response_json,
                    created_at
             FROM live_trades
             WHERE order_id IS NOT NULL
@@ -803,6 +1443,181 @@ class ScannerRepository:
             for row in rows
         ]
 
+    @staticmethod
+    def _live_order_status_bucket(status: str) -> str:
+        normalized = str(status or "").upper()
+        if normalized in {"SUBMITTED", "PENDING", "OPEN", "CANCEL_REQUESTED"}:
+            return "open"
+        if normalized in {"CONFIRMED", "MATCHED", "FILLED", "MINED"}:
+            return "matched"
+        if normalized in {"CANCELLED", "EXPIRED", "FAILED", "CANCEL_UNCONFIRMED", "QUALIFICATION_CANCELLED", "REPRICE_CANCELLED"}:
+            return "cancelled"
+        if normalized in {"REDEEMED", "SETTLED_LOST"}:
+            return "finished"
+        return normalized.lower() or "unknown"
+
+    def recent_live_orders(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id,
+                   token_id,
+                   action,
+                   market_slug,
+                   outcome_label,
+                   target_price,
+                   requested_size,
+                   order_id,
+                   status,
+                   response_json,
+                   created_at
+            FROM live_trades
+            WHERE order_id IS NOT NULL
+              AND UPPER(status) NOT IN ('MISATTRIBUTED_FILL_IGNORED')
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        if not rows:
+            return []
+
+        market_slugs = sorted({str(row["market_slug"]) for row in rows if str(row.get("market_slug") or "")})
+        market_status: dict[str, dict[str, Any]] = {}
+        if market_slugs:
+            placeholders = ",".join("?" for _ in market_slugs)
+            market_rows = self.connection.fetchall(
+                f"""
+                SELECT slug, end_date, active, closed, raw_json
+                FROM markets
+                WHERE slug IN ({placeholders})
+                """,
+                tuple(market_slugs),
+            )
+            now_ts = self._now().timestamp()
+            market_status = {str(row["slug"]): self._market_status(row, now_ts=now_ts) for row in market_rows}
+            for slug in market_slugs:
+                market_status.setdefault(
+                    slug,
+                    {
+                        "ended": self._is_market_ended(
+                            slug,
+                            end_date=None,
+                            active=None,
+                            closed=None,
+                            now_ts=now_ts,
+                        ),
+                        "winning_outcome": None,
+                    },
+                )
+
+        token_ids = sorted({str(row["token_id"]) for row in rows if str(row.get("token_id") or "")})
+        latest_books: dict[str, dict[str, Any]] = {}
+        if token_ids:
+            placeholders = ",".join("?" for _ in token_ids)
+            book_rows = self.connection.fetchall(
+                f"""
+                SELECT obs.token_id,
+                       obs.best_bid,
+                       obs.best_ask,
+                       obs.midpoint,
+                       obs.captured_at
+                FROM orderbook_snapshots obs
+                INNER JOIN (
+                    SELECT token_id, MAX(captured_at) AS captured_at
+                    FROM orderbook_snapshots
+                    WHERE token_id IN ({placeholders})
+                    GROUP BY token_id
+                ) latest
+                  ON latest.token_id = obs.token_id
+                 AND latest.captured_at = obs.captured_at
+                """,
+                tuple(token_ids),
+            )
+            latest_books = {str(row["token_id"]): row for row in book_rows}
+
+        orders: list[dict[str, Any]] = []
+        for row in rows:
+            price = float(row["target_price"] or 0.0)
+            size = float(row["requested_size"] or 0.0)
+            notional = price * size
+            status_bucket = self._live_order_status_bucket(str(row["status"] or ""))
+            action = str(row["action"] or "").upper()
+            response = self._load_json(row.get("response_json"), {})
+            market_slug = str(row["market_slug"] or "")
+            status_info = market_status.get(market_slug, {})
+            market_ended = bool(status_info.get("ended"))
+            settlement_price = self._settlement_price_for_outcome(
+                str(row["outcome_label"] or ""),
+                status_info.get("winning_outcome") or response.get("crypto_winning_outcome"),
+            )
+            if market_ended and status_bucket == "matched":
+                status_bucket = "settlement_pending"
+            book = latest_books.get(str(row.get("token_id") or ""))
+            current_price = None
+            current_price_source = None
+            if market_ended and status_bucket == "settlement_pending" and settlement_price is not None:
+                current_price = settlement_price
+                current_price_source = "settlement_outcome"
+            elif book:
+                if book.get("best_bid") is not None:
+                    current_price = float(book["best_bid"])
+                    current_price_source = "best_bid"
+                elif book.get("midpoint") is not None:
+                    current_price = float(book["midpoint"])
+                    current_price_source = "midpoint"
+                elif book.get("best_ask") is not None:
+                    current_price = float(book["best_ask"])
+                    current_price_source = "best_ask"
+
+            current_value = None
+            pnl = None
+            normalized_status = str(row["status"] or "").upper()
+            if action == "BUY":
+                if normalized_status == "REDEEMED":
+                    current_price = 1.0
+                    current_price_source = "settlement_outcome"
+                    current_value = size
+                    pnl = size - notional
+                elif normalized_status == "SETTLED_LOST":
+                    current_price = 0.0
+                    current_price_source = "settlement_outcome"
+                    current_value = 0.0
+                    pnl = -notional
+                elif status_bucket in {"matched", "settlement_pending"} and current_price is not None:
+                    current_value = current_price * size
+                    pnl = current_value - notional
+            elif action == "SELL" and status_bucket in {"matched", "finished"}:
+                current_value = notional
+                pnl = 0.0
+
+            orders.append(
+                {
+                    "opportunity_id": row["opportunity_id"],
+                    "token_id": row["token_id"],
+                    "action": action,
+                    "market_slug": market_slug,
+                    "market_url": f"https://polymarket.com/market/{market_slug}" if market_slug else None,
+                    "outcome_label": row["outcome_label"],
+                    "target_price": price,
+                    "requested_size": size,
+                    "notional": notional,
+                    "order_id": row["order_id"],
+                    "raw_status": row["status"],
+                    "status": status_bucket,
+                    "market_ended": market_ended,
+                    "current_price": current_price,
+                    "current_price_source": current_price_source,
+                    "current_price_at": book.get("captured_at") if book else None,
+                    "current_value": current_value,
+                    "pnl": pnl,
+                    "transaction_hash": response.get("transaction_hash") or response.get("transactionHash"),
+                    "clob_fill_id": response.get("id"),
+                    "trader_side": response.get("trader_side"),
+                    "created_at": row["created_at"],
+                }
+            )
+        return orders
+
     def _estimated_live_trade_summary(
         self,
         *,
@@ -920,6 +1735,35 @@ class ScannerRepository:
             """,
             (*self.LIVE_JOURNAL_STATUSES, max(limit * 8, limit)),
         )
+
+        market_slugs = sorted({str(row["market_slug"]) for row in rows if str(row.get("market_slug") or "")})
+        market_status: dict[str, dict[str, Any]] = {}
+        if market_slugs:
+            placeholders = ",".join("?" for _ in market_slugs)
+            market_rows = self.connection.fetchall(
+                f"""
+                SELECT slug, end_date, active, closed, raw_json
+                FROM markets
+                WHERE slug IN ({placeholders})
+                """,
+                tuple(market_slugs),
+            )
+            now_ts = self._now().timestamp()
+            market_status = {str(row["slug"]): self._market_status(row, now_ts=now_ts) for row in market_rows}
+            for slug in market_slugs:
+                market_status.setdefault(
+                    slug,
+                    {
+                        "ended": self._is_market_ended(
+                            slug,
+                            end_date=None,
+                            active=None,
+                            closed=None,
+                            now_ts=now_ts,
+                        ),
+                        "winning_outcome": None,
+                    },
+                )
 
         groups: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -1044,7 +1888,23 @@ class ScannerRepository:
             book = latest_books.get(str(group.get("token_id") or ""))
             current_price = None
             current_price_source = "missing"
-            if book:
+            status_info = market_status.get(str(group.get("market_slug") or ""), {})
+            market_ended = bool(status_info.get("ended"))
+            settlement_price = self._settlement_price_for_outcome(
+                str(group.get("outcome_label") or ""),
+                status_info.get("winning_outcome"),
+            )
+            if market_ended and float(group.get("open_size") or 0.0) > 1e-9 and settlement_price is not None:
+                current_price = settlement_price
+                current_price_source = "settlement_outcome"
+                group["latest_status"] = "settlement_pending"
+            elif market_ended and str(group.get("latest_status") or "").upper() == "REDEEMED":
+                current_price = 1.0
+                current_price_source = "settlement_outcome"
+            elif market_ended and str(group.get("latest_status") or "").upper() == "SETTLED_LOST":
+                current_price = 0.0
+                current_price_source = "settlement_outcome"
+            elif book:
                 best_bid = book.get("best_bid")
                 midpoint = book.get("midpoint")
                 best_ask = book.get("best_ask")
@@ -1067,6 +1927,7 @@ class ScannerRepository:
             group["current_price"] = current_price
             group["current_price_source"] = current_price_source
             group["current_price_at"] = book.get("captured_at") if book else None
+            group["market_ended"] = market_ended
             group["current_value"] = current_value
             group["unrealized_pnl"] = unrealized_pnl
             group["total_pnl"] = total_pnl
@@ -1327,33 +2188,106 @@ class ScannerRepository:
         return int(row["signal_count"]) if row else 0
 
     def near_close_live_exposure(self) -> dict[str, Any]:
-        inactive_placeholders = ",".join("?" for _ in self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES)
+        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_STATUSES)
         rows = self.connection.fetchall(
             f"""
-            SELECT market_slug, action, target_price, requested_size, status, response_json
+            SELECT token_id,
+                   action,
+                   market_slug,
+                   outcome_label,
+                   target_price,
+                   requested_size,
+                   status,
+                   response_json,
+                   created_at
             FROM live_trades
             WHERE response_json LIKE '%"strategy_variant": "near_close_maker"%'
-              AND status NOT IN ({inactive_placeholders})
+              AND UPPER(status) IN ({status_placeholders})
+            ORDER BY created_at ASC, id ASC
             """,
-            self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES,
+            self.LIVE_JOURNAL_STATUSES,
         )
         by_market: dict[str, float] = {}
+        by_position: dict[str, dict[str, Any]] = {}
+        open_lots: dict[str, list[dict[str, float]]] = {}
         total = 0.0
-        active_orders = 0
-        now_ts = datetime.now(timezone.utc).timestamp()
         for row in rows:
-            response = self._load_json(row.get("response_json"), {})
-            expiration = response.get("expiration")
-            if expiration is not None and float(expiration or 0) <= now_ts:
+            action = str(row["action"] or "").upper()
+            status = str(row["status"] or "").upper()
+            price = float(row["target_price"] or 0.0)
+            size = float(row["requested_size"] or 0.0)
+            if price <= 0 or size <= 0:
                 continue
-            active_orders += 1
-            notional = float(row["target_price"] or 0.0) * float(row["requested_size"] or 0.0)
-            if str(row["action"]).upper() == "SELL":
-                notional = -notional
             market_slug = str(row["market_slug"])
-            by_market[market_slug] = by_market.get(market_slug, 0.0) + notional
-            total += notional
-        return {"total": max(total, 0.0), "by_market": by_market, "active_orders": active_orders}
+            position_key = self._position_key(market_slug, row["token_id"], row["outcome_label"])
+            lots = open_lots.setdefault(position_key, [])
+            if action == "BUY" and status == "REDEEMED":
+                continue
+            if action == "BUY" and status == "SETTLED_LOST":
+                continue
+            if action == "BUY":
+                lots.append({"size": size, "price": price})
+                continue
+            if action != "SELL":
+                continue
+            remaining = size
+            while remaining > 1e-9 and lots:
+                lot = lots[0]
+                matched = min(remaining, float(lot["size"]))
+                remaining -= matched
+                lot["size"] = float(lot["size"]) - matched
+                if lot["size"] <= 1e-9:
+                    lots.pop(0)
+
+        for key, lots in open_lots.items():
+            open_size = sum(float(lot["size"]) for lot in lots if float(lot["size"]) > 1e-9)
+            if open_size <= 1e-9:
+                continue
+            open_cost_basis = sum(
+                float(lot["size"]) * float(lot["price"])
+                for lot in lots
+                if float(lot["size"]) > 1e-9
+            )
+            market_slug, token_id, outcome_label = key.split(":", 2)
+            by_market[market_slug] = by_market.get(market_slug, 0.0) + open_cost_basis
+            by_position[key] = {
+                "market_slug": market_slug,
+                "token_id": token_id,
+                "outcome_label": outcome_label,
+                "open_size": open_size,
+                "open_cost_basis": open_cost_basis,
+                "pending_size": 0.0,
+                "total_size": open_size,
+            }
+            total += open_cost_basis
+
+        active_orders = 0
+        for order in self.near_close_active_orders_for_market():
+            active_orders += 1
+            market_slug = str(order.get("market_slug") or "")
+            position_key = self._position_key(market_slug, order.get("token_id"), order.get("outcome_label"))
+            position = by_position.setdefault(
+                position_key,
+                {
+                    "market_slug": market_slug,
+                    "token_id": str(order.get("token_id") or ""),
+                    "outcome_label": str(order.get("outcome_label") or ""),
+                    "open_size": 0.0,
+                    "open_cost_basis": 0.0,
+                    "pending_size": 0.0,
+                    "total_size": 0.0,
+                },
+            )
+            pending_size = float(order.get("requested_size") or 0.0)
+            position["pending_size"] = float(position.get("pending_size") or 0.0) + pending_size
+            position["total_size"] = float(position.get("open_size") or 0.0) + float(position["pending_size"])
+
+        return {
+            "total": max(total, 0.0),
+            "by_market": by_market,
+            "by_position": by_position,
+            "active_orders": active_orders,
+        }
 
     def near_close_dashboard_summary(self) -> dict[str, Any]:
         signal_count = self.near_close_signal_count()
@@ -1421,6 +2355,15 @@ class ScannerRepository:
             (self._cutoff_iso(hours=24),),
         )
         scan_row = self.latest_scan_cycle()
+        heartbeat_row = self.connection.fetchone(
+            """
+            SELECT latest_scan_at
+            FROM watch_heartbeats
+            WHERE latest_scan_at IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        )
         audit_row = self.connection.fetchone(
             """
             SELECT COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS execution_events_24h,
@@ -1435,7 +2378,7 @@ class ScannerRepository:
             "total_markets": market_row["total_markets"] if market_row else 0,
             "open_markets": market_row["open_markets"] if market_row else 0,
             "latest_discovered_at": market_row["latest_discovered_at"] if market_row else None,
-            "latest_scan_at": scan_row.get("executed_at"),
+            "latest_scan_at": heartbeat_row["latest_scan_at"] if heartbeat_row else scan_row.get("executed_at"),
             "latest_discovered_market_count": scan_row.get("discovered_market_count", 0),
             "latest_monitored_markets": scan_row.get("monitored_market_count", 0),
             "latest_book_count": scan_row.get("book_count", 0),
@@ -1491,6 +2434,10 @@ class ScannerRepository:
         opportunities: list[dict[str, Any]] = []
         for row in rows:
             details = self._load_json(row["details_json"], {})
+            market_slugs = self._load_json(row["market_slugs_json"], [])
+            title_text = str(row["title"] or "").lower()
+            if "xrp" in title_text or any("xrp" in str(slug).lower() for slug in market_slugs):
+                continue
             qualification_tier = details.get("qualification_tier", "actionable")
             qualification_label = details.get(
                 "qualification_label",
@@ -1516,7 +2463,7 @@ class ScannerRepository:
                     "direction": row["direction"],
                     "title": f"[{qualification_label}] {row['title']}",
                     "summary": details.get("summary") or details.get("note") or row["title"],
-                    "market_slugs": self._load_json(row["market_slugs_json"], []),
+                    "market_slugs": market_slugs,
                     "gross_edge": row["gross_edge"],
                     "net_edge": row["net_edge"],
                     "max_safe_size": row["max_safe_size"],

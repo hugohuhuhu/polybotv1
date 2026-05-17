@@ -220,7 +220,11 @@ def _wrap_usdce_to_pusd(
     allowance = _call_uint(client, settings.polygon_rpc_url, usdce, _erc20_allowance_data(wallet, onramp))
     approve_tx = None
     if allowance < amount_units:
-        approve_data = _encode_call("approve(address,uint256)", [("address", onramp), ("uint256", amount_units)])
+        allowance_target = max(
+            amount_units,
+            _decimal_to_base_units(settings.auto_redeem_wrap_allowance_usdce),
+        )
+        approve_data = _encode_call("approve(address,uint256)", [("address", onramp), ("uint256", allowance_target)])
         approve_tx = _send_transaction(client, settings, private_key=private_key, from_address=wallet, to=usdce, data=approve_data)
         receipt = _wait_receipt(client, settings.polygon_rpc_url, approve_tx)
         if int(receipt.get("status", "0x0"), 16) != 1:
@@ -307,7 +311,24 @@ def run_auto_redeem_once(
                 _ctf_balance_data(wallet, token_id),
             )
             if balance_units <= 0:
-                result.message = "No conditional token balance to redeem."
+                repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
+                repository.save_execution_event(
+                    source="auto-redeem",
+                    mode="live",
+                    opportunity_id=str(candidate.get("opportunity_id") or ""),
+                    status="redeemed",
+                    message="Winning conditional token has no wallet balance; marking local position complete.",
+                    details={
+                        "market_slug": result.market_slug,
+                        "outcome_label": result.outcome_label,
+                        "token_id": token_id,
+                        "condition_id": condition_id,
+                        "ctf_units": balance_units,
+                        "reason": "no_conditional_token_balance",
+                    },
+                )
+                result.status = "redeemed"
+                result.message = "No conditional token balance to redeem; local position marked complete."
                 results.append(result)
                 continue
             usdce_before = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)

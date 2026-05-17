@@ -1,5 +1,8 @@
-const body = document.body;
+﻿const body = document.body;
 const refreshSec = Number(body.dataset.refreshSec || 15);
+const DASHBOARD_FETCH_TIMEOUT_MS = 12000;
+const ACTION_FETCH_TIMEOUT_MS = 90000;
+const LIVE_ORDER_SYNC_SEC = 5;
 const pageSize = Number(body.dataset.pageSize || 18);
 
 const statusChip = document.getElementById("statusChip");
@@ -8,6 +11,8 @@ const lastUpdatedLabel = document.getElementById("lastUpdatedLabel");
 const refreshLabel = document.getElementById("refreshLabel");
 const scanCountdownLabel = document.getElementById("scanCountdownLabel");
 const scanCountdownBar = document.getElementById("scanCountdownBar");
+const heartbeatLabel = document.getElementById("heartbeatLabel");
+const heartbeatList = document.getElementById("heartbeatList");
 const persistenceLabel = document.getElementById("persistenceLabel");
 const persistenceNote = document.getElementById("persistenceNote");
 const riskBanner = document.getElementById("riskBanner");
@@ -30,12 +35,16 @@ const walletUsdc = document.getElementById("walletUsdc");
 const walletPusd = document.getElementById("walletPusd");
 const preflightSummary = document.getElementById("preflightSummary");
 const preflightList = document.getElementById("preflightList");
+const parameterSummary = document.getElementById("parameterSummary");
+const parameterDiagnostics = document.getElementById("parameterDiagnostics");
+const tradingParameterGrid = document.getElementById("tradingParameterGrid");
 const summaryGrid = document.getElementById("summaryGrid");
 const criteriaFunnel = document.getElementById("criteriaFunnel");
 const opportunityRows = document.getElementById("opportunityRows");
 const strategyStack = document.getElementById("strategyStack");
 const alertFeed = document.getElementById("alertFeed");
 const executionFeed = document.getElementById("executionFeed");
+const executionOrderFeed = document.getElementById("executionOrderFeed");
 const positionFeed = document.getElementById("positionFeed");
 const tradePnlValue = document.getElementById("tradePnlValue");
 const tradePnlMeta = document.getElementById("tradePnlMeta");
@@ -49,6 +58,8 @@ const TEXT = {
   noStrategies: "\u5c1a\u672a\u6709\u7b56\u7565\u7d71\u8a08\u8cc7\u6599\u3002",
   noAlerts: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u8b66\u793a\u3002",
   noExecutions: "\u5c1a\u672a\u6709\u57f7\u884c\u4e8b\u4ef6\u3002",
+  noLiveOrders: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u771f\u5be6\u59d4\u8a17\u3002",
+  noHeartbeats: "\u5c1a\u672a\u6709 watch \u5fc3\u8df3\u3002",
   noTrades: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u3002",
   noTradeRecords: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u7d00\u9304",
   noMarkets: "\u5c1a\u672a\u540c\u6b65\u5e02\u5834\u8cc7\u6599\u3002",
@@ -71,6 +82,8 @@ const TEXT = {
   watchStoppedDetail: "\u80cc\u666f watch \u5df2\u505c\u6389\uff0c\u73fe\u5728\u4e0d\u6703\u81ea\u52d5\u6383\u63cf\uff0c\u4e5f\u4e0d\u6703\u81ea\u52d5\u9001\u55ae\u3002",
   updateFailed: "\u66f4\u65b0\u4ea4\u6613\u63a7\u5236\u5931\u6557",
   scanFailed: "\u6383\u63cf\u5931\u6557",
+  syncDelayed: "\u540c\u6b65\u5ef6\u9072\uff0c\u4fdd\u7559\u4e0a\u4e00\u7b46\u8cc7\u6599",
+  scanNoLiveEntries: "\u6383\u63cf\u5b8c\u6210\uff0c\u76ee\u524d\u6c92\u6709\u7b26\u5408 Live \u689d\u4ef6\u7684\u55ae\u3002",
   watchStart: "\u555f\u52d5 watch",
   watchStop: "\u505c\u6b62 watch",
   watchStarting: "watch \u555f\u52d5\u4e2d",
@@ -121,6 +134,17 @@ let latestWatchState = {
 
 let nextDashboardSyncAt = Date.now() + refreshSec * 1000;
 let dashboardLoadInFlight = false;
+let dashboardSyncTimer = null;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DASHBOARD_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 
 function formatNumber(value, fractionDigits = 0) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -176,7 +200,7 @@ function formatTime(value) {
 function activeDashboardSyncSec() {
   const watchInterval = Number(latestWatchState?.scan_interval_sec || 0);
   if (latestWatchState?.running && watchInterval > 0) {
-    return watchInterval;
+    return Math.min(refreshSec, LIVE_ORDER_SYNC_SEC);
   }
   return refreshSec;
 }
@@ -186,25 +210,72 @@ function resetDashboardSyncCountdown() {
   renderSyncCountdown();
 }
 
+function scheduleDashboardSync(delayMs = activeDashboardSyncSec() * 1000) {
+  if (dashboardSyncTimer) {
+    window.clearTimeout(dashboardSyncTimer);
+  }
+  const waitMs = Math.max(Number(delayMs) || 0, 250);
+  dashboardSyncTimer = window.setTimeout(async () => {
+    dashboardSyncTimer = null;
+    if (dashboardLoadInFlight) {
+      nextDashboardSyncAt = Date.now() + 1000;
+      renderSyncCountdown();
+      scheduleDashboardSync(1000);
+      return;
+    }
+    try {
+      await loadDashboard();
+    } catch (_error) {
+      setStatus("warn", TEXT.syncDelayed);
+      resetDashboardSyncCountdown();
+    } finally {
+      scheduleDashboardSync();
+    }
+  }, waitMs);
+}
+
 function renderSyncCountdown() {
   if (!refreshLabel || !scanCountdownLabel || !scanCountdownBar) {
     return;
   }
 
-  const watchInterval = Number(latestWatchState?.scan_interval_sec || 0);
-  const syncSec = activeDashboardSyncSec();
-  const remainingMs = Math.max(nextDashboardSyncAt - Date.now(), 0);
-  const totalMs = Math.max(syncSec * 1000, 1);
-  const progress = Math.min(Math.max((1 - remainingMs / totalMs) * 100, 0), 100);
+  const heartbeat = latestWatchState?.latest_heartbeat || {};
+  const details = heartbeat.details || {};
+  const phase = latestWatchState?.phase || details.phase || heartbeat.state || latestWatchState?.state;
+  const scanTimeoutSec = Number(latestWatchState?.watch_scan_timeout_sec || details.timeout_sec || 60);
+  const delaySec = Number(latestWatchState?.watch_delay_sec || details.delay_sec || 30);
+  let progress = 0;
 
-  if (latestWatchState?.running && watchInterval > 0) {
-    refreshLabel.textContent = `${watchInterval} 秒掃描 / ${refreshSec} 秒同步`;
-    scanCountdownLabel.textContent = `下次同步倒數 ${(remainingMs / 1000).toFixed(1)} 秒`;
-    scanCountdownBar.parentElement?.classList.remove("stopped");
+  refreshLabel.textContent = `掃描 → delay ${formatNumber(delaySec)} 秒 → 再次掃描`;
+  scanCountdownBar.parentElement?.classList.toggle("stopped", !latestWatchState?.running);
+
+  if (!latestWatchState?.running) {
+    scanCountdownLabel.textContent =
+      latestWatchState?.state === "stale" ? "watch 掃描停滯，流程暫停" : "watch 已停止，流程暫停";
+    scanCountdownBar.style.width = "0%";
+    return;
+  }
+
+  if (phase === "scanning") {
+    const startedAt = new Date(latestWatchState.phase_started_at || details.scan_started_at || Date.now()).getTime();
+    const elapsedMs = Math.max(Date.now() - startedAt, 0);
+    const totalMs = Math.max(scanTimeoutSec * 1000, 1);
+    const remainingSec = Math.max((totalMs - elapsedMs) / 1000, 0);
+    progress = Math.min(Math.max((elapsedMs / totalMs) * 100, 0), 100);
+    scanCountdownLabel.textContent = `掃描中，超過 ${formatNumber(scanTimeoutSec)} 秒會 drop，目前剩約 ${remainingSec.toFixed(1)} 秒`;
+  } else if (phase === "delay") {
+    const untilAt = new Date(latestWatchState.phase_until || details.delay_until || Date.now()).getTime();
+    const remainingMs = Math.max(untilAt - Date.now(), 0);
+    const totalMs = Math.max(delaySec * 1000, 1);
+    progress = Math.min(Math.max((1 - remainingMs / totalMs) * 100, 0), 100);
+    scanCountdownLabel.textContent = `delay 中，${(remainingMs / 1000).toFixed(1)} 秒後再次掃描`;
+  } else if (phase === "timeout") {
+    progress = 100;
+    scanCountdownLabel.textContent = `上一輪超過 ${formatNumber(scanTimeoutSec)} 秒已 drop，準備進入 delay`;
   } else {
-    refreshLabel.textContent = `${refreshSec} 秒同步`;
-    scanCountdownLabel.textContent = latestWatchState?.state === "stale" ? "watch 掃描停滯，改用頁面同步倒數" : "watch 已停止，改用頁面同步倒數";
-    scanCountdownBar.parentElement?.classList.add("stopped");
+    const heartbeatAge = Number(latestWatchState?.heartbeat_age_sec || 0);
+    progress = heartbeatAge > delaySec ? 100 : Math.min((heartbeatAge / Math.max(delaySec, 1)) * 100, 100);
+    scanCountdownLabel.textContent = "等待下一輪 watch 心跳";
   }
 
   scanCountdownBar.style.width = `${progress}%`;
@@ -227,7 +298,7 @@ function looksMojibake(value) {
   if (!value) {
     return false;
   }
-  return /[ÃÂÅÆÇÉÏÖØÙÚà-ÿ]/.test(String(value));
+  return /[脙脗脜脝脟脡脧脰脴脵脷脿]/.test(String(value));
 }
 
 function cleanOpportunityTitle(item) {
@@ -253,6 +324,10 @@ function strategyLabel(strategyType) {
 function executionStatusLabel(status) {
   const mapping = {
     submitted: "\u5df2\u9001\u51fa",
+    open: "open",
+    matched: "matched",
+    settlement_pending: "matched",
+    finished: "finished",
     duplicate_claim: "\u91cd\u8907\u8a8d\u9818",
     risk_blocked: "\u98a8\u63a7\u963b\u64cb",
     preflight_blocked: "\u524d\u6aa2\u963b\u64cb",
@@ -262,10 +337,80 @@ function executionStatusLabel(status) {
     failed: "\u5931\u6557",
     cancelled: "\u5df2\u53d6\u6d88",
     filled: "\u5df2\u6210\u4ea4",
+    finish_completed: "\u6536\u5de5\u5b8c\u6210",
+    finish_failed: "\u6536\u5de5\u5931\u6557",
   };
+  if (status === "settlement_pending") {
+    return "matched";
+  }
   return mapping[status] || status || "-";
 }
 
+function liveOrderStatusClass(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (
+    normalized === "open" ||
+    normalized === "matched" ||
+    normalized === "settlement_pending" ||
+    normalized === "finished"
+  ) {
+    return "ok";
+  }
+  if (normalized === "cancelled") {
+    return "neutral";
+  }
+  return "problem";
+}
+
+function riskReasonLabel(item) {
+  const message = String(item?.message || "");
+  const mapping = [
+    [/same-market exposure limit/i, "\u540c\u5e02\u5834\u66dd\u96aa\u5df2\u9054\u4e0a\u9650"],
+    [/total exposure limit/i, "Near-close \u7e3d\u66dd\u96aa\u5df2\u9054\u4e0a\u9650"],
+    [/daily live notional/i, "\u4eca\u65e5 Live \u91d1\u984d\u4e0a\u9650"],
+    [/daily live order/i, "\u4eca\u65e5 Live \u7b46\u6578\u4e0a\u9650"],
+    [/max_notional_per_plan/i, "\u55ae\u7b46\u91d1\u984d\u4e0a\u9650"],
+    [/kill switch/i, "Kill switch \u5df2\u555f\u52d5"],
+    [/paper signals/i, "paper signal \u6578\u91cf\u5c1a\u672a\u9054\u6a19"],
+    [/disabled.*paper observation|paper observation only/i, "\u7b56\u7565\u4ecd\u662f paper-only"],
+    [/no positive notional/i, "\u59d4\u8a17\u91d1\u984d\u4e0d\u662f\u6b63\u6578"],
+  ];
+  const match = mapping.find(([pattern]) => pattern.test(message));
+  return match ? match[1] : message || "\u98a8\u63a7\u689d\u4ef6\u672a\u901a\u904e";
+}
+
+function riskEventDetail(item) {
+  const details = item?.details || {};
+  if (item?.status === "preflight_blocked") {
+    const reasons = Array.isArray(details.blocking_reasons) ? details.blocking_reasons : [];
+    const cleanReasons = reasons
+      .map((reason) => String(reason || ""))
+      .filter(Boolean)
+      .map((reason) => {
+        if (/Polygon RPC|POL|pUSD|allowance|approve/i.test(reason)) {
+          return reason;
+        }
+        return "\u9322\u5305 / RPC / pUSD \u524d\u7f6e\u6aa2\u67e5\u672a\u901a\u904e";
+      });
+    return cleanReasons.length
+      ? `\u89f8\u767c\uff1a${cleanReasons.join("\uff0c")}`
+      : "\u89f8\u767c\uff1aLive \u4ea4\u6613\u524d\u7f6e\u6aa2\u67e5\u672a\u901a\u904e";
+  }
+  if (item?.status !== "risk_blocked") {
+    return executionEventPresentation(item).message;
+  }
+  const parts = [`\u89f8\u767c\uff1a${riskReasonLabel(item)}`];
+  if (details.estimated_notional !== undefined) {
+    parts.push(`\u672c\u55ae ${formatToken(details.estimated_notional)} pUSD`);
+  }
+  if (details.projected_daily_notional !== undefined) {
+    parts.push(`\u63a8\u4f30\u7d2f\u8a08 ${formatToken(details.projected_daily_notional)} pUSD`);
+  }
+  if (details.projected_daily_orders !== undefined) {
+    parts.push(`\u63a8\u4f30\u7b46\u6578 ${formatNumber(details.projected_daily_orders)}`);
+  }
+  return parts.join("\uff0c");
+}
 function executionEventPresentation(item) {
   const armed = Boolean(latestTradingState?.armed);
 
@@ -305,7 +450,7 @@ function executionEventPresentation(item) {
 
 function readableMarketName(slug) {
   if (!slug) {
-    return "風控事件";
+    return "\u98a8\u63a7\u4e8b\u4ef6";
   }
   const parts = String(slug).split("-updown-");
   if (parts.length === 2) {
@@ -328,13 +473,13 @@ function executionEventSummary(item) {
   return {
     market: readableMarketName(leg.market_slug),
     time: formatTime(item?.created_at),
-    size: leg.requested_size ? `${formatToken(leg.requested_size)} 股` : notional ? `${formatToken(notional)} pUSD` : "-",
+    size: leg.requested_size ? `${formatToken(leg.requested_size)} \u80a1` : notional ? `${formatToken(notional)} pUSD` : "-",
     status: executionStatusLabel(item?.status),
     pillClass: executionEventPresentation(item).pillClass,
     outcome: leg.outcome_label ? ` / ${leg.outcome_label}` : "",
+    detail: riskEventDetail(item),
   };
 }
-
 function renderWatchIndicator(trading, watch, risk) {
   if (!armedIndicator || !armedIndicatorTitle || !armedIndicatorDetail) {
     return;
@@ -362,11 +507,11 @@ function renderWatchIndicator(trading, watch, risk) {
   if (!armed) {
     armedIndicator.classList.add("idle");
   }
-  armedIndicatorTitle.textContent = armed ? (nearCloseLiveEnabled ? "實戰模式" : "系統已武裝") : TEXT.watchRunningTitle;
+  armedIndicatorTitle.textContent = armed ? (nearCloseLiveEnabled ? "實戰模式" : "系統已待命") : TEXT.watchRunningTitle;
   armedIndicatorDetail.textContent = armed
     ? nearCloseLiveEnabled
-      ? "watch 正在運行；Near-close maker 命中 live 條件時會送出 post-only GTD 真單。"
-      : "watch 正在運行；Near-close maker 目前只收集 paper signal，不會送真單。"
+      ? "watch 正在運行；near-close maker 命中 live 條件時會送出 post-only GTD 真單。"
+      : "watch 正在運行；near-close maker 目前只收集 paper signal，不會送真單。"
     : TEXT.watchIdleDetail;
 }
 
@@ -531,7 +676,7 @@ function renderCriteriaFunnel(summary) {
       const count = Number(stage?.count || 0);
       const previous = index > 0 ? Number(funnel[index - 1]?.count || 0) : count;
       const dropped = Math.max(previous - count, 0);
-      const dropLabel = index === 0 ? "起點" : `淘汰 ${formatNumber(dropped)}`;
+      const dropLabel = index === 0 ? "璧烽粸" : `娣樻卑 ${formatNumber(dropped)}`;
       return `
         <article class="criteria-stage ${count === 0 ? "is-zero" : ""}">
           <div>
@@ -651,12 +796,60 @@ function renderExecutionEvents(events) {
         <article class="feed-item execution-item">
           <div class="execution-main">
             <strong>${escapeHtml(summary.market)}${escapeHtml(summary.outcome)}</strong>
+            <p>${escapeHtml(summary.detail)}</p>
             <time>${escapeHtml(summary.time)}</time>
           </div>
           <div class="execution-meta">
             <span>${escapeHtml(summary.size)}</span>
             <span class="feed-pill ${summary.pillClass}">${escapeHtml(summary.status)}</span>
           </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderLiveOrders(orders) {
+  if (!executionOrderFeed) {
+    return;
+  }
+  if (!orders?.length) {
+    executionOrderFeed.innerHTML = `<p class="empty-block">${TEXT.noLiveOrders}</p>`;
+    return;
+  }
+
+  executionOrderFeed.innerHTML = orders
+    .map((order) => {
+      const status = String(order.status || "unknown").toLowerCase();
+      const statusClass = liveOrderStatusClass(status);
+      const action = String(order.action || "").toUpperCase();
+      const valueLabel =
+        order.current_value === null || order.current_value === undefined
+          ? "-"
+          : `${formatToken(order.current_value)} pUSD`;
+      const pnlLabel =
+        order.pnl === null || order.pnl === undefined ? "-" : `${formatSignedToken(order.pnl)} pUSD`;
+      const isMatched = ["matched", "settlement_pending", "finished"].includes(status);
+      const title = escapeHtml(readableMarketName(order.market_slug));
+      const marketTitle =
+        isMatched && order.market_url
+          ? `<a href="${escapeHtml(order.market_url)}" target="_blank" rel="noreferrer">${title}</a>`
+          : title;
+      return `
+        <article class="order-card">
+          <header>
+            <div>
+              <strong>${marketTitle}</strong>
+              <p>${escapeHtml(order.outcome_label || "-")} · ${escapeHtml(action || "-")} ${formatToken(order.requested_size)} 股 @ ${formatToken(order.target_price)}</p>
+            </div>
+            <span class="feed-pill ${statusClass}">${escapeHtml(executionStatusLabel(status))}</span>
+          </header>
+          <div class="order-card__metrics">
+            <span>部位 ${formatToken(order.notional)} pUSD</span>
+            <span>面值 ${valueLabel}</span>
+            <span>損益 ${pnlLabel}</span>
+          </div>
+          <time>${formatTime(order.created_at)}</time>
         </article>
       `;
     })
@@ -855,7 +1048,7 @@ function renderTrading(trading, wallet, risk, preflight, persistence, watch) {
   } else if (armed && !risk?.near_close?.live_enabled) {
     tradingSummary.textContent = "Live 與自動下單已開啟，但 Near-close maker 仍是 paper-only，目前不會送真單。";
   } else if (armed) {
-    tradingSummary.textContent = "實戰模式：Live 與自動下單已開啟；Near-close maker 命中時會送出 post-only GTD 真單。";
+    tradingSummary.textContent = "實戰模式：Live 與自動下單已開啟，Near-close maker 命中時會送出 post-only GTD 真單。";
   } else if (liveEnabled) {
     tradingSummary.textContent = "Live \u6a21\u5f0f\u5df2\u555f\u7528\uff0c\u4f46\u81ea\u52d5\u4e0b\u55ae\u5c1a\u672a\u958b\u555f\u3002";
   } else {
@@ -876,7 +1069,7 @@ function renderTrading(trading, wallet, risk, preflight, persistence, watch) {
   if (armed && risk?.near_close?.live_enabled) {
     banners.push("實戰模式：Near-close maker 命中 live 條件時會送出 post-only GTD 真單。");
   } else if (armed) {
-    banners.push("系統已武裝，但 Near-close maker 目前是 paper-only，不會送真單。");
+    banners.push("系統已待命，但 Near-close maker 目前是 paper-only，不會送真單。");
   }
   if (persistence?.cloud_warning) {
     banners.push("\u76ee\u524d\u4ecd\u7528 SQLite \u90e8\u7f72\uff1b\u5728\u9577\u6642\u9593\u9ad8\u983b\u5beb\u5165\u4e0b\uff0c\u7a69\u5b9a\u6027\u4ecd\u4e0d\u5982 PostgreSQL / Cloud SQL\u3002");
@@ -941,6 +1134,76 @@ function renderPreflight(preflight) {
     .join("");
 }
 
+function formatParameterValue(item) {
+  if (!item) {
+    return "-";
+  }
+  const value = item.value;
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  if (typeof value === "number") {
+    const digits = Math.abs(value) > 10 || Number.isInteger(value) ? 0 : 4;
+    return `${formatNumber(value, digits)}${item.unit ? ` ${item.unit}` : ""}`;
+  }
+  return `${value}${item.unit ? ` ${item.unit}` : ""}`;
+}
+
+function renderTradingParameters(parameters) {
+  if (!parameterSummary || !parameterDiagnostics || !tradingParameterGrid) {
+    return;
+  }
+  const groups = Array.isArray(parameters?.groups) ? parameters.groups : [];
+  const diagnostics = Array.isArray(parameters?.diagnostics) ? parameters.diagnostics : [];
+  const blockerCount = diagnostics.filter((item) => item.level === "blocked").length;
+  const watchCount = diagnostics.filter((item) => item.level === "watch").length;
+
+  parameterSummary.textContent =
+    blockerCount > 0
+      ? `${blockerCount} 個送單阻擋`
+      : watchCount > 0
+        ? `${watchCount} 個掃描卡點`
+        : "參數正常";
+
+  parameterDiagnostics.innerHTML = diagnostics.length
+    ? diagnostics
+        .map((item) => {
+          const level = item.level === "ok" ? "ok" : item.level === "blocked" ? "problem" : "watch";
+          return `
+            <article class="parameter-diagnostic ${level}">
+              <strong>${escapeHtml(item.label || "-")}</strong>
+              <p>${escapeHtml(item.detail || "-")}</p>
+            </article>
+          `;
+        })
+        .join("")
+    : `<p class="empty-block">目前沒有下單阻擋診斷。</p>`;
+
+  tradingParameterGrid.innerHTML = groups.length
+    ? groups
+        .map(
+          (group) => `
+            <section class="parameter-group">
+              <h5>${escapeHtml(group.title || "參數")}</h5>
+              <div class="parameter-list">
+                ${(Array.isArray(group.items) ? group.items : [])
+                  .map(
+                    (item) => `
+                      <div class="parameter-row">
+                        <span>${escapeHtml(item.label || "-")}</span>
+                        <strong>${escapeHtml(formatParameterValue(item))}</strong>
+                      </div>
+                    `,
+                  )
+                  .join("")}
+              </div>
+            </section>
+          `,
+        )
+        .join("")
+    : `<p class="empty-block">尚未同步參數。</p>`;
+}
+
 function renderWallet(wallet) {
   walletStatusNote.textContent = walletStatusMessage(wallet);
   if (!wallet?.configured) {
@@ -968,6 +1231,48 @@ function renderPersistence(persistence) {
   persistenceNote.textContent = backend === "PostgreSQL" ? TEXT.persistencePostgres : TEXT.persistenceSqlite;
 }
 
+function watchPhaseLabel(item) {
+  const phase = item?.details?.phase || item?.state;
+  const mapping = {
+    scanning: "掃描中",
+    delay: "delay",
+    timeout: "timeout drop",
+    completed: "掃描完成",
+    running: "掃描完成",
+    error: "錯誤",
+  };
+  return mapping[phase] || phase || "-";
+}
+
+function renderWatchHeartbeats(heartbeats) {
+  if (!heartbeatLabel || !heartbeatList) {
+    return;
+  }
+  const rows = Array.isArray(heartbeats) ? heartbeats : [];
+  if (!rows.length) {
+    heartbeatLabel.textContent = TEXT.waitingSync;
+    heartbeatList.innerHTML = `<small>${TEXT.noHeartbeats}</small>`;
+    return;
+  }
+  const latest = rows[0];
+  heartbeatLabel.textContent = watchPhaseLabel(latest);
+  heartbeatList.innerHTML = rows
+    .slice(0, 4)
+    .map((item) => {
+      const phase = item?.details?.phase || item?.state || "";
+      const rowClass = phase === "timeout" || item?.state === "error" ? "is-error" : phase === "delay" ? "is-stale" : "";
+      const label = watchPhaseLabel(item);
+      const message = item?.message || "";
+      return `
+        <div class="heartbeat-row ${rowClass}">
+          <span class="heartbeat-row__dot"></span>
+          <span><strong>${escapeHtml(label)}</strong> · ${escapeHtml(formatTime(item?.created_at))}<br />${escapeHtml(message)}</span>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 async function toggleWatch() {
   if (watchToggle.dataset.busy === "true") {
     return;
@@ -977,10 +1282,10 @@ async function toggleWatch() {
   setControlBusy(true);
   setStatus("", latestWatchState.running ? TEXT.watchStopping : TEXT.watchStarting);
   try {
-    const response = await fetch("/api/actions/watch", {
+    const response = await fetchWithTimeout("/api/actions/watch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    });
+    }, ACTION_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error("watch_toggle_failed");
     }
@@ -1003,6 +1308,7 @@ function applyDashboardPayload(payload) {
   renderStrategies(payload.strategies || []);
   renderOpportunities(payload.opportunities || []);
   renderAlerts(payload.alerts || []);
+  renderLiveOrders(payload.live_orders || []);
   renderExecutionEvents(payload.execution_events || []);
   renderTradeJournal(payload.trade_groups || payload.positions || [], payload.trade_journal || payload.pnl || {});
   renderMarkets(payload.markets || []);
@@ -1016,7 +1322,9 @@ function applyDashboardPayload(payload) {
   );
   renderWallet(payload.wallet || {});
   renderPreflight(payload.preflight || null);
+  renderTradingParameters(payload.trading_parameters || null);
   renderPersistence(payload.persistence || {});
+  renderWatchHeartbeats(payload.watch_heartbeats || []);
 
   lastUpdatedLabel.textContent = formatTime(
     payload.summary?.latest_snapshot_at ||
@@ -1060,7 +1368,7 @@ function tryApplyDashboardPayload(payload) {
 async function loadDashboard() {
   dashboardLoadInFlight = true;
   try {
-    const response = await fetch("/api/dashboard", { cache: "no-store" });
+    const response = await fetchWithTimeout("/api/dashboard", { cache: "no-store" }, DASHBOARD_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error("dashboard_fetch_failed");
     }
@@ -1077,10 +1385,10 @@ async function toggleAction(path, loadingText, successText) {
   setControlBusy(true);
   setStatus("", loadingText);
   try {
-    const response = await fetch(path, {
+    const response = await fetchWithTimeout(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    });
+    }, ACTION_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       if (response.status === 409) {
         const error = await response.json();
@@ -1125,10 +1433,10 @@ async function finishWork() {
   finishWorkButton.textContent = TEXT.finishingWork;
   setStatus("", TEXT.finishingWork);
   try {
-    const response = await fetch("/api/actions/trading/finish", {
+    const response = await fetchWithTimeout("/api/actions/trading/finish", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    });
+    }, ACTION_FETCH_TIMEOUT_MS);
     const body = await response.json();
     if (!response.ok) {
       applyDashboardPayload(body.payload);
@@ -1153,10 +1461,10 @@ async function triggerScan() {
   setControlBusy(true);
   setStatus("", latestTradingState.armed ? TEXT.scanningArmed : TEXT.scanning);
   try {
-    const response = await fetch("/api/actions/scan", {
+    const response = await fetchWithTimeout("/api/actions/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    });
+    }, ACTION_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error("scan_failed");
     }
@@ -1166,6 +1474,7 @@ async function triggerScan() {
     }
     const submittedCount = body.execution_summary?.submitted_count || 0;
     const items = body.execution_summary?.items || [];
+    const latestOpportunityCount = Number(body.payload?.summary?.latest_scan_opportunities || 0);
     const partialFailureCount = items.filter((item) => item.status === "partial_failure").length;
     const blockedCount = items.filter((item) => item.status === "risk_blocked").length;
     const preflightBlockedCount = items.filter((item) => item.status === "preflight_blocked").length;
@@ -1178,13 +1487,15 @@ async function triggerScan() {
       setStatus("warn", "\u6383\u63cf\u5b8c\u6210\uff0c\u4f46\u524d\u7f6e\u6aa2\u67e5\u672a\u901a\u904e\uff0c\u6c92\u6709\u9001\u55ae\u3002");
     } else if (blockedCount > 0) {
       setStatus("warn", `\u6383\u63cf\u5b8c\u6210\uff0c\u4f46\u6709 ${blockedCount} \u7b46\u6a5f\u6703\u88ab\u98a8\u63a7\u64cb\u4e0b\u3002`);
+    } else if (latestOpportunityCount <= 0) {
+      setStatus("hot", TEXT.scanNoLiveEntries);
     } else {
       setStatus("hot", latestTradingState.armed ? TEXT.armedWatching : TEXT.scanDone);
     }
   } catch (_error) {
     try {
       await loadDashboard();
-      setStatus("warn", TEXT.scanDone);
+      setStatus("warn", TEXT.syncDelayed);
       return;
     } catch (_refreshError) {
       console.error("Failed to recover dashboard after scan error", _error, _refreshError);
@@ -1202,17 +1513,8 @@ function startDashboardSyncLoop() {
   renderSyncCountdown();
   window.setInterval(() => {
     renderSyncCountdown();
-    if (dashboardLoadInFlight) {
-      return;
-    }
-    if (Date.now() < nextDashboardSyncAt) {
-      return;
-    }
-    void loadDashboard().catch(() => {
-      setStatus("warn", TEXT.scanFailed);
-      resetDashboardSyncCountdown();
-    });
-  }, 200);
+  }, 1000);
+  scheduleDashboardSync(activeDashboardSyncSec() * 1000);
 }
 
 scanButton.addEventListener("click", () => {
@@ -1241,7 +1543,8 @@ watchToggle.addEventListener("click", () => {
 
 resetDashboardSyncCountdown();
 void loadDashboard().catch(() => {
-  setStatus("warn", TEXT.scanFailed);
+  setStatus("warn", TEXT.syncDelayed);
   resetDashboardSyncCountdown();
 });
 startDashboardSyncLoop();
+
