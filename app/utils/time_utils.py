@@ -29,6 +29,18 @@ def is_older_than(target: datetime, threshold_sec: int, now: datetime | None = N
     return (current.astimezone(timezone.utc) - target).total_seconds() >= threshold_sec
 
 
+def seconds_until_next_minute_second(now_timestamp: float, *, target_second: float = 1.0) -> float:
+    """Return seconds until the next minute boundary at the requested second."""
+
+    if target_second < 0 or target_second >= 60:
+        raise ValueError("target_second must be in [0, 60).")
+    seconds_into_minute = now_timestamp % 60
+    delay = target_second - seconds_into_minute
+    if delay <= 0.05:
+        delay += 60
+    return delay
+
+
 def humanize_seconds(value: float) -> str:
     delta = timedelta(seconds=max(value, 0))
     total = int(delta.total_seconds())

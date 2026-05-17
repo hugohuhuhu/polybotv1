@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v22" />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v25" />
   </head>
   <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
     <div class="ambient ambient-a"></div>
@@ -41,7 +41,7 @@
           <p class="hero-label">控制中心</p>
           <h2>把掃描、風控與交易紀錄集中在同一個遠端面板</h2>
           <p class="hero-copy">
-            這個頁面會固定自動刷新，讓你在瀏覽器直接看目前市場探索、候選機會、執行紀錄與資料持久化狀態。
+            這個頁面會持續呈現市場探索、候選機會、執行紀錄與資料持久化狀態。
           </p>
           <article class="hero-wallet-card">
             <div class="hero-wallet-card__header">
@@ -117,8 +117,8 @@
 
         <div class="hero-meta">
           <div class="hero-meta-card">
-            <span>自動刷新</span>
-            <strong id="refreshLabel">{{ refresh_sec }} 秒</strong>
+            <span>watch 流程</span>
+            <strong id="refreshLabel">掃描 → delay 30 秒 → 再次掃描</strong>
             <small class="countdown-copy" id="scanCountdownLabel">尚未同步</small>
             <div class="countdown-bar" aria-hidden="true">
               <span id="scanCountdownBar"></span>
@@ -200,6 +200,21 @@
           <p class="control-copy" id="preflightSummary">等待前置檢查同步。</p>
           <div class="preflight-list" id="preflightList">
             <p class="empty-block">尚未建立檢查報告。</p>
+          </div>
+          <div class="parameter-panel" id="tradingParameterPanel">
+            <div class="parameter-panel__header">
+              <div>
+                <p class="panel-kicker">LIVE PARAMETERS</p>
+                <h4>下單參數與目前卡點</h4>
+              </div>
+              <span id="parameterSummary">等待參數同步</span>
+            </div>
+            <div class="parameter-diagnostics" id="parameterDiagnostics">
+              <p class="empty-block">尚未同步下單診斷。</p>
+            </div>
+            <div class="parameter-grid" id="tradingParameterGrid">
+              <p class="empty-block">尚未同步參數。</p>
+            </div>
           </div>
         </article>
       </section>
@@ -296,7 +311,7 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v22" defer></script>
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v25" defer></script>
   </body>
 </html>
 

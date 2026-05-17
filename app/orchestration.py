@@ -55,6 +55,24 @@ def _market_family_key(market: MarketRecord) -> str:
     return market.event_slug or market.event_id or market.category or market.slug
 
 
+def _market_text(market: MarketRecord) -> str:
+    values = (
+        market.question,
+        market.slug,
+        market.event_title,
+        market.event_slug,
+        market.category,
+        market.resolution_source,
+        " ".join(market.tags),
+    )
+    return " ".join(str(value).lower() for value in values if value)
+
+
+def _is_excluded_market(market: MarketRecord) -> bool:
+    text = _market_text(market)
+    return "xrp" in text
+
+
 def _market_spread(market: MarketRecord) -> float | None:
     if market.spread is not None:
         return market.spread
@@ -144,6 +162,10 @@ def _parse_crypto_updown_market(market: MarketRecord) -> tuple[str, datetime] | 
     return symbol, start_time
 
 
+def _is_crypto_updown_market(market: MarketRecord) -> bool:
+    return _parse_crypto_updown_market(market) is not None
+
+
 async def enrich_crypto_near_close_markets(settings: Settings, markets: list[MarketRecord]) -> None:
     if not settings.near_close_crypto_enabled:
         return
@@ -151,6 +173,11 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
     updown_by_market: dict[str, tuple[str, datetime]] = {}
     symbols: set[str] = set()
     start_price_requests: dict[str, tuple[str, int]] = {}
+    now = datetime.now(timezone.utc)
+    updown_max_minutes = min(
+        settings.near_close_scan_lookahead_minutes,
+        settings.near_close_crypto_updown_max_minutes_to_end,
+    )
     for market in markets:
         parsed = _parse_crypto_strike_market(market)
         if parsed is not None:
@@ -163,7 +190,12 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
             symbol, start_time = updown
             updown_by_market[market.market_id] = updown
             symbols.add(symbol)
-            if start_time <= datetime.now(timezone.utc):
+            minutes_left = _minutes_to_resolution(market, now)
+            in_updown_window = (
+                minutes_left is not None
+                and settings.near_close_crypto_updown_min_minutes_to_end <= minutes_left <= updown_max_minutes
+            )
+            if in_updown_window and start_time <= now:
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
     if not symbols:
         return
@@ -343,7 +375,12 @@ def shortlist_near_close_markets(
     limit: int | None = None,
 ) -> tuple[list[MarketRecord], dict[str, object]]:
     now = datetime.now(timezone.utc)
-    candidates = [market for market in markets if _is_near_close_pool_candidate(settings, market, now)]
+    candidate_markets = [market for market in markets if _is_crypto_updown_market(market)] if settings.near_close_scan_crypto_updown_only else markets
+    candidates = [
+        market
+        for market in candidate_markets
+        if not _is_excluded_market(market) and _is_near_close_pool_candidate(settings, market, now)
+    ]
     selected = sorted(
         candidates,
         key=lambda market: (
@@ -384,8 +421,10 @@ def shortlist_near_close_markets(
         "excluded_family_cap_count": 0,
         "shortlisted_markets": shortlisted_entries,
         "shortlist_mode": "near_close",
+        "near_close_scan_crypto_updown_only": settings.near_close_scan_crypto_updown_only,
+        "crypto_updown_discovered_count": len(candidate_markets) if settings.near_close_scan_crypto_updown_only else None,
         "near_close_candidates": len(candidates),
-        "near_close_funnel": build_near_close_funnel(settings, markets, shortlisted=selected, now=now),
+        "near_close_funnel": build_near_close_funnel(settings, candidate_markets, shortlisted=selected, now=now),
     }
     return selected, diagnostics
 
@@ -407,6 +446,8 @@ def _build_shortlist_profiles(
     diagnostics = {"excluded_long_tail_count": 0}
 
     for market in markets:
+        if _is_excluded_market(market):
+            continue
         if not market.active or market.closed:
             continue
         family_key = _market_family_key(market)
@@ -533,21 +574,14 @@ async def discover_markets(
 ) -> tuple[list[EventRecord], list[MarketRecord]]:
     gamma = GammaClient(settings.gamma_base_url)
     try:
-        events, markets = await gamma.discover_active_markets(limit=limit or settings.discovery_event_limit)
         if include_near_close_window:
             now = datetime.now(timezone.utc)
-            near_events, near_markets = await gamma.discover_markets_by_end_date(
+            return await gamma.discover_markets_by_end_date(
                 end_date_min=now,
                 end_date_max=now + timedelta(minutes=settings.near_close_scan_lookahead_minutes),
                 limit=settings.near_close_scan_event_limit,
             )
-            events_by_id = {event.event_id: event for event in events}
-            for event in near_events:
-                events_by_id.setdefault(event.event_id, event)
-            markets_by_id = {market.market_id: market for market in markets}
-            for market in near_markets:
-                markets_by_id.setdefault(market.market_id, market)
-            return list(events_by_id.values()), list(markets_by_id.values())
+        events, markets = await gamma.discover_active_markets(limit=limit or settings.discovery_event_limit)
         return events, markets
     finally:
         await gamma.close()
@@ -697,6 +731,9 @@ async def execute_scan_cycle(
         discovery_limit,
         include_near_close_window=bool(settings.near_close_scan_pool_enabled and settings.near_close_maker_enabled),
     )
+    markets = [market for market in markets if not _is_excluded_market(market)]
+    if settings.near_close_scan_crypto_updown_only:
+        markets = [market for market in markets if _is_crypto_updown_market(market)]
     await enrich_crypto_near_close_markets(settings, markets)
     positive_edge_hits = (
         repository.recent_positive_edge_by_slug(hours=settings.watch_positive_edge_lookback_hours)
@@ -780,6 +817,14 @@ def _opportunity_tier_counts(opportunities: list[Opportunity]) -> tuple[int, int
 
 def persist_scan_cycle(repository: ScannerRepository, result: ScanCycleResult, settings: Settings | None = None) -> None:
     actionable_count, candidate_count = _opportunity_tier_counts(result.opportunities)
+    if settings is not None:
+        repository.finalize_previous_scan_day_if_needed(
+            executed_at=result.executed_at,
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+        )
     repository.save_markets(result.events, result.markets)
     repository.save_orderbooks(result.books.values())
     repository.save_opportunities(result.opportunities)
@@ -816,6 +861,14 @@ def persist_monitor_cycle(
     settings: Settings | None = None,
 ) -> None:
     actionable_count, candidate_count = _opportunity_tier_counts(result.opportunities)
+    if settings is not None:
+        repository.finalize_previous_scan_day_if_needed(
+            executed_at=result.executed_at,
+            raw_retention_days=settings.db_raw_retention_days,
+            snapshot_retention_days=settings.db_snapshot_retention_days,
+            maintenance_interval_sec=settings.db_maintenance_interval_sec,
+            vacuum_interval_sec=settings.db_vacuum_interval_sec,
+        )
     repository.save_orderbooks(result.books.values())
     repository.save_opportunities(result.opportunities)
     repository.save_scan_cycle(

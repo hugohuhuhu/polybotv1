@@ -459,6 +459,100 @@ def test_late_resolution_scanner_uses_crypto_updown_proxy_variant() -> None:
     assert opportunities[0].max_safe_size == 5
 
 
+def test_late_resolution_scanner_rejects_crypto_updown_too_close_to_start() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.65,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = MarketRecord(
+        market_id="m-sol-updown",
+        event_id="e-sol",
+        question="Solana Up or Down - May 2, 5:55AM-6:00AM ET",
+        slug="sol-updown",
+        outcome_labels=["Up", "Down"],
+        token_ids=["sol_up", "sol_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/sol-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=3),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 85.98,
+            "near_close_crypto_start_price": 86.12,
+            "near_close_crypto_start_distance": 0.0016256,
+            "near_close_crypto_winning_outcome": "Down",
+        },
+    )
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "sol_up": make_book("sol_up", bid=0.01, ask=0.04, size=80),
+            "sol_down": make_book("sol_down", bid=0.95, ask=0.98, size=80),
+        },
+    )
+
+    assert opportunities == []
+
+
+def test_late_resolution_scanner_blocks_live_below_crypto_updown_cancel_distance() -> None:
+    settings = Settings(
+        NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+        NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=5,
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.001,
+        NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.002,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.65,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = MarketRecord(
+        market_id="m-sol-updown-live",
+        event_id="e-sol",
+        question="Solana Up or Down - May 2, 5:55AM-6:00AM ET",
+        slug="sol-updown-live",
+        outcome_labels=["Up", "Down"],
+        token_ids=["sol_up", "sol_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/sol-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=3),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 85.98,
+            "near_close_crypto_start_price": 86.12,
+            "near_close_crypto_start_distance": 0.0016256,
+            "near_close_crypto_winning_outcome": "Down",
+        },
+    )
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "sol_up": make_book("sol_up", bid=0.01, ask=0.04, size=80),
+            "sol_down": make_book("sol_down", bid=0.95, ask=0.98, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].details["tradable_live"] is False
+
+
 def test_late_resolution_scanner_prices_crypto_updown_with_gemini_30m_params() -> None:
     settings = Settings(
         CANDIDATE_MIN_NET_EDGE=-0.0035,

@@ -853,6 +853,126 @@ body.armed-state .status-chip.hot .status-dot {
   background: var(--amber);
 }
 
+.parameter-panel {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(23, 38, 31, 0.1);
+}
+
+.parameter-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.parameter-panel__header h4,
+.parameter-panel__header p {
+  margin: 0;
+}
+
+.parameter-panel__header h4 {
+  font-size: 1rem;
+}
+
+.parameter-panel__header span {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 0.22rem 0.62rem;
+  background: rgba(23, 38, 31, 0.08);
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.parameter-diagnostics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin-bottom: 0.85rem;
+}
+
+.parameter-diagnostic {
+  border-radius: 0.95rem;
+  padding: 0.66rem 0.72rem;
+  border: 1px solid rgba(23, 38, 31, 0.08);
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.parameter-diagnostic.ok {
+  border-color: rgba(14, 106, 104, 0.32);
+  background: rgba(14, 106, 104, 0.1);
+}
+
+.parameter-diagnostic.problem {
+  border-color: rgba(171, 95, 88, 0.38);
+  background: rgba(171, 95, 88, 0.12);
+}
+
+.parameter-diagnostic.watch {
+  border-color: rgba(214, 139, 45, 0.35);
+  background: rgba(214, 139, 45, 0.12);
+}
+
+.parameter-diagnostic strong,
+.parameter-diagnostic p {
+  margin: 0;
+}
+
+.parameter-diagnostic p {
+  margin-top: 0.16rem;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.parameter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.parameter-group {
+  min-width: 0;
+}
+
+.parameter-group h5 {
+  margin: 0 0 0.45rem;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
+.parameter-list {
+  display: grid;
+  gap: 0.32rem;
+}
+
+.parameter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+  border-radius: 0.72rem;
+  padding: 0.42rem 0.52rem;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(23, 38, 31, 0.06);
+}
+
+.parameter-row span {
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+}
+
+.parameter-row strong {
+  min-width: 0;
+  text-align: right;
+  font-size: 0.82rem;
+  word-break: break-word;
+}
+
 .metric-card {
   border-radius: 1.5rem;
   padding: 1.1rem 1.15rem;
@@ -1565,6 +1685,11 @@ body.armed-state .status-chip.hot .status-dot {
   }
 
   .preflight-list {
+    grid-template-columns: 1fr;
+  }
+
+  .parameter-diagnostics,
+  .parameter-grid {
     grid-template-columns: 1fr;
   }
 

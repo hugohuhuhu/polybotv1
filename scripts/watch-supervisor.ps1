@@ -10,8 +10,11 @@ $stdoutLog = Join-Path $logDir "watch.stdout.log"
 $stderrLog = Join-Path $logDir "watch.stderr.log"
 $supervisorLog = Join-Path $logDir "watch-supervisor.log"
 $watchPidFile = Join-Path $logDir "watch.pid"
+$watchLivenessFile = Join-Path $logDir "watch.liveness"
 $supervisorPidFile = Join-Path $logDir "watch-supervisor.pid"
 $mutexName = "Global\PolymarketMispricingWatchSupervisor"
+$childStaleKillSec = 65
+$restartDelaySec = 30
 
 Add-Type @"
 using System;
@@ -31,7 +34,9 @@ New-Item -ItemType Directory -Path $sqliteBackupDir -Force | Out-Null
 Set-Location $repoRoot
 $env:SQLITE_PATH = $sqlitePath
 $env:SQLITE_BACKUP_DIR = $sqliteBackupDir
-$env:SCAN_INTERVAL_SEC = "60"
+$env:SCAN_INTERVAL_SEC = "30"
+$env:WATCH_SCAN_TIMEOUT_SEC = "60"
+$env:WATCH_TIMEOUT_RETRY_SEC = "30"
 $env:DISCOVERY_REFRESH_SEC = "900"
 $env:DISCOVERY_EVENT_LIMIT = "100"
 $env:WATCH_MARKET_LIMIT = "20"
@@ -41,18 +46,21 @@ $env:WATCH_BUCKET_RECENT_LIMIT = "4"
 $env:WATCH_BUCKET_SPECIAL_LIMIT = "2"
 $env:BOOK_FETCH_CONCURRENCY = "5"
 $env:DASHBOARD_REFRESH_SEC = "30"
-$env:MAX_DAILY_LIVE_ORDERS = "42"
 $env:AUTO_REDEEM_ENABLED = "true"
 $env:AUTO_REDEEM_REFRESH_SEC = "300"
 $env:AUTO_REDEEM_MIN_USDCE = "0.01"
+$env:AUTO_REDEEM_WRAP_ALLOWANCE_USDCE = "10000"
 $env:NEAR_CLOSE_MAKER_LIVE_ENABLED = "true"
 $env:NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE = "0"
+$env:NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY = "true"
+$env:NEAR_CLOSE_MAX_POSITION_SIZE = "10"
 $env:NEAR_CLOSE_SCAN_EVENT_LIMIT = "750"
 $env:NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES = "75"
 $env:NEAR_CLOSE_ORDER_SIZE = "5"
 $env:NEAR_CLOSE_MAX_MARKET_EXPOSURE = "5"
 $env:NEAR_CLOSE_MAX_TOTAL_EXPOSURE = "25"
 $env:NEAR_CLOSE_MAX_MINUTES_TO_END = "15"
+$env:NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END = "3"
 $env:NEAR_CLOSE_MIN_BEST_ASK = "0.98"
 $env:NEAR_CLOSE_MIN_MIDPOINT = "0.975"
 $env:NEAR_CLOSE_MAX_SPREAD = "0.025"
@@ -65,7 +73,7 @@ $env:NEAR_CLOSE_CRYPTO_ORDER_SIZE = "2"
 $env:NEAR_CLOSE_CRYPTO_MIN_STRIKE_DISTANCE = "0.02"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED = "true"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE = "5"
-$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END = "1.5"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END = "0.35"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END = "45"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE = "0.003"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE = "0.002"
@@ -116,6 +124,17 @@ try {
                 -PassThru
             $child.Id | Set-Content -Path $watchPidFile -Encoding ascii
             Write-SupervisorLog "child started pid=$($child.Id)"
+            while (-not $child.HasExited) {
+                Start-Sleep -Seconds 5
+                if (Test-Path $watchLivenessFile) {
+                    $age = ((Get-Date) - (Get-Item $watchLivenessFile).LastWriteTime).TotalSeconds
+                    if ($age -gt $childStaleKillSec) {
+                        Write-SupervisorLog "child stale for $([math]::Round($age, 1))s; killing pid=$($child.Id)"
+                        Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+                        break
+                    }
+                }
+            }
             $child.WaitForExit()
             Remove-Item -Path $watchPidFile -ErrorAction SilentlyContinue
             Write-SupervisorLog "child exited pid=$($child.Id) code=$($child.ExitCode)"
@@ -124,7 +143,7 @@ try {
             Write-SupervisorLog "supervisor caught error: $($_.Exception.Message)"
         }
 
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds $restartDelaySec
     }
 } finally {
     [SleepControl]::SetThreadExecutionState($ES_CONTINUOUS) | Out-Null

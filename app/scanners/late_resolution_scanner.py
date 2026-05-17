@@ -80,11 +80,18 @@ class LateResolutionScanner:
         midpoint = book.midpoint
         spread = book.spread
         decision = classify_near_close_market(market)
+        crypto_start_distance: float | None = None
         if decision.variant == "crypto_updown":
             if not (self.settings.near_close_crypto_enabled and self.settings.near_close_crypto_updown_enabled):
                 return None
             winning_outcome = str(market.raw.get("near_close_crypto_winning_outcome") or "")
             if outcome_label.lower() != winning_outcome.lower():
+                return None
+            try:
+                crypto_start_distance = float(market.raw.get("near_close_crypto_start_distance") or 0.0)
+            except (TypeError, ValueError):
+                return None
+            if crypto_start_distance < self.settings.near_close_crypto_updown_min_start_distance:
                 return None
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
@@ -164,6 +171,11 @@ class LateResolutionScanner:
             best_bid - self.settings.near_close_emergency_slippage,
             entry_bid - self.settings.near_close_emergency_max_loss,
         )
+        live_distance_allowed = not (
+            decision.variant == "crypto_updown"
+            and crypto_start_distance is not None
+            and crypto_start_distance < self.settings.near_close_crypto_updown_cancel_start_distance
+        )
         details = {
             "strategy_variant": "near_close_maker",
             "outcome_label": outcome_label,
@@ -189,7 +201,11 @@ class LateResolutionScanner:
             "crypto_start_time": market.raw.get("near_close_crypto_start_time"),
             "crypto_start_distance": market.raw.get("near_close_crypto_start_distance"),
             "crypto_winning_outcome": market.raw.get("near_close_crypto_winning_outcome"),
-            "tradable_live": bool(self.settings.near_close_maker_live_enabled),
+            "tradable_live": bool(
+                self.settings.near_close_maker_live_enabled
+                and live_distance_allowed
+                and minutes_left <= self.settings.near_close_live_max_minutes_to_end
+            ),
             "requires_exit_order": False,
             "post_only": True,
             "order_type": "GTD",

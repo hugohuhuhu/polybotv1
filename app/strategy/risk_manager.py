@@ -30,6 +30,10 @@ class RiskManager:
             if leg.action.upper() in {"BUY", "SELL"}
         )
 
+    @staticmethod
+    def _position_key(market_slug: str, token_id: str, outcome_label: str) -> str:
+        return f"{market_slug}:{str(token_id or '')}:{str(outcome_label or '')}"
+
     def assess(self, plan: ExecutionPlan, repository: ScannerRepository, *, mode: str) -> RiskDecision:
         estimated_notional = self.estimate_plan_notional(plan)
         leg_count = sum(1 for leg in plan.legs if leg.action.upper() in {"BUY", "SELL"})
@@ -124,17 +128,6 @@ class RiskManager:
                 projected_daily_notional=projected_notional,
                 projected_daily_orders=projected_orders,
             )
-        if projected_orders > self.settings.max_daily_live_orders:
-            return RiskDecision(
-                allowed=False,
-                reason=(
-                    f"Projected live order count {projected_orders} exceeds "
-                    f"MAX_DAILY_LIVE_ORDERS {self.settings.max_daily_live_orders}."
-                ),
-                estimated_notional=estimated_notional,
-                projected_daily_notional=projected_notional,
-                projected_daily_orders=projected_orders,
-            )
         return RiskDecision(
             allowed=True,
             reason="Live execution is within configured risk limits.",
@@ -173,6 +166,24 @@ class RiskManager:
                 projected_daily_notional=estimated_notional,
                 projected_daily_orders=leg_count,
             )
+        max_minutes = self._near_close_live_max_minutes(plan)
+        raw_minutes = plan.metadata.get("minutes_to_resolution")
+        if raw_minutes is not None:
+            try:
+                minutes_to_resolution = float(raw_minutes)
+            except (TypeError, ValueError):
+                minutes_to_resolution = None
+            if minutes_to_resolution is None or minutes_to_resolution > max_minutes:
+                return RiskDecision(
+                    allowed=False,
+                    reason=(
+                        f"Near-close maker live entry requires <= {max_minutes:.1f} minutes to resolution; "
+                        f"currently {raw_minutes}."
+                    ),
+                    estimated_notional=estimated_notional,
+                    projected_daily_notional=estimated_notional,
+                    projected_daily_orders=leg_count,
+                )
         signal_count = repository.near_close_signal_count()
         if signal_count < self.settings.near_close_min_paper_signals_for_live:
             return RiskDecision(
@@ -186,15 +197,20 @@ class RiskManager:
                 projected_daily_orders=leg_count,
             )
         exposure = repository.near_close_live_exposure()
-        market_slug = plan.legs[0].market_slug if plan.legs else ""
-        market_exposure = float(exposure["by_market"].get(market_slug, 0.0)) + estimated_notional
+        first_leg = plan.legs[0] if plan.legs else None
+        market_slug = first_leg.market_slug if first_leg else ""
+        position_key = self._position_key(market_slug, first_leg.token_id, first_leg.outcome_label) if first_leg else ""
+        position = exposure.get("by_position", {}).get(position_key, {})
+        projected_position_size = float(position.get("total_size") or 0.0) + (
+            float(first_leg.size) if first_leg else 0.0
+        )
         total_exposure = float(exposure["total"]) + estimated_notional
-        if market_exposure > self.settings.near_close_max_market_exposure:
+        if projected_position_size > self.settings.near_close_max_position_size:
             return RiskDecision(
                 allowed=False,
-                reason="Near-close maker same-market exposure limit reached.",
+                reason="Near-close maker same-position size limit reached.",
                 estimated_notional=estimated_notional,
-                projected_daily_notional=market_exposure,
+                projected_daily_notional=total_exposure,
                 projected_daily_orders=leg_count,
             )
         if total_exposure > self.settings.near_close_max_total_exposure:
@@ -206,3 +222,6 @@ class RiskManager:
                 projected_daily_orders=leg_count,
             )
         return None
+
+    def _near_close_live_max_minutes(self, plan: ExecutionPlan) -> float:
+        return self.settings.near_close_live_max_minutes_to_end

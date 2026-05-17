@@ -220,7 +220,11 @@ def _wrap_usdce_to_pusd(
     allowance = _call_uint(client, settings.polygon_rpc_url, usdce, _erc20_allowance_data(wallet, onramp))
     approve_tx = None
     if allowance < amount_units:
-        approve_data = _encode_call("approve(address,uint256)", [("address", onramp), ("uint256", amount_units)])
+        allowance_target = max(
+            amount_units,
+            _decimal_to_base_units(settings.auto_redeem_wrap_allowance_usdce),
+        )
+        approve_data = _encode_call("approve(address,uint256)", [("address", onramp), ("uint256", allowance_target)])
         approve_tx = _send_transaction(client, settings, private_key=private_key, from_address=wallet, to=usdce, data=approve_data)
         receipt = _wait_receipt(client, settings.polygon_rpc_url, approve_tx)
         if int(receipt.get("status", "0x0"), 16) != 1:

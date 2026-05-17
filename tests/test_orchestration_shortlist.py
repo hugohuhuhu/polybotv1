@@ -155,6 +155,38 @@ def test_shortlist_prefers_recent_positive_edge_signal_over_raw_liquidity() -> N
     assert diagnostics["shortlist_reason_counts"]["recent_positive_edge"] >= 1
 
 
+def test_shortlist_excludes_xrp_related_markets() -> None:
+    settings = Settings(
+        WATCH_MARKET_LIMIT=2,
+        WATCH_BUCKET_GENERAL_LIMIT=2,
+        WATCH_BUCKET_EVENT_LIMIT=0,
+        WATCH_BUCKET_RECENT_LIMIT=0,
+        WATCH_BUCKET_SPECIAL_LIMIT=0,
+    )
+    markets = [
+        make_market(
+            "xrp",
+            event_id="crypto",
+            slug="xrp-updown-market",
+            question="XRP Up or Down - later today?",
+            yes_price=0.52,
+            liquidity=12000,
+        ),
+        make_market(
+            "btc",
+            event_id="crypto",
+            slug="bitcoin-core-market",
+            question="Bitcoin core market",
+            yes_price=0.51,
+            liquidity=9000,
+        ),
+    ]
+
+    shortlisted, _diagnostics = shortlist_markets(markets, 2, settings=settings)
+
+    assert [market.slug for market in shortlisted] == ["bitcoin-core-market"]
+
+
 def test_near_close_pool_only_keeps_upcoming_clear_binary_markets() -> None:
     settings = Settings(
         NEAR_CLOSE_SCAN_POOL_LIMIT=2,
@@ -293,7 +325,116 @@ def test_near_close_pool_accepts_crypto_updown_proxy_far_from_start() -> None:
     shortlisted, diagnostics = shortlist_near_close_markets([crypto], settings=settings)
 
     assert [market.slug for market in shortlisted] == ["ethereum-updown"]
-    assert diagnostics["shortlisted_markets"][0]["reasons"][-1] == "crypto_updown_proxy_far_from_start"
+    assert diagnostics["shortlisted_markets"][0]["reasons"][-1] == "crypto_updown_proxy_price_ready"
+
+
+def test_near_close_pool_crypto_updown_only_filters_first() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=5,
+        NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
+        NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+    )
+    now = datetime.now(timezone.utc)
+    official = make_market(
+        "official",
+        event_id="macro",
+        slug="cpi-above-forecast",
+        question="Will official CPI data be above forecast?",
+        yes_price=0.99,
+        liquidity=12000,
+    ).model_copy(
+        update={
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://www.bls.gov/cpi/",
+        }
+    )
+    fixed_strike = make_market(
+        "btc",
+        event_id="crypto",
+        slug="bitcoin-above-70000",
+        question="Bitcoin above 70,000 on May 1?",
+        yes_price=0.99,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://www.binance.com/en/trade/BTC_USDT",
+            "category": "Crypto",
+            "raw": {
+                "near_close_crypto_spot_price": 72500.0,
+                "near_close_crypto_strike_price": 70000.0,
+                "near_close_crypto_strike_distance": 0.0357,
+                "near_close_crypto_winning_outcome": "Yes",
+            },
+        }
+    )
+    updown = make_market(
+        "eth-updown",
+        event_id="crypto",
+        slug="ethereum-updown",
+        question="Ethereum Up or Down - May 2, 5:55AM-6:00AM ET",
+        yes_price=0.68,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "event_title": "Ethereum Up or Down - May 2, 5:55AM-6:00AM ET",
+            "outcome_labels": ["Up", "Down"],
+            "token_ids": ["eth-up", "eth-down"],
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://data.chain.link/streams/eth-usd",
+            "raw": {
+                "eventStartTime": (now - timedelta(minutes=7)).isoformat(),
+                "near_close_crypto_variant": "updown_proxy",
+                "near_close_crypto_spot_price": 3010.0,
+                "near_close_crypto_start_price": 3000.0,
+                "near_close_crypto_start_distance": 0.003333,
+                "near_close_crypto_winning_outcome": "Up",
+            },
+        }
+    )
+
+    shortlisted, diagnostics = shortlist_near_close_markets([official, fixed_strike, updown], settings=settings)
+
+    assert [market.slug for market in shortlisted] == ["ethereum-updown"]
+    assert diagnostics["near_close_scan_crypto_updown_only"] is True
+    assert diagnostics["crypto_updown_discovered_count"] == 1
+
+
+def test_near_close_pool_excludes_xrp_related_markets() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=5,
+        NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
+        NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+    )
+    now = datetime.now(timezone.utc)
+    xrp_market = make_market(
+        "xrp-updown",
+        event_id="crypto",
+        slug="xrp-updown",
+        question="XRP Up or Down - May 2, 5:55AM-6:00AM ET",
+        yes_price=0.68,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "outcome_labels": ["Up", "Down"],
+            "token_ids": ["xrp-up", "xrp-down"],
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://data.chain.link/streams/xrp-usd",
+            "raw": {
+                "near_close_crypto_variant": "updown_proxy",
+                "near_close_crypto_spot_price": 2.01,
+                "near_close_crypto_start_price": 2.0,
+                "near_close_crypto_start_distance": 0.005,
+                "near_close_crypto_winning_outcome": "Up",
+            },
+        }
+    )
+
+    shortlisted, diagnostics = shortlist_near_close_markets([xrp_market], settings=settings)
+
+    assert shortlisted == []
+    assert diagnostics["watch_bucket_counts"]["near_close"] == 0
 
 
 def test_near_close_pool_keeps_restricted_markets_as_tradeable_risk_label() -> None:
