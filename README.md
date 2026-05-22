@@ -190,6 +190,23 @@ The crypto Up/Down near-close maker scan keeps the existing spread, depth, midpo
 - Entry target is capped by `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE` (`0.95` by default).
 - The legacy `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE` still applies, so the effective cap is the lower of the two.
 
+The local live launch scripts enable a time-funnel start-distance rule for crypto Up/Down entries. The farther the market is from close, the stronger the move away from the start price must be:
+
+```text
+6-7 min to close     -> start distance >= 0.0024
+5-6 min to close     -> start distance >= 0.0018
+3.5-5 min to close   -> start distance >= 0.00121
+1.5-3.5 min to close -> start distance >= 0.0010
+0.35-1.5 min to close -> start distance >= 0.00085
+```
+
+Relevant settings:
+
+- `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`
+- `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00075` remains the cancellation line for already-active maker orders.
+
 The post-fill hedge flow is intentionally sequential. The bot never places the opposite-side hedge at the same time as the entry. It waits until the original near-close maker BUY is confirmed filled in `live_trades`, then evaluates an opposite-outcome BUY hedge.
 
 Example:

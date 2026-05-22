@@ -506,6 +506,90 @@ def test_late_resolution_scanner_rejects_crypto_updown_too_close_to_start() -> N
     assert opportunities == []
 
 
+def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladder() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER="7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085",
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.95,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=0.35,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+
+    pass_cases = [
+        (7.0, 0.0024, 0.0024, "<= 7m"),
+        (5.5, 0.0018, 0.0018, "<= 6m"),
+        (4.0, 0.00121, 0.00121, "<= 5m"),
+        (2.0, 0.0010, 0.0010, "<= 3.5m"),
+        (1.0, 0.00085, 0.00085, "<= 1.5m"),
+    ]
+    for minutes_left, start_distance, required, rule in pass_cases:
+        market = _make_crypto_updown_market(minutes_left=minutes_left, start_distance=start_distance)
+        opportunities = scanner.scan(
+            [market],
+            {
+                "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+                "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+            },
+        )
+
+        assert len(opportunities) == 1
+        assert opportunities[0].details["crypto_start_distance_required"] == required
+        assert opportunities[0].details["crypto_start_distance_rule"] == rule
+        assert opportunities[0].details["crypto_start_distance_dynamic"] is True
+
+    reject_cases = [
+        (7.0, 0.0023),
+        (5.5, 0.0017),
+        (1.0, 0.0008),
+    ]
+    for minutes_left, start_distance in reject_cases:
+        market = _make_crypto_updown_market(minutes_left=minutes_left, start_distance=start_distance)
+        rejection_counts: dict[str, int] = {}
+        opportunities = scanner.scan(
+            [market],
+            {
+                "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+                "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+            },
+            rejection_counts=rejection_counts,
+        )
+
+        assert opportunities == []
+        assert rejection_counts == {"start_distance_below_min": 1}
+
+
+def _make_crypto_updown_market(*, minutes_left: float, start_distance: float) -> MarketRecord:
+    return MarketRecord(
+        market_id=f"m-dynamic-{minutes_left}-{start_distance}",
+        event_id="e-dynamic",
+        question="Ethereum Up or Down - May 2, 5:55AM-6:00AM ET",
+        slug=f"dynamic-updown-{minutes_left}-{start_distance}",
+        outcome_labels=["Up", "Down"],
+        token_ids=["dynamic_up", "dynamic_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/eth-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=minutes_left),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 3000.0 * (1.0 + start_distance),
+            "near_close_crypto_start_price": 3000.0,
+            "near_close_crypto_start_distance": start_distance,
+            "near_close_crypto_winning_outcome": "Up",
+        },
+    )
+
+
 def test_late_resolution_scanner_blocks_live_below_crypto_updown_cancel_distance() -> None:
     settings = Settings(
         NEAR_CLOSE_MAKER_LIVE_ENABLED=True,

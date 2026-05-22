@@ -121,7 +121,8 @@ class LateResolutionScanner:
             except (TypeError, ValueError):
                 reject("missing_start_distance")
                 return None
-            if crypto_start_distance < self.settings.near_close_crypto_updown_min_start_distance:
+            required_start_distance, start_distance_rule = self._crypto_updown_required_start_distance(minutes_left)
+            if crypto_start_distance < required_start_distance:
                 reject("start_distance_below_min")
                 return None
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
@@ -257,6 +258,13 @@ class LateResolutionScanner:
             "crypto_start_price": market.raw.get("near_close_crypto_start_price"),
             "crypto_start_time": market.raw.get("near_close_crypto_start_time"),
             "crypto_start_distance": market.raw.get("near_close_crypto_start_distance"),
+            "crypto_start_distance_required": required_start_distance if decision.variant == "crypto_updown" else None,
+            "crypto_start_distance_rule": start_distance_rule if decision.variant == "crypto_updown" else None,
+            "crypto_start_distance_dynamic": (
+                bool(self.settings.near_close_crypto_updown_dynamic_start_distance_enabled)
+                if decision.variant == "crypto_updown"
+                else None
+            ),
             "crypto_winning_outcome": market.raw.get("near_close_crypto_winning_outcome"),
             "tradable_live": bool(
                 self.settings.near_close_maker_live_enabled
@@ -336,6 +344,40 @@ class LateResolutionScanner:
         value = Decimal(str(price))
         units = (value / step).to_integral_value(rounding=ROUND_FLOOR)
         return float(units * step)
+
+    def _crypto_updown_required_start_distance(self, minutes_left: float) -> tuple[float, str]:
+        static_threshold = float(self.settings.near_close_crypto_updown_min_start_distance)
+        if not self.settings.near_close_crypto_updown_dynamic_start_distance_enabled:
+            return static_threshold, "static"
+
+        ladder = self._parse_start_distance_ladder(self.settings.near_close_crypto_updown_start_distance_ladder)
+        for upper_minutes, threshold in ladder:
+            if minutes_left <= upper_minutes:
+                return threshold, f"<= {upper_minutes:g}m"
+        upper_minutes, threshold = ladder[-1]
+        return threshold, f"> {upper_minutes:g}m"
+
+    @staticmethod
+    def _parse_start_distance_ladder(raw_ladder: str) -> list[tuple[float, float]]:
+        ladder: list[tuple[float, float]] = []
+        for raw_item in str(raw_ladder or "").split(","):
+            item = raw_item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise ValueError(f"Invalid start distance ladder item: {item!r}")
+            raw_minutes, raw_threshold = item.split(":", 1)
+            try:
+                upper_minutes = float(raw_minutes.strip())
+                threshold = float(raw_threshold.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid start distance ladder item: {item!r}") from exc
+            if upper_minutes <= 0 or threshold < 0:
+                raise ValueError(f"Invalid start distance ladder item: {item!r}")
+            ladder.append((upper_minutes, threshold))
+        if not ladder:
+            raise ValueError("NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER must contain at least one item")
+        return sorted(ladder, key=lambda pair: pair[0])
 
     def _time_window(self, variant: str) -> tuple[float, float]:
         if variant == "crypto_updown":

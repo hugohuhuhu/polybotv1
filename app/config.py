@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
-    near_close_live_max_minutes_to_end: float = Field(default=5.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
+    near_close_live_max_minutes_to_end: float = Field(default=7.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
     near_close_max_bid_price: float = Field(default=0.97, alias="NEAR_CLOSE_MAX_BID_PRICE")
     near_close_min_best_ask: float = Field(default=0.98, alias="NEAR_CLOSE_MIN_BEST_ASK")
     near_close_min_midpoint: float = Field(default=0.975, alias="NEAR_CLOSE_MIN_MIDPOINT")
@@ -158,6 +158,14 @@ class Settings(BaseSettings):
     near_close_crypto_updown_min_start_distance: float = Field(
         default=0.00121,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE",
+    )
+    near_close_crypto_updown_dynamic_start_distance_enabled: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED",
+    )
+    near_close_crypto_updown_start_distance_ladder: str = Field(
+        default="7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085",
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER",
     )
     near_close_crypto_updown_cancel_start_distance: float = Field(
         default=0.00075,
