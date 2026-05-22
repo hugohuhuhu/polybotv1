@@ -14,6 +14,7 @@ $watchLivenessFile = Join-Path $logDir "watch.liveness"
 $supervisorPidFile = Join-Path $logDir "watch-supervisor.pid"
 $mutexName = "Global\PolymarketMispricingWatchSupervisor"
 $childStaleKillSec = 150
+$childStartupGraceSec = 30
 $restartDelaySec = 30
 
 Add-Type @"
@@ -129,6 +130,7 @@ try {
     while ($true) {
         try {
             [SleepControl]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED) | Out-Null
+            Remove-Item -Path $watchLivenessFile -ErrorAction SilentlyContinue
             Write-SupervisorLog "starting child watch process"
             $child = Start-Process -FilePath python `
                 -ArgumentList "-m", "app.main", "watch" `
@@ -136,24 +138,32 @@ try {
                 -RedirectStandardOutput $stdoutLog `
                 -RedirectStandardError $stderrLog `
                 -PassThru
+            $childStartedAt = Get-Date
             $child.Id | Set-Content -Path $watchPidFile -Encoding ascii
             Write-SupervisorLog "child started pid=$($child.Id)"
             while (-not $child.HasExited) {
                 Start-Sleep -Seconds 5
+                $childAge = ((Get-Date) - $childStartedAt).TotalSeconds
                 if (Test-Path $watchLivenessFile) {
                     $age = ((Get-Date) - (Get-Item $watchLivenessFile).LastWriteTime).TotalSeconds
-                    if ($age -gt $childStaleKillSec) {
+                    if (($childAge -gt $childStartupGraceSec) -and ($age -gt $childStaleKillSec)) {
                         Write-SupervisorLog "child stale for $([math]::Round($age, 1))s; killing pid=$($child.Id)"
                         Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
                         break
                     }
+                } elseif ($childAge -gt $childStaleKillSec) {
+                    Write-SupervisorLog "child produced no liveness for $([math]::Round($childAge, 1))s; killing pid=$($child.Id)"
+                    Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+                    break
                 }
             }
             $child.WaitForExit()
             Remove-Item -Path $watchPidFile -ErrorAction SilentlyContinue
+            Remove-Item -Path $watchLivenessFile -ErrorAction SilentlyContinue
             Write-SupervisorLog "child exited pid=$($child.Id) code=$($child.ExitCode)"
         } catch {
             Remove-Item -Path $watchPidFile -ErrorAction SilentlyContinue
+            Remove-Item -Path $watchLivenessFile -ErrorAction SilentlyContinue
             Write-SupervisorLog "supervisor caught error: $($_.Exception.Message)"
         }
 
