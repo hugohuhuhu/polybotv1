@@ -36,6 +36,7 @@ from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, resolve_funder_address
 from app.strategy.near_close_order_manager import NearCloseOrderManager
 from app.strategy.post_fill_hedge import execute_post_fill_hedges
+from app.strategy.post_fill_profit_take import execute_post_fill_profit_takes
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
 from app.utils.logging_utils import configure_logging, get_logger
@@ -296,6 +297,9 @@ async def _execute_near_close_taker_exits(
         assumed_fill = bool(group.get("assumed_fill"))
         source_order_id = str(group.get("source_order_id") or "").strip()
         cancel_response = None
+        profit_take_cancel_response = None
+        profit_take_cancelled_order_ids: list[str] = []
+        profit_take_uncertain_order_ids: list[str] = []
         if assumed_fill and not settings.near_close_assume_submitted_filled_stop_exit:
             continue
         if assumed_fill and source_order_id:
@@ -321,6 +325,56 @@ async def _execute_near_close_taker_exits(
                     continue
             except Exception as exc:
                 cancel_response = {"error": str(exc)}
+        profit_take_order_ids = [
+            str(order.get("order_id") or "").strip()
+            for order in repository.near_close_active_profit_take_orders_for_position(
+                token_id=token_id,
+                market_slug=market_slug,
+            )
+            if str(order.get("order_id") or "").strip()
+        ]
+        if profit_take_order_ids:
+            try:
+                profit_take_cancel_response = await live_trader.cancel_orders(profit_take_order_ids)
+                profit_take_cancelled_order_ids, profit_take_uncertain_order_ids = _split_cancel_response(
+                    profit_take_order_ids,
+                    profit_take_cancel_response,
+                )
+                if profit_take_cancelled_order_ids:
+                    repository.mark_live_orders_cancelled(
+                        profit_take_cancelled_order_ids,
+                        status="stop_exit_cancelled_profit_take",
+                        cancel_response=profit_take_cancel_response,
+                    )
+                if profit_take_uncertain_order_ids:
+                    repository.mark_live_orders_cancelled(
+                        profit_take_uncertain_order_ids,
+                        status="cancel_unconfirmed",
+                        cancel_response=profit_take_cancel_response,
+                    )
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=f"stop-exit:{market_slug}:{token_id}",
+                        status="profit_take_cancel_unconfirmed_before_stop_exit",
+                        message="Profit-taking SELL could not be confirmed cancelled before stop-exit.",
+                        details={
+                            "order_ids": profit_take_order_ids,
+                            "uncertain_order_ids": profit_take_uncertain_order_ids,
+                            "cancel_response": profit_take_cancel_response,
+                        },
+                    )
+                    continue
+            except Exception as exc:
+                repository.save_execution_event(
+                    source="watch",
+                    mode="live",
+                    opportunity_id=f"stop-exit:{market_slug}:{token_id}",
+                    status="profit_take_cancel_failed_before_stop_exit",
+                    message=str(exc),
+                    details={"order_ids": profit_take_order_ids},
+                )
+                continue
         plan = ExecutionPlan(
             opportunity_id=f"stop-exit:{market_slug}:{token_id}",
             summary=f"Taker stop exit on {market_slug} at {target_price:.4f}",
@@ -345,6 +399,9 @@ async def _execute_near_close_taker_exits(
                         "assumed_fill_stop_exit": assumed_fill,
                         "source_order_id": source_order_id or None,
                         "source_cancel_response": cancel_response,
+                        "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                        "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                        "profit_take_cancel_response": profit_take_cancel_response,
                     },
                 )
             ],
@@ -388,6 +445,9 @@ async def _execute_near_close_taker_exits(
                             "assumed_fill_stop_exit": assumed_fill,
                             "source_order_id": source_order_id or None,
                             "source_cancel_response": cancel_response,
+                            "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                            "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                            "profit_take_cancel_response": profit_take_cancel_response,
                         },
                     )
                 ],
@@ -437,6 +497,9 @@ async def _execute_near_close_taker_exits(
                 "assumed_fill_stop_exit": assumed_fill,
                 "source_order_id": source_order_id or None,
                 "source_cancel_response": cancel_response,
+                "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                "profit_take_cancel_response": profit_take_cancel_response,
                 "second_chance_enabled": settings.near_close_second_chance_exit_enabled,
                 "second_chance_attempted": second_chance_result is not None,
                 "second_chance_target_price": second_chance_target,
@@ -470,6 +533,7 @@ def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
         if token_id:
             token_ids.append(token_id)
     token_ids.extend(repository.near_close_hedge_watch_token_ids(limit=50))
+    token_ids.extend(repository.near_close_profit_take_watch_token_ids(limit=50))
     return list(dict.fromkeys(token_ids))
 
 
@@ -1131,6 +1195,25 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             details={"trigger_price": runtime_settings.near_close_taker_exit_price},
                         )
                         logger.warning("Near-close taker exit failed", context={"error": str(exc)})
+                    try:
+                        await execute_post_fill_profit_takes(
+                            repository=repository,
+                            live_trader=live_trader,
+                            settings=runtime_settings,
+                            controls=controls,
+                            watch_books=book_state.books,
+                            source="watch",
+                        )
+                    except Exception as exc:
+                        repository.save_execution_event(
+                            source="watch",
+                            mode="live",
+                            opportunity_id=None,
+                            status="profit_take_loop_failed",
+                            message=str(exc),
+                            details={},
+                        )
+                        logger.warning("Post-fill profit-take loop failed", context={"error": str(exc)})
 
                 for opportunity in cycle.opportunities:
                     if not liquidity_filter.is_alert_eligible(opportunity):

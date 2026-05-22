@@ -599,3 +599,91 @@ def test_near_close_taker_exit_uses_second_chance_floor_when_first_fak_has_no_ma
     assert trader.plans[1].legs[0].metadata["stop_exit_stage"] == "second_chance"
     assert exits[0]["second_chance_attempted"] is True
     assert exits[0]["status"] == "submitted"
+
+
+def test_near_close_taker_exit_cancels_active_profit_take_before_stop(tmp_path) -> None:
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.cancelled = []
+            self.plan = None
+
+        async def cancel_orders(self, order_ids):
+            self.cancelled.extend(order_ids)
+            return {"canceled": order_ids}
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    repository = ScannerRepository(connect_db(tmp_path / "stop-cancels-profit.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "entry-before-profit",
+                1,
+                "BUY",
+                "token-doge",
+                "doge-updown-5m-test",
+                "Down",
+                0.91,
+                5.0,
+                "0xentry",
+                "CONFIRMED",
+                json.dumps({"strategy_variant": "near_close_maker"}),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "profit-take:0xentry",
+                1,
+                "SELL",
+                "token-doge",
+                "doge-updown-5m-test",
+                "Down",
+                0.97,
+                5.0,
+                "0xprofit",
+                "SUBMITTED",
+                json.dumps({"strategy_variant": "near_close_profit_take", "profit_take_for_order_id": "0xentry"}),
+                "2026-05-14T00:58:20+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(
+                NEAR_CLOSE_TAKER_EXIT_PRICE=0.52,
+                NEAR_CLOSE_HARD_STOP_OFFSET=0.025,
+                NEAR_CLOSE_EMERGENCY_SLIPPAGE=0.03,
+            ),
+            watch_books={"token-doge": make_book(bid=0.87, ask=0.9)},
+        )
+    )
+
+    row = repository.connection.fetchone("SELECT status FROM live_trades WHERE order_id = ?", ("0xprofit",))
+    assert trader.cancelled == ["0xprofit"]
+    assert trader.plan is not None
+    assert trader.plan.legs[0].action == "SELL"
+    assert row["status"] == "stop_exit_cancelled_profit_take"

@@ -231,6 +231,23 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_HEDGE_MIN_MINUTES_TO_END",
     )
     near_close_hedge_order_type: str = Field(default="FAK", alias="NEAR_CLOSE_HEDGE_ORDER_TYPE")
+    near_close_profit_take_enabled: bool = Field(default=True, alias="NEAR_CLOSE_PROFIT_TAKE_ENABLED")
+    near_close_profit_take_live_enabled: bool = Field(default=False, alias="NEAR_CLOSE_PROFIT_TAKE_LIVE_ENABLED")
+    near_close_profit_take_shadow_enabled: bool = Field(default=True, alias="NEAR_CLOSE_PROFIT_TAKE_SHADOW_ENABLED")
+    near_close_profit_take_order_type: str = Field(default="GTD", alias="NEAR_CLOSE_PROFIT_TAKE_ORDER_TYPE")
+    near_close_profit_take_gtd_seconds: int = Field(default=240, alias="NEAR_CLOSE_PROFIT_TAKE_GTD_SECONDS")
+    near_close_profit_take_ladder: str = Field(
+        default="0.865:0.950,0.885:0.955,0.905:0.965,0.925:0.970,0.940:0.985",
+        alias="NEAR_CLOSE_PROFIT_TAKE_LADDER",
+    )
+    near_close_profit_take_min_net_profit: float = Field(default=0.20, alias="NEAR_CLOSE_PROFIT_TAKE_MIN_NET_PROFIT")
+    near_close_profit_take_min_depth: float = Field(default=5.0, alias="NEAR_CLOSE_PROFIT_TAKE_MIN_DEPTH")
+    near_close_profit_take_max_spread: float = Field(default=0.08, alias="NEAR_CLOSE_PROFIT_TAKE_MAX_SPREAD")
+    near_close_profit_take_min_minutes_to_end: float = Field(
+        default=0.25,
+        alias="NEAR_CLOSE_PROFIT_TAKE_MIN_MINUTES_TO_END",
+    )
+    near_close_profit_take_taker_fee_rate: float = Field(default=0.07, alias="NEAR_CLOSE_PROFIT_TAKE_TAKER_FEE_RATE")
     related_rules_path: Path = Field(
         default=Path("./rules/related_markets.example.yaml"),
         alias="RELATED_RULES_PATH",

@@ -1195,6 +1195,85 @@ class ScannerRepository:
         )
         return row is not None
 
+    def profit_take_order_exists_for_entry(self, entry_order_id: str) -> bool:
+        order_id = str(entry_order_id or "").strip()
+        if not order_id:
+            return True
+        row = self.connection.fetchone(
+            """
+            SELECT id
+            FROM live_trades
+            WHERE (
+                    opportunity_id = ?
+                    OR (response_json LIKE '%profit_take_for_order_id%' AND response_json LIKE ?)
+                  )
+              AND UPPER(status) NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+            LIMIT 1
+            """,
+            (f"profit-take:{order_id}", f"%{order_id}%"),
+        )
+        return row is not None
+
+    def near_close_stop_exit_order_exists_for_token(self, token_id: str) -> bool:
+        token = str(token_id or "").strip()
+        if not token:
+            return False
+        row = self.connection.fetchone(
+            """
+            SELECT id
+            FROM live_trades
+            WHERE token_id = ?
+              AND UPPER(action) = 'SELL'
+              AND response_json LIKE '%"strategy_variant": "near_close_stop_exit"%'
+              AND UPPER(status) NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+            LIMIT 1
+            """,
+            (token,),
+        )
+        return row is not None
+
+    def near_close_active_profit_take_orders_for_position(
+        self,
+        *,
+        token_id: str,
+        market_slug: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = f"""
+            SELECT order_id, token_id, market_slug, outcome_label, target_price, requested_size, status, response_json, created_at
+            FROM live_trades
+            WHERE token_id = ?
+              AND UPPER(action) = 'SELL'
+              AND response_json LIKE '%"strategy_variant": "near_close_profit_take"%'
+              AND UPPER(status) NOT IN ({",".join("?" for _ in self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES)})
+        """
+        params: list[Any] = [str(token_id or ""), *self.NEAR_CLOSE_INACTIVE_ORDER_STATUSES]
+        if market_slug:
+            query += " AND market_slug = ?"
+            params.append(market_slug)
+        query += " ORDER BY created_at DESC"
+        rows = self.connection.fetchall(query, params)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        orders: list[dict[str, Any]] = []
+        for row in rows:
+            response = self._load_json(row.get("response_json"), {})
+            expiration = response.get("expiration") if isinstance(response, dict) else None
+            if expiration is not None and float(expiration or 0) <= now_ts:
+                continue
+            orders.append(
+                {
+                    "order_id": row["order_id"],
+                    "token_id": row["token_id"],
+                    "market_slug": row["market_slug"],
+                    "outcome_label": row["outcome_label"],
+                    "target_price": float(row["target_price"] or 0.0),
+                    "requested_size": float(row["requested_size"] or 0.0),
+                    "status": row["status"],
+                    "response": response if isinstance(response, dict) else {},
+                    "created_at": row["created_at"],
+                }
+            )
+        return orders
+
     def near_close_filled_entries_without_hedge(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(
             """
@@ -1249,6 +1328,59 @@ class ScannerRepository:
                 break
         return candidates
 
+    def near_close_filled_entries_without_profit_take(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT live_trades.id,
+                   live_trades.opportunity_id,
+                   live_trades.action,
+                   live_trades.token_id,
+                   live_trades.market_slug,
+                   live_trades.outcome_label,
+                   live_trades.target_price,
+                   live_trades.requested_size,
+                   live_trades.order_id,
+                   live_trades.status,
+                   live_trades.response_json,
+                   live_trades.created_at,
+                   markets.market_id AS entry_market_id,
+                   markets.end_date,
+                   markets.active,
+                   markets.closed
+            FROM live_trades
+            LEFT JOIN markets ON markets.slug = live_trades.market_slug
+            WHERE live_trades.order_id IS NOT NULL
+              AND live_trades.opportunity_id NOT LIKE 'hedge:%'
+              AND live_trades.opportunity_id NOT LIKE 'profit-take:%'
+              AND UPPER(live_trades.action) = 'BUY'
+              AND UPPER(live_trades.status) IN ('CONFIRMED', 'MATCHED', 'FILLED', 'MINED')
+            ORDER BY live_trades.created_at DESC, live_trades.id DESC
+            LIMIT ?
+            """,
+            (max(limit * 3, limit),),
+        )
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            response = self._load_json(row.get("response_json"), {})
+            if not isinstance(response, dict):
+                response = {}
+            if response.get("strategy_variant") != "near_close_maker":
+                continue
+            order_id = str(row.get("order_id") or "")
+            if self.profit_take_order_exists_for_entry(order_id):
+                continue
+            outcomes = self.market_outcomes(str(row.get("market_slug") or ""))
+            candidates.append(
+                {
+                    **row,
+                    "response": response,
+                    "market_outcomes": outcomes,
+                }
+            )
+            if len(candidates) >= limit:
+                break
+        return candidates
+
     def near_close_hedge_watch_token_ids(self, limit: int = 50) -> list[str]:
         token_ids: list[str] = []
         for entry in self.near_close_filled_entries_without_hedge(limit=limit):
@@ -1258,6 +1390,15 @@ class ScannerRepository:
                 if token_id and token_id != entry_token_id:
                     token_ids.append(token_id)
         return list(dict.fromkeys(token_ids))
+
+    def near_close_profit_take_watch_token_ids(self, limit: int = 50) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(entry.get("token_id") or "")
+                for entry in self.near_close_filled_entries_without_profit_take(limit=limit)
+                if str(entry.get("token_id") or "")
+            )
+        )
 
     def save_polymarket_activity_trades(self, activities: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
         inserted = 0

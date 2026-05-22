@@ -215,6 +215,36 @@ Key hedge settings:
 The hedge respects the kill switch, daily/per-plan risk checks, market close checks, opposite-side liquidity, max ask, spread, and duplicate-order guard. Current risk accounting treats the hedge conservatively as another live order for daily limits; it does not weaken existing exposure controls.
 
 Risks: the hedge may not fill, the market can reverse before the hedge is submitted, opposite liquidity can disappear, the orderbook can be stale, and the CLOB V2 adapter can reject or normalize order details differently than expected. Shadow mode should be used first for counterfactual analysis.
+
+## Near-Close Post-Fill Profit Take
+
+The profit-take flow is also sequential. The bot does not place a SELL before the entry BUY is filled because SELL orders must be backed by outcome-token balance. After a near-close maker BUY is confirmed filled, the bot can place a position-backed SELL to take profit before resolution.
+
+Default ladder:
+
+```text
+entry <= 0.865 -> sell 0.950
+entry <= 0.885 -> sell 0.955
+entry <= 0.905 -> sell 0.965
+entry <= 0.925 -> sell 0.970
+entry <= 0.940 -> sell 0.985
+entry >  0.940 -> skip
+```
+
+Key profit-take settings:
+
+- `NEAR_CLOSE_PROFIT_TAKE_ENABLED=true`
+- `NEAR_CLOSE_PROFIT_TAKE_LIVE_ENABLED=false` by default; local launch scripts enable it for live testing.
+- `NEAR_CLOSE_PROFIT_TAKE_SHADOW_ENABLED=true`
+- `NEAR_CLOSE_PROFIT_TAKE_ORDER_TYPE=GTD`
+- `NEAR_CLOSE_PROFIT_TAKE_GTD_SECONDS=240`
+- `NEAR_CLOSE_PROFIT_TAKE_MIN_NET_PROFIT=0.20`
+- `NEAR_CLOSE_PROFIT_TAKE_MIN_DEPTH=5`
+- `NEAR_CLOSE_PROFIT_TAKE_MAX_SPREAD=0.08`
+
+Stop-exit remains the downside protection path. If stop-exit is triggered while a profit-taking SELL is still active, the bot first attempts to cancel the profit-taking SELL; if cancellation is unconfirmed, it skips the stop-exit submission to avoid double-selling the same token balance.
+
+Strategy-level changes should be snapshotted before implementation: run validation, commit the current working strategy, push the branch, push an annotated version tag, then create a new strategy branch for the next experiment.
 - `MAX_DAILY_LIVE_NOTIONAL`
 - `MAX_DAILY_LIVE_ORDERS`
 

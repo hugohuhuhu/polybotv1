@@ -84,6 +84,9 @@ async def execute_near_close_taker_exits(
         assumed_fill = bool(group.get("assumed_fill"))
         source_order_id = str(group.get("source_order_id") or "").strip()
         cancel_response = None
+        profit_take_cancel_response = None
+        profit_take_cancelled_order_ids: list[str] = []
+        profit_take_uncertain_order_ids: list[str] = []
         if assumed_fill and not settings.near_close_assume_submitted_filled_stop_exit:
             continue
         if assumed_fill and source_order_id:
@@ -109,6 +112,56 @@ async def execute_near_close_taker_exits(
                     continue
             except Exception as exc:
                 cancel_response = {"error": str(exc)}
+        profit_take_order_ids = [
+            str(order.get("order_id") or "").strip()
+            for order in repository.near_close_active_profit_take_orders_for_position(
+                token_id=token_id,
+                market_slug=market_slug,
+            )
+            if str(order.get("order_id") or "").strip()
+        ]
+        if profit_take_order_ids:
+            try:
+                profit_take_cancel_response = await live_trader.cancel_orders(profit_take_order_ids)
+                profit_take_cancelled_order_ids, profit_take_uncertain_order_ids = _split_cancel_response(
+                    profit_take_order_ids,
+                    profit_take_cancel_response,
+                )
+                if profit_take_cancelled_order_ids:
+                    repository.mark_live_orders_cancelled(
+                        profit_take_cancelled_order_ids,
+                        status="stop_exit_cancelled_profit_take",
+                        cancel_response=profit_take_cancel_response,
+                    )
+                if profit_take_uncertain_order_ids:
+                    repository.mark_live_orders_cancelled(
+                        profit_take_uncertain_order_ids,
+                        status="cancel_unconfirmed",
+                        cancel_response=profit_take_cancel_response,
+                    )
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=f"stop-exit:{market_slug}:{token_id}",
+                        status="profit_take_cancel_unconfirmed_before_stop_exit",
+                        message="Profit-taking SELL could not be confirmed cancelled before stop-exit.",
+                        details={
+                            "order_ids": profit_take_order_ids,
+                            "uncertain_order_ids": profit_take_uncertain_order_ids,
+                            "cancel_response": profit_take_cancel_response,
+                        },
+                    )
+                    continue
+            except Exception as exc:
+                repository.save_execution_event(
+                    source="watch",
+                    mode="live",
+                    opportunity_id=f"stop-exit:{market_slug}:{token_id}",
+                    status="profit_take_cancel_failed_before_stop_exit",
+                    message=str(exc),
+                    details={"order_ids": profit_take_order_ids},
+                )
+                continue
         plan = ExecutionPlan(
             opportunity_id=f"stop-exit:{market_slug}:{token_id}",
             summary=f"Taker stop exit on {market_slug} at {target_price:.4f}",
@@ -133,6 +186,9 @@ async def execute_near_close_taker_exits(
                         "assumed_fill_stop_exit": assumed_fill,
                         "source_order_id": source_order_id or None,
                         "source_cancel_response": cancel_response,
+                        "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                        "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                        "profit_take_cancel_response": profit_take_cancel_response,
                     },
                 )
             ],
@@ -176,6 +232,9 @@ async def execute_near_close_taker_exits(
                             "assumed_fill_stop_exit": assumed_fill,
                             "source_order_id": source_order_id or None,
                             "source_cancel_response": cancel_response,
+                            "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                            "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                            "profit_take_cancel_response": profit_take_cancel_response,
                         },
                     )
                 ],
@@ -225,6 +284,9 @@ async def execute_near_close_taker_exits(
                 "assumed_fill_stop_exit": assumed_fill,
                 "source_order_id": source_order_id or None,
                 "source_cancel_response": cancel_response,
+                "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
+                "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                "profit_take_cancel_response": profit_take_cancel_response,
                 "second_chance_enabled": settings.near_close_second_chance_exit_enabled,
                 "second_chance_attempted": second_chance_result is not None,
                 "second_chance_target_price": second_chance_target,

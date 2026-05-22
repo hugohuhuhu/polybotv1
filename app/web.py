@@ -33,6 +33,7 @@ from app.storage.path_safety import path_sync_warning
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner
 from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
+from app.strategy.post_fill_profit_take import execute_post_fill_profit_takes
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, create_authenticated_clob_v2_client
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
@@ -90,6 +91,7 @@ def refresh_open_position_orderbooks(repository: ScannerRepository, settings: Se
             for group in groups
             if float(group.get("open_size") or 0.0) > 1e-9 and str(group.get("token_id") or "")
         }
+        | set(repository.near_close_profit_take_watch_token_ids(limit=50))
     )
     if not token_ids:
         return 0
@@ -561,6 +563,20 @@ def _trading_parameters_payload(
                     {"label": "最大 spread", "value": settings.near_close_hedge_max_spread},
                     {"label": "最短剩餘時間", "value": settings.near_close_hedge_min_minutes_to_end, "unit": "分"},
                     {"label": "動態定價", "value": "開" if settings.near_close_hedge_dynamic_pricing_enabled else "關"},
+                ],
+            },
+            {
+                "title": "Post-fill profit take",
+                "items": [
+                    {"label": "策略啟用", "value": "開" if settings.near_close_profit_take_enabled else "關"},
+                    {"label": "Live 掛單", "value": "開" if settings.near_close_profit_take_live_enabled else "關"},
+                    {"label": "shadow 記錄", "value": "開" if settings.near_close_profit_take_shadow_enabled else "關"},
+                    {"label": "ladder", "value": settings.near_close_profit_take_ladder},
+                    {"label": "最低淨利", "value": settings.near_close_profit_take_min_net_profit, "unit": "pUSD"},
+                    {"label": "最低 depth", "value": settings.near_close_profit_take_min_depth},
+                    {"label": "最大 spread", "value": settings.near_close_profit_take_max_spread},
+                    {"label": "掛單型態", "value": settings.near_close_profit_take_order_type},
+                    {"label": "GTD 秒數", "value": settings.near_close_profit_take_gtd_seconds, "unit": "秒"},
                 ],
             },
             {
@@ -1378,6 +1394,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     for group in groups
                     if float(group.get("open_size") or 0.0) > 1e-9 and str(group.get("token_id") or "")
                 ]
+                token_ids.extend(repo.near_close_profit_take_watch_token_ids(limit=50))
             token_ids = list(dict.fromkeys(token_ids))
             if not token_ids:
                 return
@@ -1407,6 +1424,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         status="stop_exit_checked",
                         message=f"Near-close stop exit submitted for {len(exits)} position(s).",
                         details={"exits": exits},
+                    )
+                profit_takes = await asyncio.wait_for(
+                    execute_post_fill_profit_takes(
+                        repository=repo,
+                        live_trader=live_trader,
+                        settings=runtime_settings,
+                        controls=controls,
+                        watch_books=books,
+                        source="dashboard",
+                    ),
+                    timeout=NEAR_CLOSE_STOP_EXIT_TIMEOUT_SEC,
+                )
+                if profit_takes:
+                    repo.save_execution_event(
+                        source="dashboard",
+                        mode="live",
+                        opportunity_id=None,
+                        status="profit_take_checked",
+                        message=f"Post-fill profit take submitted for {profit_takes} position(s).",
+                        details={"submitted_count": profit_takes},
                     )
 
     async def near_close_stop_exit_loop(stop_event: asyncio.Event) -> None:
