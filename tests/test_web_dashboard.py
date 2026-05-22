@@ -90,6 +90,7 @@ def seed_dashboard_data(sqlite_path: Path) -> None:
         opportunity_count=1,
         actionable_count=1,
         candidate_count=0,
+        scan_rejection_counts={"bid_depth_below_min": 3, "spread_above_max": 1},
     )
     now = datetime.now(timezone.utc)
     repository.save_watch_heartbeat(
@@ -196,6 +197,11 @@ def test_dashboard_routes_render_and_serve_data(tmp_path, monkeypatch) -> None:
     assert payload["watch"]["phase"] == "delay"
     assert payload["watch"]["watch_scan_timeout_sec"] == 60.0
     assert payload["watch"]["watch_delay_sec"] == 30.0
+    rejection_group = next(
+        group for group in payload["trading_parameters"]["groups"] if group["title"] == "Crypto Up/Down 被擋原因"
+    )
+    assert rejection_group["items"][0]["label"] == "depth 不足"
+    assert rejection_group["items"][0]["value"] == 3
 
 
 def test_dashboard_timeout_reuses_last_successful_payload(tmp_path, monkeypatch) -> None:
@@ -397,6 +403,240 @@ def test_dashboard_trade_group_prefers_local_orderbook_over_portfolio_position_p
     assert round(group["total_pnl"], 2) == -0.03
     assert group["current_price"] == 0.954
     assert group["current_price_source"] == "best_bid"
+
+
+def test_dashboard_portfolio_value_overrides_stale_settlement_outcome(tmp_path, monkeypatch) -> None:
+    async def fake_wallet_status(_settings):
+        return {
+            "configured": True,
+            "address": "0x1111111111111111111111111111111111111111",
+            "status": "ok",
+            "message": "ok",
+            "balances": [{"symbol": "pUSD", "amount": 15.0, "status": "ok", "note": None}],
+            "portfolio": {
+                "position_value": 4.38,
+                "status": "ok",
+                "source": "polymarket_data_api",
+                "note": None,
+                "positions": [
+                    {
+                        "asset": "yes",
+                        "currentValue": 4.38,
+                        "cashPnl": 0.03,
+                        "curPrice": 0.876,
+                        "redeemable": True,
+                    }
+                ],
+            },
+        }
+
+    async def fake_preflight(_settings, *, verify_clob_credentials=True):
+        return FakePreflightReport(ready=True)
+
+    monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
+    monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    sqlite_path = tmp_path / "dashboard-stale-settlement.db"
+    seed_dashboard_data(sqlite_path)
+    connection = connect_db(sqlite_path)
+    with connection.transaction():
+        connection.execute(
+            """
+            UPDATE markets
+            SET end_date = ?, raw_json = ?
+            WHERE slug = ?
+            """,
+            (
+                (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                json.dumps({"near_close_crypto_winning_outcome": "No"}),
+                "will-something-happen",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "stale-settlement-test",
+                1,
+                "BUY",
+                "yes",
+                "will-something-happen",
+                "Yes",
+                0.87,
+                5.0,
+                "0xstalesettlement",
+                "CONFIRMED",
+                "{}",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    connection.close()
+    app = create_app(Settings(SQLITE_PATH=str(sqlite_path), POLYMARKET_PRIVATE_KEY="0x" + "1" * 64))
+    client = TestClient(app)
+
+    payload = client.get("/api/dashboard").json()
+    group = payload["trade_groups"][0]
+
+    assert group["current_value"] == 4.38
+    assert group["current_price"] == 0.876
+    assert group["current_price_source"] == "polymarket_data_api"
+    assert group["total_pnl"] == 0.03
+    assert group["latest_status"] == "redeemable"
+
+
+def test_dashboard_does_not_duplicate_wallet_position_for_closed_local_trade(tmp_path, monkeypatch) -> None:
+    async def fake_wallet_status(_settings):
+        return {
+            "configured": True,
+            "address": "0x1111111111111111111111111111111111111111",
+            "status": "ok",
+            "message": "ok",
+            "balances": [{"symbol": "pUSD", "amount": 15.0, "status": "ok", "note": None}],
+            "portfolio": {
+                "position_value": 0.0,
+                "status": "ok",
+                "source": "polymarket_data_api",
+                "note": None,
+                "positions": [
+                    {
+                        "asset": "yes",
+                        "title": "Will something happen?",
+                        "outcome": "Yes",
+                        "size": 5.0,
+                        "initialValue": 4.35,
+                        "currentValue": 0.0,
+                        "cashPnl": -4.35,
+                        "curPrice": 0.0,
+                        "redeemable": True,
+                    }
+                ],
+            },
+        }
+
+    async def fake_preflight(_settings, *, verify_clob_credentials=True):
+        return FakePreflightReport(ready=True)
+
+    monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
+    monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    sqlite_path = tmp_path / "dashboard-closed-wallet-duplicate.db"
+    seed_dashboard_data(sqlite_path)
+    connection = connect_db(sqlite_path)
+    with connection.transaction():
+        connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "closed-wallet-duplicate-test",
+                1,
+                "BUY",
+                "yes",
+                "will-something-happen",
+                "Yes",
+                0.87,
+                5.0,
+                "0xclosedwalletduplicate",
+                "SETTLED_LOST",
+                "{}",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    connection.close()
+    app = create_app(Settings(SQLITE_PATH=str(sqlite_path), POLYMARKET_PRIVATE_KEY="0x" + "1" * 64))
+    client = TestClient(app)
+
+    payload = client.get("/api/dashboard").json()
+    groups = [group for group in payload["trade_groups"] if group["token_id"] == "yes"]
+
+    assert len(groups) == 1
+    assert groups[0]["latest_status"] == "SETTLED_LOST"
+
+
+def test_dashboard_live_orders_include_net_exit_pnl_for_closed_position(tmp_path, monkeypatch) -> None:
+    async def fake_wallet_status(_settings):
+        return {
+            "configured": True,
+            "address": "0x1111111111111111111111111111111111111111",
+            "status": "ok",
+            "message": "ok",
+            "balances": [{"symbol": "pUSD", "amount": 15.0, "status": "ok", "note": None}],
+            "portfolio": {"position_value": 0.0, "status": "ok", "source": "polymarket_data_api", "positions": []},
+        }
+
+    async def fake_preflight(_settings, *, verify_clob_credentials=True):
+        return FakePreflightReport(ready=True)
+
+    monkeypatch.setattr("app.web.load_wallet_status", fake_wallet_status)
+    monkeypatch.setattr("app.web.load_preflight_report", fake_preflight)
+    sqlite_path = tmp_path / "dashboard-live-order-net-pnl.db"
+    seed_dashboard_data(sqlite_path)
+    connection = connect_db(sqlite_path)
+    now = datetime.now(timezone.utc)
+    with connection.transaction():
+        connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "net-live-order-test",
+                1,
+                "BUY",
+                "yes",
+                "will-something-happen",
+                "Yes",
+                0.92,
+                5.0,
+                "0xnetbuy",
+                "SETTLED_LOST",
+                "{}",
+                now.isoformat(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "net-live-order-test",
+                2,
+                "SELL",
+                "yes",
+                "will-something-happen",
+                "Yes",
+                0.68,
+                5.0,
+                "0xnetsell",
+                "CONFIRMED",
+                "{}",
+                (now + timedelta(seconds=10)).isoformat(),
+            ),
+        )
+    connection.close()
+    app = create_app(Settings(SQLITE_PATH=str(sqlite_path), POLYMARKET_PRIVATE_KEY="0x" + "1" * 64))
+    client = TestClient(app)
+
+    payload = client.get("/api/dashboard").json()
+    group = next(group for group in payload["trade_groups"] if group["token_id"] == "yes")
+    buy_order = next(order for order in payload["live_orders"] if order["order_id"] == "0xnetbuy")
+
+    assert group["position_status"] == "closed"
+    assert round(group["total_pnl"], 2) == -1.2
+    assert round(buy_order["pnl"], 2) == -4.6
+    assert round(buy_order["net_pnl"], 2) == -1.2
+    assert round(buy_order["net_exit_notional"], 2) == 3.4
+    assert buy_order["net_position_status"] == "closed"
 
 
 def test_dashboard_includes_wallet_only_unredeemed_position(tmp_path, monkeypatch) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 import time
 from zoneinfo import ZoneInfo
@@ -298,6 +299,7 @@ def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
         excluded_long_tail_count=7,
         excluded_family_cap_count=3,
         positive_edge_candidates_24h=4,
+        scan_rejection_counts={"bid_depth_below_min": 9, "spread_above_max": 4},
         near_close_funnel=[
             {
                 "label": "探索到的市場",
@@ -469,6 +471,7 @@ def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
     assert dashboard["near_close_funnel"][1]["count"] == 40
     assert dashboard["paper_notional_today"] == 97.0
     assert dashboard["watch_bucket_counts"]["general"] == 20
+    assert dashboard["scan_rejection_counts"]["bid_depth_below_min"] == 9
     assert dashboard["excluded_long_tail_count"] == 7
     assert dashboard["positive_edge_candidates_24h"] == 4
 
@@ -804,6 +807,70 @@ def test_recent_live_orders_use_settlement_value_after_market_end(tmp_path) -> N
     assert round(group["total_pnl"], 2) == 0.15
 
 
+def test_live_trade_groups_offset_settled_lost_entry_with_stop_exit_sell(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "settled-lost-stop-offset.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "lost-entry",
+                1,
+                "BUY",
+                "sol-up",
+                "sol-updown-15m-test",
+                "Up",
+                0.92,
+                5.0,
+                "0xbuy",
+                "SETTLED_LOST",
+                "{}",
+                "2026-05-21T21:11:13+00:00",
+            ),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "stop-exit-second-chance:sol-updown-15m-test:sol-up",
+                1,
+                "SELL",
+                "sol-up",
+                "sol-updown-15m-test",
+                "Up",
+                0.68,
+                5.0,
+                "0xsell",
+                "CONFIRMED",
+                json.dumps({"strategy_variant": "near_close_stop_exit"}),
+                "2026-05-21T21:14:40+00:00",
+            ),
+        )
+
+    group = repository.live_trade_groups(limit=5)[0]
+
+    assert group["buy_size"] == 5.0
+    assert group["sell_size"] == 5.0
+    assert group["open_size"] == 0.0
+    assert round(group["entry_notional"], 2) == 4.6
+    assert round(group["exit_notional"], 2) == 3.4
+    assert round(group["estimated_realized_pnl"], 2) == -1.2
+    assert round(group["total_pnl"], 2) == -1.2
+    assert group["position_status"] == "closed"
+
+    journal = repository.live_trade_journal_summary()
+    assert round(float(journal["estimated_realized_pnl_total"]), 2) == -1.2
+    assert round(float(journal["open_size_total"]), 2) == 0.0
+
+
 def test_recent_live_orders_use_response_winner_and_market_link_after_market_end(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-response-winner-order.db"))
     token_id = "eth-up"
@@ -974,3 +1041,114 @@ def test_near_close_live_exposure_ignores_strategy_cancelled_orders(tmp_path) ->
     exposure = repository.near_close_live_exposure()
     assert exposure["total"] == 0.0
     assert exposure["active_orders"] == 0
+
+
+def test_loss_autopsy_records_entry_books_stop_and_hedge_context(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "loss-autopsy.db"))
+    created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    token_id = "doge-down"
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "loss-entry",
+                1,
+                "BUY",
+                token_id,
+                "doge-updown-5m-test",
+                "Down",
+                0.87,
+                5.0,
+                "0xloss",
+                "SETTLED_LOST",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_maker",
+                        "outcome_label": "Down",
+                        "minutes_to_resolution": 2.4,
+                        "crypto_start_distance": 0.0016,
+                        "crypto_winning_outcome": "Down",
+                        "entry_bid": 0.87,
+                        "entry_ask": 0.88,
+                        "current_bid": 0.86,
+                        "current_midpoint": 0.87,
+                    }
+                ),
+                created_at.isoformat(),
+            ),
+        )
+    trade_id = repository.connection.fetchone("SELECT id FROM live_trades WHERE order_id = ?", ("0xloss",))["id"]
+    repository.save_orderbooks(
+        [
+            OrderBookSnapshot(
+                token_id=token_id,
+                bids=[BookLevel(price=0.86, size=20)],
+                asks=[BookLevel(price=0.88, size=20)],
+                updated_at=created_at + timedelta(seconds=5),
+            ),
+            OrderBookSnapshot(
+                token_id=token_id,
+                bids=[BookLevel(price=0.17, size=5)],
+                asks=[BookLevel(price=0.27, size=10)],
+                updated_at=created_at + timedelta(minutes=1),
+            ),
+        ]
+    )
+    repository.save_execution_event(
+        source="watch",
+        mode="live",
+        opportunity_id=f"stop-exit:doge-updown-5m-test:{token_id}",
+        status="failed",
+        message="PolyApiException: no orders found to match with FAK order",
+        details={
+            "strategy_variant": "near_close_stop_exit",
+            "market_slug": "doge-updown-5m-test",
+            "token_id": token_id,
+            "reference_price": 0.18,
+            "target_price": 0.15,
+        },
+    )
+    repository.save_execution_event(
+        source="watch",
+        mode="live",
+        opportunity_id=None,
+        status="hedge_skipped",
+        message="too_close_to_resolution",
+        details={
+            "strategy_variant": "near_close_post_fill_hedge",
+            "entry_market_slug": "doge-updown-5m-test",
+            "entry_token_id": token_id,
+        },
+    )
+
+    autopsy = repository.save_loss_autopsy(
+        [trade_id],
+        risk_settings={
+            "taker_exit_price": 0.52,
+            "hard_stop_offset": 0.025,
+            "emergency_slippage": 0.03,
+        },
+        settlement_details={"outcome_prices": "[\"1\", \"0\"]"},
+    )
+    repository.save_loss_autopsy([trade_id])
+
+    events = [
+        event
+        for event in repository.recent_execution_events(limit=10)
+        if event["status"] == "loss_autopsy"
+    ]
+    assert autopsy is not None
+    assert len(events) == 1
+    details = events[0]["details"]
+    assert details["entry"]["market_slug"] == "doge-updown-5m-test"
+    assert round(details["entry"]["entry_price"], 6) == 0.87
+    assert details["first_stop_cross"]["best_bid"] == 0.17
+    assert details["stop_exit"]["attempted"] is True
+    assert details["hedge"]["observed"] is True
+    assert "stop_exit_fak_no_match" in details["diagnosis"]
+    assert "hedge_skipped_too_close_to_resolution" in details["diagnosis"]

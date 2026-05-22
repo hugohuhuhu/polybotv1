@@ -50,9 +50,28 @@ EMBEDDED_WATCH_LIVE_TIMEOUT_SEC = 25.0
 EMBEDDED_WATCH_CYCLE_TIMEOUT_SEC = 60.0
 LIVE_FILL_SYNC_INTERVAL_SEC = 5.0
 LIVE_FILL_ACTIVITY_LIMIT = 500
-NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC = 5.0
+NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC = 3.0
 NEAR_CLOSE_STOP_EXIT_TIMEOUT_SEC = 12.0
 OPEN_POSITION_BOOK_REFRESH_INTERVAL_SEC = 120.0
+
+SCAN_REJECTION_REASON_LABELS = {
+    "market_not_allowed": "市場層條件未通過",
+    "missing_minutes_to_resolution": "缺少剩餘時間",
+    "missing_orderbook": "缺 orderbook",
+    "crypto_updown_disabled": "Crypto Up/Down 未啟用",
+    "missing_start_distance": "缺 start distance",
+    "start_distance_below_min": "start distance 太低",
+    "missing_orderbook_prices": "缺 bid/ask/midpoint",
+    "best_ask_below_min": "ask 低於門檻",
+    "midpoint_below_min": "midpoint 低於門檻",
+    "spread_above_max": "spread 太寬",
+    "bid_at_or_above_skip": "bid 已達取消觀察線",
+    "tick_size_too_large": "tick size 太大",
+    "entry_price_out_of_range": "進場價不在區間",
+    "would_cross_post_only": "會 crossing，不適合 post-only",
+    "bid_depth_below_min": "depth 不足",
+    "net_edge_below_min": "淨邊際不足",
+}
 
 
 async def _fetch_orderbooks_for_tokens(settings: Settings, token_ids: list[str]) -> dict[str, Any]:
@@ -223,21 +242,30 @@ def _apply_portfolio_position_values(groups: list[dict[str, Any]], wallet: dict[
         item = dict(group)
         asset = str(item.get("token_id") or "")
         position = positions.get(asset)
-        if position is not None and float(item.get("open_size") or 0.0) > 1e-9:
+        if position is not None:
             matched_assets.add(asset)
+        if position is not None and float(item.get("open_size") or 0.0) > 1e-9:
             current_value = _float_or_none(position.get("currentValue"))
             cash_pnl = _float_or_none(position.get("cashPnl"))
             cur_price = _float_or_none(position.get("curPrice"))
             local_value = _float_or_none(item.get("current_value"))
             local_price = _float_or_none(item.get("current_price"))
+            local_source = str(item.get("current_price_source") or "")
             local_has_price = local_value is not None and local_price is not None
-            if current_value is not None and not local_has_price:
+            prefer_portfolio = not local_has_price or local_source in {"missing", "settlement_outcome"}
+            if position.get("redeemable") is True:
+                item["latest_status"] = "redeemable"
+            if current_value is not None and prefer_portfolio:
                 item["current_value"] = current_value
                 item["unrealized_pnl"] = current_value - float(item.get("open_cost_basis") or 0.0)
                 item["current_price_source"] = "polymarket_data_api"
-            if cash_pnl is not None and not local_has_price:
-                item["total_pnl"] = cash_pnl
-            if cur_price is not None and local_price is None:
+                if cash_pnl is not None:
+                    item["total_pnl"] = cash_pnl
+                else:
+                    item["total_pnl"] = float(item.get("estimated_realized_pnl") or 0.0) + float(
+                        item.get("unrealized_pnl") or 0.0
+                    )
+            if cur_price is not None and (prefer_portfolio or local_price is None):
                 item["current_price"] = cur_price
         adjusted.append(item)
     for asset, position in positions.items():
@@ -246,6 +274,43 @@ def _apply_portfolio_position_values(groups: list[dict[str, Any]], wallet: dict[
         wallet_group = _wallet_only_trade_group(position)
         if wallet_group is not None:
             adjusted.append(wallet_group)
+    return adjusted
+
+
+def _live_position_key(item: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("market_slug") or ""),
+        str(item.get("token_id") or ""),
+        str(item.get("outcome_label") or ""),
+    )
+
+
+def _apply_live_order_group_values(orders: list[dict[str, Any]], groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped = {_live_position_key(group): group for group in groups}
+    adjusted: list[dict[str, Any]] = []
+    for order in orders:
+        item = dict(order)
+        group = grouped.get(_live_position_key(item))
+        if group is None:
+            adjusted.append(item)
+            continue
+
+        sell_size = float(group.get("sell_size") or 0.0)
+        redeemed_size = float(group.get("redeemed_size") or 0.0)
+        is_closed = str(group.get("position_status") or "") == "closed"
+        if sell_size <= 1e-9 and redeemed_size <= 1e-9 and not is_closed:
+            adjusted.append(item)
+            continue
+
+        item["net_pnl"] = group.get("total_pnl")
+        item["net_entry_notional"] = group.get("entry_notional")
+        item["net_exit_notional"] = group.get("exit_notional")
+        item["net_current_value"] = group.get("current_value")
+        item["net_open_size"] = group.get("open_size")
+        item["net_position_status"] = group.get("position_status")
+        item["net_sell_size"] = group.get("sell_size")
+        item["net_redeemed_size"] = group.get("redeemed_size")
+        adjusted.append(item)
     return adjusted
 
 
@@ -327,6 +392,36 @@ def _last_funnel_stage(summary: dict[str, Any]) -> dict[str, Any] | None:
     return stage if isinstance(stage, dict) else None
 
 
+def _scan_rejection_items(summary: dict[str, Any], *, limit: int = 8) -> list[dict[str, Any]]:
+    raw_counts = summary.get("scan_rejection_counts")
+    if not isinstance(raw_counts, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    for reason, count in raw_counts.items():
+        try:
+            numeric_count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if numeric_count <= 0:
+            continue
+        items.append(
+            {
+                "reason": str(reason),
+                "label": SCAN_REJECTION_REASON_LABELS.get(str(reason), str(reason)),
+                "value": numeric_count,
+                "unit": "次",
+            }
+        )
+    return sorted(items, key=lambda item: (-int(item["value"]), str(item["reason"])))[:limit]
+
+
+def _scan_rejection_parameter_groups(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    items = _scan_rejection_items(summary)
+    if not items:
+        return []
+    return [{"title": "Crypto Up/Down 被擋原因", "items": items}]
+
+
 def _trading_parameters_payload(
     settings: Settings,
     controls: TradingControls,
@@ -352,6 +447,7 @@ def _trading_parameters_payload(
         else 0
     )
     funnel_stage = _last_funnel_stage(summary)
+    rejection_items = _scan_rejection_items(summary, limit=3)
     diagnostics: list[dict[str, str]] = []
 
     if not controls.live_trading_enabled:
@@ -369,6 +465,9 @@ def _trading_parameters_payload(
     if latest_opportunity_count <= 0:
         label = str(funnel_stage.get("label") or "掃描條件") if funnel_stage else "掃描條件"
         diagnostics.append({"level": "watch", "label": "最新掃描沒有可下單機會", "detail": f"最新一輪 opportunity=0；目前最後卡在「{label}」。"})
+        if rejection_items:
+            top_reasons = "、".join(f"{item['label']} {item['value']} 次" for item in rejection_items)
+            diagnostics.append({"level": "watch", "label": "Crypto Up/Down 主要卡點", "detail": f"最近一輪主要被擋原因：{top_reasons}。"})
     elif latest_actionable_count <= 0:
         diagnostics.append({"level": "watch", "label": "最新掃描沒有 actionable", "detail": f"最新一輪有 {latest_opportunity_count} 個候選，但沒有可直接送單的 actionable。"})
     elif live_eligible_count <= 0:
@@ -443,8 +542,25 @@ def _trading_parameters_payload(
                     {"label": "最低 midpoint", "value": settings.near_close_crypto_updown_min_midpoint},
                     {"label": "最大 spread", "value": settings.near_close_crypto_updown_max_spread},
                     {"label": "最高 bid", "value": settings.near_close_crypto_updown_max_bid_price},
+                    {"label": "進場價下限", "value": settings.near_close_crypto_updown_min_entry_price},
+                    {"label": "進場價上限", "value": settings.near_close_crypto_updown_max_entry_price},
                     {"label": "最低 depth", "value": settings.near_close_crypto_updown_min_depth},
                     {"label": "midpoint discount", "value": settings.near_close_crypto_updown_midpoint_discount},
+                ],
+            },
+            *_scan_rejection_parameter_groups(summary),
+            {
+                "title": "Post-fill hedge",
+                "items": [
+                    {"label": "真實掛單", "value": "開" if settings.near_close_post_fill_hedge_enabled else "關"},
+                    {"label": "shadow 記錄", "value": "開" if settings.near_close_post_fill_hedge_shadow_enabled else "關"},
+                    {"label": "預設 hedge 價", "value": settings.near_close_hedge_default_price},
+                    {"label": "最低鎖利", "value": settings.near_close_hedge_min_locked_profit},
+                    {"label": "最大 ask", "value": settings.near_close_hedge_max_best_ask},
+                    {"label": "最低 depth", "value": settings.near_close_hedge_min_depth},
+                    {"label": "最大 spread", "value": settings.near_close_hedge_max_spread},
+                    {"label": "最短剩餘時間", "value": settings.near_close_hedge_min_minutes_to_end, "unit": "分"},
+                    {"label": "動態定價", "value": "開" if settings.near_close_hedge_dynamic_pricing_enabled else "關"},
                 ],
             },
             {
@@ -457,6 +573,15 @@ def _trading_parameters_payload(
                     {"label": "今日 paper 筆數", "value": f"{int(risk_summary.get('paper_trades_today') or 0)} / {settings.max_daily_paper_trades}"},
                     {"label": "日損上限", "value": settings.near_close_daily_loss_limit, "unit": "pUSD"},
                     {"label": "連續虧損上限", "value": settings.near_close_max_consecutive_losses},
+                ],
+            },
+            {
+                "title": "Stop exit",
+                "items": [
+                    {"label": "深跌觸發", "value": settings.near_close_taker_exit_price},
+                    {"label": "進場價跌幅觸發", "value": settings.near_close_hard_stop_offset},
+                    {"label": "SELL FAK 滑價", "value": settings.near_close_emergency_slippage},
+                    {"label": "背景檢查間隔", "value": NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC, "unit": "秒"},
                 ],
             },
         ],
@@ -657,7 +782,7 @@ def build_watch_status(
     elif running:
         state = "running"
         message = "watch 背景監看正常運行中。"
-    elif watch_running and latest_scan_dt is None and startup_age_sec is not None and startup_age_sec <= startup_grace_sec:
+    elif watch_running and startup_age_sec is not None and startup_age_sec <= startup_grace_sec:
         state = "starting"
         message = "watch 已啟動，正在建立首輪掃描。"
     elif watch_running:
@@ -713,6 +838,9 @@ async def build_dashboard_payload(
         limit=settings.dashboard_page_size,
         strategy_variant=strategy_variant,
     )
+    trade_groups_for_orders = _apply_portfolio_position_values(repository.live_trade_groups(limit=50), wallet or {})
+    trade_groups = trade_groups_for_orders[:8]
+    live_orders = _apply_live_order_group_values(repository.recent_live_orders(limit=20), trade_groups_for_orders)
     return {
         "summary": summary,
         "strategies": repository.strategy_summary(strategy_variant=strategy_variant),
@@ -721,9 +849,9 @@ async def build_dashboard_payload(
         "markets": repository.top_markets(limit=10, shortlist_only=strategy_variant == "near_close_maker"),
         "watch_heartbeats": watch_heartbeats,
         "execution_events": repository.recent_execution_events(limit=10),
-        "live_orders": repository.recent_live_orders(limit=20),
+        "live_orders": live_orders,
         "positions": repository.recent_live_positions(limit=10),
-                "trade_groups": _apply_portfolio_position_values(repository.live_trade_groups(limit=8), wallet or {}),
+        "trade_groups": trade_groups,
         "open_positions": repository.open_live_positions(limit=12),
         "pnl": repository.settled_pnl_summary(),
         "trade_journal": _trade_journal_payload(repository, settings, wallet or {}),
@@ -895,8 +1023,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
-    def load_controls(repo: ScannerRepository) -> TradingControls:
-        if app.state.controls_override is not None:
+    def load_controls(repo: ScannerRepository, *, refresh: bool = False) -> TradingControls:
+        if app.state.controls_override is not None and not refresh:
             return app.state.controls_override
         controls = repo.get_trading_controls(app.state.default_controls)
         app.state.controls_override = controls
@@ -1147,7 +1275,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "live_submitted_count": None,
                     },
                 )
-                controls = load_controls(repo)
+                controls = load_controls(repo, refresh=True)
                 try:
                     execution_summary, updated_controls = asyncio.run(
                         asyncio.wait_for(
@@ -1229,6 +1357,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if app.state.stop_exit_lock.locked():
             return
         async with app.state.stop_exit_lock:
+            try:
+                await maybe_sync_live_fills()
+            except Exception as exc:
+                with repository_scope() as repo:
+                    repo.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="fill_sync_failed",
+                        message=str(exc),
+                        details={"trigger": "near_close_stop_exit"},
+                    )
             with repository_scope() as repo:
                 controls = load_controls(repo)
                 runtime_settings = controls.apply(current_settings)
@@ -1276,9 +1416,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pass
         while not stop_event.is_set():
             try:
-                external_watch_running = any(_pid_running(pid) for pid in _iter_watch_processes())
-                if not external_watch_running:
-                    await run_near_close_stop_exit_once()
+                await run_near_close_stop_exit_once()
             except Exception as exc:
                 try:
                     with repository_scope() as repo:
@@ -1353,8 +1491,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redeem_stop_event = asyncio.Event()
         app.state.auto_redeem_stop_event = redeem_stop_event
         app.state.auto_redeem_task = asyncio.create_task(background_auto_redeem_loop(redeem_stop_event))
-        app.state.stop_exit_stop_event = None
-        app.state.stop_exit_task = None
+        stop_exit_stop_event = asyncio.Event()
+        app.state.stop_exit_stop_event = stop_exit_stop_event
+        app.state.stop_exit_task = asyncio.create_task(near_close_stop_exit_loop(stop_exit_stop_event))
 
     @app.on_event("shutdown")
     async def stop_background_tasks() -> None:
@@ -1396,6 +1535,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "latest_candidate_count": 0,
                 "watch_bucket_counts": {},
                 "shortlist_reason_counts": {},
+                "scan_rejection_counts": {},
                 "excluded_long_tail_count": 0,
                 "excluded_family_cap_count": 0,
                 "positive_edge_candidates_24h": 0,
@@ -1564,6 +1704,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 limit=current_settings.dashboard_page_size,
                 strategy_variant=strategy_variant,
             )
+            trade_groups_for_orders = _apply_portfolio_position_values(repo.live_trade_groups(limit=50), wallet)
+            trade_groups = trade_groups_for_orders[:8]
+            live_orders = _apply_live_order_group_values(repo.recent_live_orders(limit=20), trade_groups_for_orders)
             return {
                 "summary": summary,
                 "strategies": repo.strategy_summary(strategy_variant=strategy_variant),
@@ -1572,9 +1715,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "markets": repo.top_markets(limit=10, shortlist_only=strategy_variant == "near_close_maker"),
                 "watch_heartbeats": watch_heartbeats,
                 "execution_events": repo.recent_execution_events(limit=10),
-                "live_orders": repo.recent_live_orders(limit=20),
+                "live_orders": live_orders,
                 "positions": repo.recent_live_positions(limit=10),
-                "trade_groups": _apply_portfolio_position_values(repo.live_trade_groups(limit=8), wallet),
+                "trade_groups": trade_groups,
                 "open_positions": repo.open_live_positions(limit=12),
                 "pnl": repo.settled_pnl_summary(),
                 "trade_journal": _trade_journal_payload(repo, current_settings, wallet),

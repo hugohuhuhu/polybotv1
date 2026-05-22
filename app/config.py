@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
-    near_close_live_max_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
+    near_close_live_max_minutes_to_end: float = Field(default=5.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
     near_close_max_bid_price: float = Field(default=0.97, alias="NEAR_CLOSE_MAX_BID_PRICE")
     near_close_min_best_ask: float = Field(default=0.98, alias="NEAR_CLOSE_MIN_BEST_ASK")
     near_close_min_midpoint: float = Field(default=0.975, alias="NEAR_CLOSE_MIN_MIDPOINT")
@@ -116,6 +116,26 @@ class Settings(BaseSettings):
     near_close_taker_exit_price: float = Field(default=0.52, alias="NEAR_CLOSE_TAKER_EXIT_PRICE")
     near_close_emergency_slippage: float = Field(default=0.01, alias="NEAR_CLOSE_EMERGENCY_SLIPPAGE")
     near_close_emergency_max_loss: float = Field(default=0.05, alias="NEAR_CLOSE_EMERGENCY_MAX_LOSS")
+    near_close_assume_submitted_filled_stop_exit: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_ASSUME_SUBMITTED_FILLED_STOP_EXIT",
+    )
+    near_close_second_chance_exit_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED",
+    )
+    near_close_second_chance_exit_price: float = Field(
+        default=0.01,
+        alias="NEAR_CLOSE_SECOND_CHANCE_EXIT_PRICE",
+    )
+    near_close_stop_exit_stale_orderbook_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_STOP_EXIT_STALE_ORDERBOOK_ENABLED",
+    )
+    near_close_stop_exit_stale_orderbook_max_age_sec: int = Field(
+        default=20,
+        alias="NEAR_CLOSE_STOP_EXIT_STALE_ORDERBOOK_MAX_AGE_SEC",
+    )
     near_close_crypto_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_ENABLED")
     near_close_crypto_order_size: float = Field(default=2.0, alias="NEAR_CLOSE_CRYPTO_ORDER_SIZE")
     near_close_crypto_min_minutes_to_end: float = Field(default=5.0, alias="NEAR_CLOSE_CRYPTO_MIN_MINUTES_TO_END")
@@ -136,11 +156,11 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END",
     )
     near_close_crypto_updown_min_start_distance: float = Field(
-        default=0.003,
+        default=0.00121,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE",
     )
     near_close_crypto_updown_cancel_start_distance: float = Field(
-        default=0.002,
+        default=0.00075,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE",
     )
     near_close_crypto_updown_min_best_ask: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
@@ -150,6 +170,18 @@ class Settings(BaseSettings):
         default=0.97,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE",
     )
+    near_close_crypto_updown_min_entry_price: float = Field(
+        default=0.86,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE",
+    )
+    near_close_crypto_updown_max_entry_price: float = Field(
+        default=0.95,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE",
+    )
+    near_close_crypto_updown_skip_bid_at_or_above: float = Field(
+        default=0.96,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE",
+    )
     near_close_crypto_updown_min_depth: float = Field(
         default=10.0,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH",
@@ -158,6 +190,47 @@ class Settings(BaseSettings):
         default=0.003,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT",
     )
+    near_close_post_fill_hedge_enabled: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_POST_FILL_HEDGE_ENABLED",
+    )
+    near_close_post_fill_hedge_shadow_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_POST_FILL_HEDGE_SHADOW_ENABLED",
+    )
+    near_close_hedge_default_price: float = Field(default=0.03, alias="NEAR_CLOSE_HEDGE_DEFAULT_PRICE")
+    near_close_hedge_min_locked_profit: float = Field(
+        default=0.02,
+        alias="NEAR_CLOSE_HEDGE_MIN_LOCKED_PROFIT",
+    )
+    near_close_hedge_dynamic_pricing_enabled: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_HEDGE_DYNAMIC_PRICING_ENABLED",
+    )
+    near_close_hedge_low_entry_threshold: float = Field(
+        default=0.88,
+        alias="NEAR_CLOSE_HEDGE_LOW_ENTRY_THRESHOLD",
+    )
+    near_close_hedge_low_entry_price: float = Field(
+        default=0.03,
+        alias="NEAR_CLOSE_HEDGE_LOW_ENTRY_PRICE",
+    )
+    near_close_hedge_mid_entry_threshold: float = Field(
+        default=0.92,
+        alias="NEAR_CLOSE_HEDGE_MID_ENTRY_THRESHOLD",
+    )
+    near_close_hedge_mid_entry_price: float = Field(
+        default=0.03,
+        alias="NEAR_CLOSE_HEDGE_MID_ENTRY_PRICE",
+    )
+    near_close_hedge_max_best_ask: float = Field(default=0.03, alias="NEAR_CLOSE_HEDGE_MAX_BEST_ASK")
+    near_close_hedge_min_depth: float = Field(default=5.0, alias="NEAR_CLOSE_HEDGE_MIN_DEPTH")
+    near_close_hedge_max_spread: float = Field(default=0.05, alias="NEAR_CLOSE_HEDGE_MAX_SPREAD")
+    near_close_hedge_min_minutes_to_end: float = Field(
+        default=0.25,
+        alias="NEAR_CLOSE_HEDGE_MIN_MINUTES_TO_END",
+    )
+    near_close_hedge_order_type: str = Field(default="FAK", alias="NEAR_CLOSE_HEDGE_ORDER_TYPE")
     related_rules_path: Path = Field(
         default=Path("./rules/related_markets.example.yaml"),
         alias="RELATED_RULES_PATH",

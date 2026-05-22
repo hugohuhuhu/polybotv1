@@ -196,6 +196,7 @@ def test_late_resolution_scanner_detects_high_probability_market() -> None:
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
         NEAR_CLOSE_MAX_MINUTES_TO_END=6,
         NEAR_CLOSE_MAX_BID_PRICE=0.97,
+        NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=3,
         NEAR_CLOSE_MIN_BEST_ASK=0.985,
         NEAR_CLOSE_MIN_MIDPOINT=0.982,
         NEAR_CLOSE_MAX_SPREAD=0.02,
@@ -418,6 +419,7 @@ def test_late_resolution_scanner_uses_crypto_updown_proxy_variant() -> None:
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.65,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.60,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
         NEAR_CLOSE_MIN_DEPTH=20,
@@ -562,8 +564,10 @@ def test_late_resolution_scanner_prices_crypto_updown_with_gemini_30m_params() -
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
-        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.04,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE=0.988,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.988,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE=1.0,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT=0.003,
     )
@@ -602,6 +606,149 @@ def test_late_resolution_scanner_prices_crypto_updown_with_gemini_30m_params() -
     assert opportunities[0].details["expiration_sec"] == 1800
     assert opportunities[0].details["max_bid_price"] == 0.988
     assert opportunities[0].details["entry_formula"] == "max(best_bid + tick, midpoint - discount)"
+
+
+def test_late_resolution_scanner_skips_crypto_updown_when_bid_is_too_high() -> None:
+    settings = Settings(
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE=0.988,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT=0.003,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = MarketRecord(
+        market_id="m-btc-updown-cap",
+        event_id="e-btc",
+        question="Bitcoin Up or Down - May 2, 5:00AM-9:00AM ET",
+        slug="btc-updown-cap",
+        outcome_labels=["Up", "Down"],
+        token_ids=["btc_up", "btc_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/btc-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=30),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 101000.0,
+            "near_close_crypto_start_price": 100000.0,
+            "near_close_crypto_start_distance": 0.01,
+            "near_close_crypto_winning_outcome": "Up",
+        },
+    )
+
+    rejection_counts: dict[str, int] = {}
+    opportunities = scanner.scan(
+        [market],
+        {
+            "btc_up": make_book("btc_up", bid=0.986, ask=0.995, size=80),
+            "btc_down": make_book("btc_down", bid=0.003, ask=0.006, size=80),
+        },
+        rejection_counts=rejection_counts,
+    )
+
+    assert opportunities == []
+    assert rejection_counts == {"bid_at_or_above_skip": 1}
+
+
+def test_late_resolution_scanner_caps_crypto_updown_entry_at_095_below_skip_bid() -> None:
+    settings = Settings(
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE=0.988,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT=0.003,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = MarketRecord(
+        market_id="m-btc-updown-cap",
+        event_id="e-btc",
+        question="Bitcoin Up or Down - May 2, 5:00AM-9:00AM ET",
+        slug="btc-updown-cap",
+        outcome_labels=["Up", "Down"],
+        token_ids=["btc_up", "btc_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/btc-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=30),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 101000.0,
+            "near_close_crypto_start_price": 100000.0,
+            "near_close_crypto_start_distance": 0.01,
+            "near_close_crypto_winning_outcome": "Up",
+        },
+    )
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "btc_up": make_book("btc_up", bid=0.95, ask=0.995, size=80),
+            "btc_down": make_book("btc_down", bid=0.003, ask=0.006, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].prices["entry_bid"] == 0.95
+    assert opportunities[0].details["min_entry_price"] == 0.86
+    assert opportunities[0].details["max_entry_price"] == 0.95
+    assert opportunities[0].details["skip_bid_at_or_above"] == 0.96
+
+
+def test_late_resolution_scanner_rejects_crypto_updown_entry_below_086() -> None:
+    settings = Settings(
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.04,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = MarketRecord(
+        market_id="m-eth-updown-low",
+        event_id="e-eth",
+        question="Ethereum Up or Down - May 2, 5:00AM-9:00AM ET",
+        slug="eth-updown-low",
+        outcome_labels=["Up", "Down"],
+        token_ids=["eth_up", "eth_down"],
+        active=True,
+        closed=False,
+        liquidity=4000,
+        resolution_source="https://data.chain.link/streams/eth-usd",
+        end_date=datetime.now(timezone.utc) + timedelta(minutes=30),
+        raw={
+            "near_close_crypto_variant": "updown_proxy",
+            "near_close_crypto_spot_price": 3010.0,
+            "near_close_crypto_start_price": 3000.0,
+            "near_close_crypto_start_distance": 0.00333,
+            "near_close_crypto_winning_outcome": "Up",
+        },
+    )
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "eth_up": make_book("eth_up", bid=0.84, ask=0.87, size=80),
+            "eth_down": make_book("eth_down", bid=0.12, ask=0.15, size=80),
+        },
+    )
+
+    assert opportunities == []
 
 
 def test_late_resolution_scanner_accepts_small_crypto_updown_distance_and_depth() -> None:
@@ -662,6 +809,7 @@ def test_run_scanners_keeps_small_crypto_updown_order_size() -> None:
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.65,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE=1.0,
         NEAR_CLOSE_MIN_DEPTH=20,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )

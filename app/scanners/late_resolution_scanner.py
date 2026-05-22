@@ -22,29 +22,52 @@ class LateResolutionScanner:
         self,
         markets: list[MarketRecord],
         books: dict[str, OrderBookSnapshot],
+        rejection_counts: dict[str, int] | None = None,
     ) -> list[Opportunity]:
         if not self.settings.near_close_maker_enabled:
             return []
         opportunities: list[Opportunity] = []
         for market in markets:
             if not self._allow_market(market, books):
+                self._record_crypto_updown_rejection(market, None, "market_not_allowed", rejection_counts)
                 continue
             minutes_left = minutes_to(market.end_date)
             if minutes_left is None:
+                self._record_crypto_updown_rejection(market, None, "missing_minutes_to_resolution", rejection_counts)
                 continue
             for index, outcome in enumerate(market.outcome_refs):
                 book = books.get(outcome.token_id)
+                outcome_label = outcome.label or f"Outcome {index + 1}"
                 if book is None:
+                    self._record_crypto_updown_rejection(market, outcome_label, "missing_orderbook", rejection_counts)
                     continue
                 opportunity = self._scan_outcome(
                     market=market,
                     book=book,
-                    outcome_label=outcome.label or f"Outcome {index + 1}",
+                    outcome_label=outcome_label,
                     minutes_left=minutes_left,
+                    rejection_counts=rejection_counts,
                 )
                 if opportunity is not None:
                     opportunities.append(opportunity)
         return opportunities
+
+    @staticmethod
+    def _record_crypto_updown_rejection(
+        market: MarketRecord,
+        outcome_label: str | None,
+        reason: str,
+        rejection_counts: dict[str, int] | None,
+    ) -> None:
+        if rejection_counts is None:
+            return
+        decision = classify_near_close_market(market)
+        if decision.variant != "crypto_updown":
+            return
+        winning_outcome = str(market.raw.get("near_close_crypto_winning_outcome") or "")
+        if outcome_label is not None and outcome_label.lower() != winning_outcome.lower():
+            return
+        rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
 
     def _allow_market(self, market: MarketRecord, books: dict[str, OrderBookSnapshot]) -> bool:
         gate_reason = self.liquidity_filter.market_gate_reason(market, books, relaxed=True)
@@ -74,15 +97,21 @@ class LateResolutionScanner:
         book: OrderBookSnapshot,
         outcome_label: str,
         minutes_left: float,
+        rejection_counts: dict[str, int] | None = None,
     ) -> Opportunity | None:
         best_ask = book.best_ask
         best_bid = book.best_bid
         midpoint = book.midpoint
         spread = book.spread
         decision = classify_near_close_market(market)
+
+        def reject(reason: str) -> None:
+            self._record_crypto_updown_rejection(market, outcome_label, reason, rejection_counts)
+
         crypto_start_distance: float | None = None
         if decision.variant == "crypto_updown":
             if not (self.settings.near_close_crypto_enabled and self.settings.near_close_crypto_updown_enabled):
+                reject("crypto_updown_disabled")
                 return None
             winning_outcome = str(market.raw.get("near_close_crypto_winning_outcome") or "")
             if outcome_label.lower() != winning_outcome.lower():
@@ -90,28 +119,35 @@ class LateResolutionScanner:
             try:
                 crypto_start_distance = float(market.raw.get("near_close_crypto_start_distance") or 0.0)
             except (TypeError, ValueError):
+                reject("missing_start_distance")
                 return None
             if crypto_start_distance < self.settings.near_close_crypto_updown_min_start_distance:
+                reject("start_distance_below_min")
                 return None
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
             max_spread = self.settings.near_close_crypto_updown_max_spread
             order_size = self.settings.near_close_crypto_updown_order_size
-            max_bid_price = self.settings.near_close_crypto_updown_max_bid_price
+            min_entry_price = self.settings.near_close_crypto_updown_min_entry_price
+            max_entry_price = self.settings.near_close_crypto_updown_max_entry_price
+            max_bid_price = min(self.settings.near_close_crypto_updown_max_bid_price, max_entry_price)
             min_depth = self.settings.near_close_crypto_updown_min_depth
             entry_formula = "max(best_bid + tick, midpoint - discount)"
         elif decision.variant == "crypto":
             if not self.settings.near_close_crypto_enabled:
+                reject("crypto_disabled")
                 return None
             winning_outcome = str(market.raw.get("near_close_crypto_winning_outcome") or "")
             if outcome_label.lower() != winning_outcome.lower():
                 return None
             if float(market.raw.get("near_close_crypto_strike_distance") or 0.0) < self.settings.near_close_crypto_min_strike_distance:
+                reject("strike_distance_below_min")
                 return None
             min_best_ask = self.settings.near_close_crypto_min_best_ask
             min_midpoint = self.settings.near_close_crypto_min_midpoint
             max_spread = self.settings.near_close_crypto_max_spread
             order_size = self.settings.near_close_crypto_order_size
+            min_entry_price = 0.0
             max_bid_price = self.settings.near_close_max_bid_price
             min_depth = self.settings.near_close_min_depth
             entry_formula = "best_bid + tick"
@@ -120,18 +156,30 @@ class LateResolutionScanner:
             min_midpoint = self.settings.near_close_min_midpoint
             max_spread = self.settings.near_close_max_spread
             order_size = self.settings.near_close_order_size
+            min_entry_price = 0.0
             max_bid_price = self.settings.near_close_max_bid_price
             min_depth = self.settings.near_close_min_depth
             entry_formula = "best_bid + tick"
         if best_ask is None or best_bid is None or midpoint is None or spread is None:
+            reject("missing_orderbook_prices")
             return None
         if best_ask < min_best_ask:
+            reject("best_ask_below_min")
             return None
         if midpoint < min_midpoint:
+            reject("midpoint_below_min")
             return None
         if spread > max_spread:
+            reject("spread_above_max")
+            return None
+        if (
+            decision.variant == "crypto_updown"
+            and best_bid >= self.settings.near_close_crypto_updown_skip_bid_at_or_above
+        ):
+            reject("bid_at_or_above_skip")
             return None
         if book.tick_size is not None and book.tick_size > 0.01:
+            reject("tick_size_too_large")
             return None
 
         tick = book.tick_size or 0.001
@@ -142,17 +190,23 @@ class LateResolutionScanner:
                 midpoint - self.settings.near_close_crypto_updown_midpoint_discount,
             )
         entry_bid = self._floor_to_tick(min(entry_candidate, max_bid_price), tick)
+        if entry_bid < min_entry_price or entry_bid > max_bid_price:
+            reject("entry_price_out_of_range")
+            return None
         if entry_bid <= 0 or entry_bid >= best_ask:
+            reject("would_cross_post_only")
             return None
 
         bid_depth = book.depth_for_side("bid", best_bid)
         if bid_depth < min_depth:
+            reject("bid_depth_below_min")
             return None
 
         gross_edge = 1.0 - entry_bid
         risk_penalty = self.settings.estimated_cost_per_leg + 0.005
         net_edge = gross_edge - risk_penalty
         if net_edge <= self.settings.candidate_min_net_edge:
+            reject("net_edge_below_min")
             return None
 
         confidence = clamp_confidence(
@@ -182,7 +236,10 @@ class LateResolutionScanner:
             "entry_bid": entry_bid,
             "entry_ask": best_ask,
             "entry_formula": entry_formula,
+            "min_entry_price": min_entry_price,
+            "max_entry_price": max_bid_price,
             "max_bid_price": max_bid_price,
+            "skip_bid_at_or_above": self.settings.near_close_crypto_updown_skip_bid_at_or_above,
             "min_depth": min_depth,
             "current_bid": best_bid,
             "current_midpoint": midpoint,

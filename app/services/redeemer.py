@@ -17,6 +17,18 @@ TOKEN_DECIMALS = 6
 ZERO_COLLECTION_ID = "0x" + ("0" * 64)
 
 
+def _loss_autopsy_risk_settings(settings: Settings) -> dict[str, Any]:
+    return {
+        "taker_exit_price": settings.near_close_taker_exit_price,
+        "hard_stop_offset": settings.near_close_hard_stop_offset,
+        "emergency_slippage": settings.near_close_emergency_slippage,
+        "hedge_enabled": settings.near_close_post_fill_hedge_enabled,
+        "hedge_shadow_enabled": settings.near_close_post_fill_hedge_shadow_enabled,
+        "hedge_default_price": settings.near_close_hedge_default_price,
+        "hedge_min_locked_profit": settings.near_close_hedge_min_locked_profit,
+    }
+
+
 @dataclass
 class RedeemResult:
     token_id: str
@@ -286,6 +298,17 @@ def run_auto_redeem_once(
                         status="settled_lost",
                         message="Conditional token expired worthless; no redeemable payout.",
                         details={
+                            "market_slug": result.market_slug,
+                            "outcome_label": result.outcome_label,
+                            "token_id": token_id,
+                            "outcome_index": outcome_index,
+                            "outcome_prices": payload.get("outcomePrices"),
+                        },
+                    )
+                    repository.save_loss_autopsy(
+                        result.trade_ids,
+                        risk_settings=_loss_autopsy_risk_settings(settings),
+                        settlement_details={
                             "market_slug": result.market_slug,
                             "outcome_label": result.outcome_label,
                             "token_id": token_id,

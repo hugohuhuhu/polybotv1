@@ -555,6 +555,12 @@ def _initialize_schema(session: DatabaseSession) -> None:
     )
     _ensure_column(
         session,
+        table_name="scan_cycles",
+        column_name="scan_rejection_counts_json",
+        definition="TEXT NOT NULL DEFAULT '{}'",
+    )
+    _ensure_column(
+        session,
         table_name="orderbook_snapshots",
         column_name="captured_minute",
         definition="TEXT NOT NULL DEFAULT ''",
@@ -598,6 +604,7 @@ _required_scan_cycle_columns = {
     "excluded_family_cap_count",
     "positive_edge_candidates_24h",
     "near_close_funnel_json",
+    "scan_rejection_counts_json",
 }
 
 

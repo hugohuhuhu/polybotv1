@@ -695,6 +695,7 @@ def run_scanners(
     markets: list[MarketRecord],
     books: dict[str, OrderBookSnapshot],
     previous_midpoints: dict[str, float] | None = None,
+    diagnostics: dict[str, object] | None = None,
 ) -> list[Opportunity]:
     liquidity_filter = LiquidityFilter(settings)
     scanners = []
@@ -707,11 +708,19 @@ def run_scanners(
     if settings.late_resolution_enabled and settings.near_close_maker_enabled:
         scanners.append(LateResolutionScanner(settings, liquidity_filter))
     opportunities: list[Opportunity] = []
+    scan_rejection_counts: dict[str, int] = {}
     for scanner in scanners:
-        opportunities.extend(scanner.scan(markets, books))
+        if isinstance(scanner, LateResolutionScanner):
+            opportunities.extend(scanner.scan(markets, books, rejection_counts=scan_rejection_counts))
+        else:
+            opportunities.extend(scanner.scan(markets, books))
     if previous_midpoints and settings.strategy_stale_price_enabled:
         stale_scanner = StalePriceScanner()
         opportunities.extend(stale_scanner.scan(markets, books, previous_midpoints))
+    if diagnostics is not None:
+        diagnostics["scan_rejection_counts"] = dict(
+            sorted(scan_rejection_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
     filtered = [opportunity for opportunity in opportunities if liquidity_filter.annotate_opportunity(opportunity)]
     return OpportunityRanker().rank(filtered)
 
@@ -753,7 +762,9 @@ async def execute_scan_cycle(
         repository.positive_edge_candidates_24h() if repository is not None else sum(positive_edge_hits.values())
     )
     books = await fetch_books(settings, shortlisted)
-    opportunities = run_scanners(settings, shortlisted, books, previous_midpoints)
+    scan_diagnostics: dict[str, object] = {}
+    opportunities = run_scanners(settings, shortlisted, books, previous_midpoints, diagnostics=scan_diagnostics)
+    shortlist_diagnostics.update(scan_diagnostics)
     if settings.near_close_scan_pool_enabled and settings.near_close_maker_enabled:
         shortlist_diagnostics["near_close_funnel"] = build_near_close_funnel(
             settings,
@@ -781,8 +792,10 @@ async def execute_monitor_cycle(
     shortlist_diagnostics: dict[str, object] | None = None,
 ) -> ScanCycleResult:
     books = await fetch_books(settings, shortlisted_markets)
-    opportunities = run_scanners(settings, shortlisted_markets, books, previous_midpoints)
+    scan_diagnostics: dict[str, object] = {}
+    opportunities = run_scanners(settings, shortlisted_markets, books, previous_midpoints, diagnostics=scan_diagnostics)
     diagnostics = dict(shortlist_diagnostics or {})
+    diagnostics.update(scan_diagnostics)
     funnel = diagnostics.get("near_close_funnel")
     if isinstance(funnel, list):
         updated_funnel = [dict(stage) for stage in funnel if isinstance(stage, dict)]
@@ -843,6 +856,7 @@ def persist_scan_cycle(repository: ScannerRepository, result: ScanCycleResult, s
         excluded_family_cap_count=int(result.shortlist_diagnostics.get("excluded_family_cap_count", 0)),
         positive_edge_candidates_24h=int(result.shortlist_diagnostics.get("positive_edge_candidates_24h", 0)),
         near_close_funnel=result.shortlist_diagnostics.get("near_close_funnel", []),
+        scan_rejection_counts=result.shortlist_diagnostics.get("scan_rejection_counts", {}),
     )
     if settings is not None:
         repository.run_database_maintenance(
@@ -886,6 +900,7 @@ def persist_monitor_cycle(
         excluded_family_cap_count=int(result.shortlist_diagnostics.get("excluded_family_cap_count", 0)),
         positive_edge_candidates_24h=int(result.shortlist_diagnostics.get("positive_edge_candidates_24h", 0)),
         near_close_funnel=result.shortlist_diagnostics.get("near_close_funnel", []),
+        scan_rejection_counts=result.shortlist_diagnostics.get("scan_rejection_counts", {}),
     )
     if settings is not None:
         repository.run_database_maintenance(

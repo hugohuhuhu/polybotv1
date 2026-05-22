@@ -17,6 +17,7 @@ Implemented execution modes:
 - `scanner + alert` by default
 - optional paper trading
 - optional live trading adapter behind feature flags
+- optional near-close post-fill hedge shadow/live flow behind feature flags
 
 Persisted data:
 
@@ -178,6 +179,42 @@ Risk controls:
 - `MAX_NOTIONAL_PER_PLAN`
 - `MAX_DAILY_PAPER_NOTIONAL`
 - `MAX_DAILY_PAPER_TRADES`
+- `MAX_DAILY_LIVE_NOTIONAL`
+- `MAX_DAILY_LIVE_ORDERS`
+
+## Near-Close Crypto Up/Down Hedge Branch
+
+The crypto Up/Down near-close maker scan keeps the existing spread, depth, midpoint, start-distance, risk, preflight, and kill-switch filters. This branch tightens the entry price band for crypto Up/Down markets:
+
+- Entry target must be at least `NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE` (`0.86` by default).
+- Entry target is capped by `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE` (`0.95` by default).
+- The legacy `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE` still applies, so the effective cap is the lower of the two.
+
+The post-fill hedge flow is intentionally sequential. The bot never places the opposite-side hedge at the same time as the entry. It waits until the original near-close maker BUY is confirmed filled in `live_trades`, then evaluates an opposite-outcome BUY hedge.
+
+Example:
+
+```text
+Entry YES @ 0.90
+Hedge NO @ 0.03
+Locked profit if hedge fills = 1.00 - 0.90 - 0.03 = 0.07
+```
+
+Key hedge settings:
+
+- `NEAR_CLOSE_POST_FILL_HEDGE_ENABLED=false` by default; live hedge placement must be explicitly enabled.
+- `NEAR_CLOSE_POST_FILL_HEDGE_SHADOW_ENABLED=true` logs counterfactual hedge decisions when live placement is disabled.
+- `NEAR_CLOSE_HEDGE_DEFAULT_PRICE=0.03`
+- `NEAR_CLOSE_HEDGE_MIN_LOCKED_PROFIT=0.02`
+- `NEAR_CLOSE_HEDGE_MAX_BEST_ASK=0.03`
+- `NEAR_CLOSE_HEDGE_MIN_DEPTH=5`
+- `NEAR_CLOSE_HEDGE_MAX_SPREAD=0.05`
+- `NEAR_CLOSE_HEDGE_MIN_MINUTES_TO_END=0.25`
+- `NEAR_CLOSE_HEDGE_DYNAMIC_PRICING_ENABLED=false`
+
+The hedge respects the kill switch, daily/per-plan risk checks, market close checks, opposite-side liquidity, max ask, spread, and duplicate-order guard. Current risk accounting treats the hedge conservatively as another live order for daily limits; it does not weaken existing exposure controls.
+
+Risks: the hedge may not fill, the market can reverse before the hedge is submitted, opposite liquidity can disappear, the orderbook can be stale, and the CLOB V2 adapter can reject or normalize order details differently than expected. Shadow mode should be used first for counterfactual analysis.
 - `MAX_DAILY_LIVE_NOTIONAL`
 - `MAX_DAILY_LIVE_ORDERS`
 

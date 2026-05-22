@@ -413,6 +413,7 @@ function riskEventDetail(item) {
 }
 function executionEventPresentation(item) {
   const armed = Boolean(latestTradingState?.armed);
+  const status = String(item?.status || "").toLowerCase();
 
   if (item?.status === "preflight_blocked" && armed) {
     return {
@@ -433,13 +434,15 @@ function executionEventPresentation(item) {
   }
 
   const pillClass =
-    item?.status === "submitted"
+    status === "submitted"
       ? "ok"
-      : item?.status === "duplicate_claim"
+      : status === "duplicate_claim"
         ? "neutral"
-        : item?.status === "rearmed"
+        : status === "rearmed"
           ? "ok"
-          : "problem";
+          : status === "live_fills_synced"
+            ? "watch"
+            : "problem";
 
   return {
     pillClass,
@@ -823,12 +826,20 @@ function renderLiveOrders(orders) {
       const status = String(order.status || "unknown").toLowerCase();
       const statusClass = liveOrderStatusClass(status);
       const action = String(order.action || "").toUpperCase();
+      const hasNetPnl = order.net_pnl !== null && order.net_pnl !== undefined;
+      const displayValue = hasNetPnl
+        ? Number(order.net_exit_notional || 0) + Number(order.net_current_value || 0)
+        : order.current_value;
+      const displayPnl = hasNetPnl ? order.net_pnl : order.pnl;
+      const displayNotional = hasNetPnl ? order.net_entry_notional ?? order.notional : order.notional;
+      const valueTitle = hasNetPnl ? "回收" : "面值";
+      const pnlTitle = hasNetPnl ? "淨損益" : "損益";
       const valueLabel =
-        order.current_value === null || order.current_value === undefined
+        displayValue === null || displayValue === undefined
           ? "-"
-          : `${formatToken(order.current_value)} pUSD`;
+          : `${formatToken(displayValue)} pUSD`;
       const pnlLabel =
-        order.pnl === null || order.pnl === undefined ? "-" : `${formatSignedToken(order.pnl)} pUSD`;
+        displayPnl === null || displayPnl === undefined ? "-" : `${formatSignedToken(displayPnl)} pUSD`;
       const isMatched = ["matched", "settlement_pending", "finished"].includes(status);
       const title = escapeHtml(readableMarketName(order.market_slug));
       const marketTitle =
@@ -845,9 +856,9 @@ function renderLiveOrders(orders) {
             <span class="feed-pill ${statusClass}">${escapeHtml(executionStatusLabel(status))}</span>
           </header>
           <div class="order-card__metrics">
-            <span>部位 ${formatToken(order.notional)} pUSD</span>
-            <span>面值 ${valueLabel}</span>
-            <span>損益 ${pnlLabel}</span>
+            <span>部位 ${formatToken(displayNotional)} pUSD</span>
+            <span>${valueTitle} ${valueLabel}</span>
+            <span>${pnlTitle} ${pnlLabel}</span>
           </div>
           <time>${formatTime(order.created_at)}</time>
         </article>

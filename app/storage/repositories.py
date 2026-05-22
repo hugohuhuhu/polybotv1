@@ -144,6 +144,54 @@ class ScannerRepository:
                         ),
                     )
 
+    def latest_orderbooks_for_tokens(
+        self,
+        token_ids: Iterable[str],
+        *,
+        max_age_seconds: float | None = None,
+    ) -> dict[str, OrderBookSnapshot]:
+        normalized = sorted({str(token_id).strip() for token_id in token_ids if str(token_id).strip()})
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self.connection.fetchall(
+            f"""
+            SELECT obs.token_id,
+                   obs.market_id,
+                   obs.best_bid,
+                   obs.best_ask,
+                   obs.bids_json,
+                   obs.asks_json,
+                   obs.captured_at
+            FROM orderbook_snapshots obs
+            INNER JOIN (
+                SELECT token_id, MAX(captured_at) AS captured_at
+                FROM orderbook_snapshots
+                WHERE token_id IN ({placeholders})
+                GROUP BY token_id
+            ) latest
+              ON latest.token_id = obs.token_id
+             AND latest.captured_at = obs.captured_at
+            """,
+            tuple(normalized),
+        )
+        now_ts = self._now().timestamp()
+        books: dict[str, OrderBookSnapshot] = {}
+        for row in rows:
+            captured_ts = self._parse_iso_timestamp(row.get("captured_at"))
+            if max_age_seconds is not None and (captured_ts <= 0 or now_ts - captured_ts > max_age_seconds):
+                continue
+            captured_at = datetime.fromtimestamp(captured_ts, tz=timezone.utc) if captured_ts > 0 else self._now()
+            books[str(row["token_id"])] = OrderBookSnapshot(
+                token_id=str(row["token_id"]),
+                market_id=row.get("market_id"),
+                bids=self._load_json(row.get("bids_json"), []),
+                asks=self._load_json(row.get("asks_json"), []),
+                updated_at=captured_at,
+                source="stored",
+            )
+        return books
+
     def summarize_scan_cycles(self) -> int:
         rows = self.connection.fetchall(
             """
@@ -428,6 +476,7 @@ class ScannerRepository:
         excluded_family_cap_count: int = 0,
         positive_edge_candidates_24h: int = 0,
         near_close_funnel: list[dict[str, Any]] | None = None,
+        scan_rejection_counts: dict[str, int] | None = None,
     ) -> None:
         with self.connection.transaction():
             self.connection.execute(
@@ -436,8 +485,9 @@ class ScannerRepository:
                     executed_at, discovered_market_count, monitored_market_count, book_count,
                     opportunity_count, actionable_count, candidate_count, watch_bucket_counts_json,
                     shortlist_reason_counts_json, shortlist_markets_json, excluded_long_tail_count,
-                    excluded_family_cap_count, positive_edge_candidates_24h, near_close_funnel_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    excluded_family_cap_count, positive_edge_candidates_24h, near_close_funnel_json,
+                    scan_rejection_counts_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     to_isoformat(executed_at),
@@ -454,6 +504,7 @@ class ScannerRepository:
                     excluded_family_cap_count,
                     positive_edge_candidates_24h,
                     json.dumps(near_close_funnel or []),
+                    json.dumps(scan_rejection_counts or {}),
                 ),
             )
 
@@ -852,7 +903,7 @@ class ScannerRepository:
             FROM live_trades
             WHERE response_json LIKE ?
               AND UPPER(action) = 'BUY'
-              AND UPPER(status) = 'CANCEL_UNCONFIRMED'
+              AND UPPER(status) IN ('SUBMITTED', 'CANCEL_UNCONFIRMED')
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
@@ -860,7 +911,10 @@ class ScannerRepository:
         )
         for row in rows:
             response = self._load_json(row.get("response_json"), {})
-            if not isinstance(response, dict) or not self._cancel_detail_indicates_matched(response):
+            status = str(row["status"] or "").upper()
+            if not isinstance(response, dict):
+                continue
+            if status == "CANCEL_UNCONFIRMED" and not self._cancel_detail_indicates_matched(response):
                 continue
             token_id = str(row["token_id"] or "")
             if not token_id or self._has_stop_exit_for_token(token_id):
@@ -888,6 +942,8 @@ class ScannerRepository:
                     "entry_notional": price * size,
                     "exit_notional": 0.0,
                     "pending_match": True,
+                    "assumed_fill": status == "SUBMITTED",
+                    "source_order_id": row["order_id"],
                     "trades": [
                         {
                             "action": str(row["action"]).upper(),
@@ -983,7 +1039,7 @@ class ScannerRepository:
                     continue
                 exists = self.connection.fetchone(
                     """
-                    SELECT id, opportunity_id, order_id, status
+                    SELECT id, opportunity_id, order_id, status, response_json
                     FROM live_trades
                     WHERE opportunity_id = ? OR order_id = ?
                     LIMIT 1
@@ -1043,7 +1099,7 @@ class ScannerRepository:
                                 price,
                                 size,
                                 status,
-                                json.dumps(fill),
+                                json.dumps(self._merge_fill_response(exists.get("response_json"), fill, user_fill)),
                                 created_at,
                                 exists["id"],
                             ),
@@ -1075,6 +1131,133 @@ class ScannerRepository:
                 )
                 inserted += 1
         return inserted
+
+    def _merge_fill_response(
+        self,
+        existing_response_json: object,
+        fill: dict[str, Any],
+        user_fill: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing = self._load_json(existing_response_json, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        return {
+            **existing,
+            **fill,
+            "clob_fill": fill,
+            "user_fill": user_fill,
+        }
+
+    def _merge_activity_response(self, existing_response_json: object, activity: dict[str, Any]) -> dict[str, Any]:
+        existing = self._load_json(existing_response_json, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        return {
+            **existing,
+            **activity,
+            "activity_trade": activity,
+        }
+
+    def market_outcomes(self, market_slug: str) -> list[dict[str, str]]:
+        row = self.connection.fetchone(
+            """
+            SELECT outcome_labels_json, token_ids_json
+            FROM markets
+            WHERE slug = ?
+            ORDER BY discovered_at DESC
+            LIMIT 1
+            """,
+            (market_slug,),
+        )
+        if not row:
+            return []
+        labels = [str(value) for value in self._load_json(row.get("outcome_labels_json"), [])]
+        token_ids = [str(value) for value in self._load_json(row.get("token_ids_json"), [])]
+        return [
+            {"outcome_label": label, "token_id": token_id}
+            for label, token_id in zip(labels, token_ids, strict=False)
+            if token_id
+        ]
+
+    def hedge_order_exists_for_entry(self, entry_order_id: str) -> bool:
+        order_id = str(entry_order_id or "").strip()
+        if not order_id:
+            return True
+        row = self.connection.fetchone(
+            """
+            SELECT id
+            FROM live_trades
+            WHERE opportunity_id = ?
+               OR (response_json LIKE '%hedge_for_order_id%' AND response_json LIKE ?)
+            LIMIT 1
+            """,
+            (f"hedge:{order_id}", f"%{order_id}%"),
+        )
+        return row is not None
+
+    def near_close_filled_entries_without_hedge(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT live_trades.id,
+                   live_trades.opportunity_id,
+                   live_trades.action,
+                   live_trades.token_id,
+                   live_trades.market_slug,
+                   live_trades.outcome_label,
+                   live_trades.target_price,
+                   live_trades.requested_size,
+                   live_trades.order_id,
+                   live_trades.status,
+                   live_trades.response_json,
+                   live_trades.created_at,
+                   markets.market_id AS entry_market_id,
+                   markets.end_date,
+                   markets.active,
+                   markets.closed
+            FROM live_trades
+            LEFT JOIN markets ON markets.slug = live_trades.market_slug
+            WHERE live_trades.order_id IS NOT NULL
+              AND live_trades.opportunity_id NOT LIKE 'hedge:%'
+              AND UPPER(live_trades.action) = 'BUY'
+              AND UPPER(live_trades.status) IN ('CONFIRMED', 'MATCHED', 'FILLED', 'MINED')
+            ORDER BY live_trades.created_at DESC, live_trades.id DESC
+            LIMIT ?
+            """,
+            (max(limit * 3, limit),),
+        )
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            response = self._load_json(row.get("response_json"), {})
+            if not isinstance(response, dict):
+                response = {}
+            if response.get("hedge_role") == "post_fill_profit_lock":
+                continue
+            if response.get("strategy_variant") != "near_close_maker":
+                continue
+            order_id = str(row.get("order_id") or "")
+            if self.hedge_order_exists_for_entry(order_id):
+                continue
+            outcomes = self.market_outcomes(str(row.get("market_slug") or ""))
+            candidates.append(
+                {
+                    **row,
+                    "response": response,
+                    "market_outcomes": outcomes,
+                }
+            )
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    def near_close_hedge_watch_token_ids(self, limit: int = 50) -> list[str]:
+        token_ids: list[str] = []
+        for entry in self.near_close_filled_entries_without_hedge(limit=limit):
+            entry_token_id = str(entry.get("token_id") or "")
+            for outcome in entry.get("market_outcomes") or []:
+                token_id = str(outcome.get("token_id") or "")
+                if token_id and token_id != entry_token_id:
+                    token_ids.append(token_id)
+        return list(dict.fromkeys(token_ids))
 
     def save_polymarket_activity_trades(self, activities: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
         inserted = 0
@@ -1129,7 +1312,7 @@ class ScannerRepository:
 
                 local_order = self.connection.fetchone(
                     """
-                    SELECT id, opportunity_id, order_id, market_slug, outcome_label
+                    SELECT id, opportunity_id, order_id, market_slug, outcome_label, response_json
                     FROM live_trades
                     WHERE token_id = ?
                       AND UPPER(action) = ?
@@ -1159,7 +1342,7 @@ class ScannerRepository:
                             str(local_order["market_slug"] or market_slug),
                             str(local_order["outcome_label"] or outcome_label),
                             "CONFIRMED",
-                            json.dumps(activity),
+                            json.dumps(self._merge_activity_response(local_order.get("response_json"), activity)),
                             created_at,
                             local_order["id"],
                         ),
@@ -1283,6 +1466,326 @@ class ScannerRepository:
                 (status, *cleaned),
             )
         return int(getattr(cursor, "rowcount", 0) or 0)
+
+    def build_loss_autopsy(
+        self,
+        trade_ids: Iterable[int],
+        *,
+        risk_settings: dict[str, Any] | None = None,
+        settlement_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        cleaned = [int(value) for value in trade_ids]
+        if not cleaned:
+            return None
+        placeholders = ",".join("?" for _ in cleaned)
+        trades = [
+            dict(row)
+            for row in self.connection.fetchall(
+                f"""
+                SELECT id, opportunity_id, action, token_id, market_slug, outcome_label,
+                       target_price, requested_size, order_id, status, response_json, created_at
+                FROM live_trades
+                WHERE id IN ({placeholders})
+                ORDER BY created_at ASC, id ASC
+                """,
+                tuple(cleaned),
+            )
+        ]
+        if not trades:
+            return None
+
+        entry_trades = [row for row in trades if str(row.get("action") or "").upper() == "BUY"]
+        basis_rows = entry_trades or trades
+        token_id = str(basis_rows[0].get("token_id") or "")
+        market_slug = str(basis_rows[0].get("market_slug") or "")
+        outcome_label = str(basis_rows[0].get("outcome_label") or "")
+        opportunity_id = str(basis_rows[0].get("opportunity_id") or "")
+        created_at = str(basis_rows[0].get("created_at") or "")
+        total_size = sum(float(row.get("requested_size") or 0.0) for row in basis_rows)
+        entry_notional = sum(
+            float(row.get("target_price") or 0.0) * float(row.get("requested_size") or 0.0)
+            for row in basis_rows
+        )
+        entry_price = entry_notional / total_size if total_size > 1e-9 else None
+        response = self._load_json(basis_rows[0].get("response_json"), {})
+        if not isinstance(response, dict):
+            response = {}
+
+        books = self._loss_autopsy_orderbook_timeline(token_id, created_at)
+        related_events = self._loss_autopsy_related_events(
+            opportunity_id=opportunity_id,
+            market_slug=market_slug,
+            token_id=token_id,
+            created_at=created_at,
+        )
+        stop_events = [
+            event
+            for event in related_events
+            if str(event.get("opportunity_id") or "").startswith("stop-exit:")
+            or "near_close_stop_exit" in json.dumps(event.get("details") or {})
+            or "stop_exit" in str(event.get("status") or "")
+        ]
+        hedge_events = [
+            event
+            for event in related_events
+            if str(event.get("status") or "").startswith("hedge_")
+            or "near_close_post_fill_hedge" in json.dumps(event.get("details") or {})
+        ]
+        risk = dict(risk_settings or {})
+        taker_exit_price = self._float_or_none(risk.get("taker_exit_price"))
+        hard_stop_offset = self._float_or_none(risk.get("hard_stop_offset"))
+        stop_cross = self._loss_autopsy_first_stop_cross(
+            books,
+            entry_price=entry_price,
+            taker_exit_price=taker_exit_price,
+            hard_stop_offset=hard_stop_offset,
+        )
+        diagnosis = self._loss_autopsy_diagnosis(
+            entry_price=entry_price,
+            entry_notional=entry_notional,
+            stop_cross=stop_cross,
+            stop_events=stop_events,
+            hedge_events=hedge_events,
+            response=response,
+        )
+
+        autopsy_key = f"loss_autopsy:{market_slug}:{token_id}:{','.join(str(value) for value in cleaned)}"
+        return {
+            "autopsy_version": 1,
+            "autopsy_key": autopsy_key,
+            "reason": "settled_lost",
+            "trade_ids": cleaned,
+            "entry": {
+                "opportunity_id": opportunity_id,
+                "market_slug": market_slug,
+                "outcome_label": outcome_label,
+                "token_id": token_id,
+                "order_ids": [str(row.get("order_id") or "") for row in basis_rows if str(row.get("order_id") or "")],
+                "created_at": created_at,
+                "entry_price": entry_price,
+                "size": total_size,
+                "notional": entry_notional,
+                "minutes_to_resolution": response.get("minutes_to_resolution"),
+                "crypto_start_distance": response.get("crypto_start_distance"),
+                "crypto_winning_outcome_at_entry": response.get("crypto_winning_outcome"),
+                "entry_bid": response.get("entry_bid"),
+                "entry_ask": response.get("entry_ask"),
+                "current_bid_at_entry": response.get("current_bid"),
+                "current_midpoint_at_entry": response.get("current_midpoint"),
+            },
+            "risk_settings": risk,
+            "settlement": settlement_details or {},
+            "book_timeline": books,
+            "first_stop_cross": stop_cross,
+            "stop_exit": {
+                "attempted": bool(stop_events),
+                "events": stop_events,
+            },
+            "hedge": {
+                "observed": bool(hedge_events),
+                "events": hedge_events,
+            },
+            "diagnosis": diagnosis,
+        }
+
+    def save_loss_autopsy(
+        self,
+        trade_ids: Iterable[int],
+        *,
+        risk_settings: dict[str, Any] | None = None,
+        settlement_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        autopsy = self.build_loss_autopsy(
+            trade_ids,
+            risk_settings=risk_settings,
+            settlement_details=settlement_details,
+        )
+        if not autopsy:
+            return None
+        if self._loss_autopsy_exists(str(autopsy.get("autopsy_key") or "")):
+            return autopsy
+        self.save_execution_event(
+            source="autopsy",
+            mode="live",
+            opportunity_id=str(autopsy.get("entry", {}).get("opportunity_id") or ""),
+            status="loss_autopsy",
+            message="Settled-lost position autopsy recorded.",
+            details=autopsy,
+        )
+        return autopsy
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _loss_autopsy_exists(self, autopsy_key: str) -> bool:
+        if not autopsy_key:
+            return False
+        row = self.connection.fetchone(
+            """
+            SELECT 1
+            FROM execution_audit_log
+            WHERE status = 'loss_autopsy'
+              AND details_json LIKE ?
+            LIMIT 1
+            """,
+            (f"%{autopsy_key}%",),
+        )
+        return row is not None
+
+    def _loss_autopsy_orderbook_timeline(self, token_id: str, created_at: str) -> list[dict[str, Any]]:
+        if not token_id:
+            return []
+        rows = self.connection.fetchall(
+            """
+            SELECT best_bid, best_ask, midpoint, spread, bids_json, asks_json, captured_at
+            FROM orderbook_snapshots
+            WHERE token_id = ?
+              AND (? = '' OR captured_at >= ?)
+            ORDER BY captured_at ASC
+            LIMIT 60
+            """,
+            (token_id, created_at, created_at),
+        )
+        timeline: list[dict[str, Any]] = []
+        for row in rows:
+            bids = self._load_json(row.get("bids_json"), [])
+            asks = self._load_json(row.get("asks_json"), [])
+            best_bid = self._float_or_none(row.get("best_bid"))
+            timeline.append(
+                {
+                    "captured_at": row.get("captured_at"),
+                    "best_bid": best_bid,
+                    "best_ask": self._float_or_none(row.get("best_ask")),
+                    "midpoint": self._float_or_none(row.get("midpoint")),
+                    "spread": self._float_or_none(row.get("spread")),
+                    "top_bid_size": self._book_level_size_at_price(bids, best_bid),
+                    "bid_levels": bids[:5] if isinstance(bids, list) else [],
+                    "ask_levels": asks[:5] if isinstance(asks, list) else [],
+                }
+            )
+        return timeline
+
+    @staticmethod
+    def _book_level_size_at_price(levels: Any, price: float | None) -> float | None:
+        if price is None or not isinstance(levels, list):
+            return None
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            try:
+                if abs(float(level.get("price")) - price) < 1e-9:
+                    return float(level.get("size") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _loss_autopsy_related_events(
+        self,
+        *,
+        opportunity_id: str,
+        market_slug: str,
+        token_id: str,
+        created_at: str,
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id, source, mode, status, message, details_json, created_at
+            FROM execution_audit_log
+            WHERE (? = '' OR created_at >= ?)
+              AND (
+                (? != '' AND opportunity_id = ?)
+                OR (? != '' AND details_json LIKE ?)
+                OR (? != '' AND details_json LIKE ?)
+                OR (? != '' AND message LIKE ?)
+              )
+            ORDER BY created_at ASC, id ASC
+            LIMIT 80
+            """,
+            (
+                created_at,
+                created_at,
+                opportunity_id,
+                opportunity_id,
+                market_slug,
+                f"%{market_slug}%",
+                token_id,
+                f"%{token_id}%",
+                market_slug,
+                f"%{market_slug}%",
+            ),
+        )
+        return [
+            {
+                **dict(row),
+                "details": self._load_json(row.get("details_json"), {}),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _loss_autopsy_first_stop_cross(
+        books: list[dict[str, Any]],
+        *,
+        entry_price: float | None,
+        taker_exit_price: float | None,
+        hard_stop_offset: float | None,
+    ) -> dict[str, Any] | None:
+        for book in books:
+            best_bid = ScannerRepository._float_or_none(book.get("best_bid"))
+            midpoint = ScannerRepository._float_or_none(book.get("midpoint"))
+            reasons: list[str] = []
+            if best_bid is not None and taker_exit_price is not None and best_bid <= taker_exit_price:
+                reasons.append("deep_taker_exit")
+            if entry_price is not None and hard_stop_offset is not None:
+                threshold = entry_price - hard_stop_offset
+                if best_bid is not None and best_bid <= threshold:
+                    reasons.append("entry_relative_bid_stop")
+                if midpoint is not None and midpoint <= threshold:
+                    reasons.append("entry_relative_midpoint_stop")
+            if reasons:
+                return {
+                    "captured_at": book.get("captured_at"),
+                    "best_bid": best_bid,
+                    "midpoint": midpoint,
+                    "reasons": reasons,
+                }
+        return None
+
+    @staticmethod
+    def _loss_autopsy_diagnosis(
+        *,
+        entry_price: float | None,
+        entry_notional: float,
+        stop_cross: dict[str, Any] | None,
+        stop_events: list[dict[str, Any]],
+        hedge_events: list[dict[str, Any]],
+        response: dict[str, Any],
+    ) -> list[str]:
+        diagnosis: list[str] = []
+        if entry_notional > 0:
+            diagnosis.append("full_entry_notional_lost")
+        if entry_price is not None and entry_price >= 0.94:
+            diagnosis.append("high_entry_price_left_small_error_margin")
+        if stop_cross is not None and not stop_events:
+            diagnosis.append("stop_trigger_crossed_without_recorded_exit_attempt")
+        for event in stop_events:
+            message = str(event.get("message") or "").lower()
+            if "no orders found" in message or "fak" in message and "no match" in message:
+                diagnosis.append("stop_exit_fak_no_match")
+                break
+        if not hedge_events:
+            diagnosis.append("no_hedge_decision_recorded")
+        elif any(str(event.get("message") or "") == "too_close_to_resolution" for event in hedge_events):
+            diagnosis.append("hedge_skipped_too_close_to_resolution")
+        if response.get("crypto_winning_outcome") and response.get("outcome_label"):
+            diagnosis.append("entry_snapshot_had_directional_signal")
+        return list(dict.fromkeys(diagnosis))
 
     def get_trading_controls(self, defaults: TradingControls) -> TradingControls:
         row = self.connection.fetchone(
@@ -1426,6 +1929,7 @@ class ScannerRepository:
                    requested_size,
                    order_id,
                    status,
+                   response_json,
                    created_at
             FROM live_trades
             WHERE order_id IS NOT NULL
@@ -1455,6 +1959,36 @@ class ScannerRepository:
         if normalized in {"REDEEMED", "SETTLED_LOST"}:
             return "finished"
         return normalized.lower() or "unknown"
+
+    def _effective_live_trade_price(self, row: dict[str, Any]) -> float:
+        target_price = float(row.get("target_price") or 0.0)
+        response = self._load_json(row.get("response_json"), {})
+        if not isinstance(response, dict):
+            return target_price
+        token_id = str(row.get("token_id") or "")
+        action = str(row.get("action") or "").upper()
+        candidates = [
+            response.get("user_fill"),
+            response.get("activity_trade"),
+            response.get("clob_fill"),
+            response,
+        ]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_side = str(candidate.get("side") or "").upper()
+            if candidate_side and candidate_side != action:
+                continue
+            candidate_asset = str(candidate.get("asset_id") or candidate.get("asset") or "")
+            if candidate_asset and token_id and candidate_asset != token_id:
+                continue
+            try:
+                price = float(candidate.get("price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                return price
+        return target_price
 
     def recent_live_orders(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(
@@ -1633,6 +2167,7 @@ class ScannerRepository:
                    requested_size,
                    order_id,
                    status,
+                   response_json,
                    created_at
             FROM live_trades
             WHERE order_id IS NOT NULL
@@ -1646,7 +2181,7 @@ class ScannerRepository:
         query += " ORDER BY created_at ASC, id ASC"
         rows = self.connection.fetchall(query, params)
 
-        open_lots: dict[str, list[dict[str, float]]] = {}
+        open_lots: dict[str, list[dict[str, Any]]] = {}
         realized_pnl = 0.0
         matched_size = 0.0
         matched_trade_count = 0
@@ -1654,7 +2189,7 @@ class ScannerRepository:
         for row in rows:
             action = str(row["action"]).upper()
             size = float(row["requested_size"] or 0.0)
-            price = float(row["target_price"] or 0.0)
+            price = self._effective_live_trade_price(row)
             if size <= 0 or price <= 0:
                 continue
 
@@ -1666,14 +2201,13 @@ class ScannerRepository:
                 matched_trade_count += 1
                 continue
             if action == "BUY" and status == "SETTLED_LOST":
-                realized_pnl -= price * size
-                matched_size += size
-                matched_trade_count += 1
+                lots = open_lots.setdefault(key, [])
+                lots.append({"size": size, "price": price, "settled_lost": True})
                 continue
 
             lots = open_lots.setdefault(key, [])
             if action == "BUY":
-                lots.append({"size": size, "price": price})
+                lots.append({"size": size, "price": price, "settled_lost": False})
                 continue
             if action != "SELL":
                 continue
@@ -1692,6 +2226,20 @@ class ScannerRepository:
                     lots.pop(0)
             if sell_matched > 0:
                 matched_trade_count += 1
+
+        for key, lots in list(open_lots.items()):
+            remaining_lots: list[dict[str, Any]] = []
+            for lot in lots:
+                remaining_size = float(lot["size"])
+                if remaining_size <= 1e-9:
+                    continue
+                if bool(lot.get("settled_lost")):
+                    realized_pnl -= float(lot["price"]) * remaining_size
+                    matched_size += remaining_size
+                    matched_trade_count += 1
+                    continue
+                remaining_lots.append(lot)
+            open_lots[key] = remaining_lots
 
         open_size_total = sum(
             float(lot["size"])
@@ -1726,6 +2274,7 @@ class ScannerRepository:
                    requested_size,
                    order_id,
                    status,
+                   response_json,
                    created_at
             FROM live_trades
             WHERE order_id IS NOT NULL
@@ -1789,7 +2338,7 @@ class ScannerRepository:
             if row_time > str(group["latest_at"] or ""):
                 group["latest_at"] = row["created_at"]
                 group["latest_status"] = row["status"]
-            price = float(row["target_price"] or 0.0)
+            price = self._effective_live_trade_price(row)
             size = float(row["requested_size"] or 0.0)
             action = str(row["action"]).upper()
             status = str(row["status"]).upper()
@@ -1813,7 +2362,7 @@ class ScannerRepository:
                 group["sell_size"] += size
 
         for group in groups.values():
-            open_lots: list[dict[str, float]] = []
+            open_lots: list[dict[str, Any]] = []
             realized_pnl = 0.0
             redeemed_size = 0.0
             entry_notional = 0.0
@@ -1833,11 +2382,11 @@ class ScannerRepository:
                     continue
                 if action == "BUY" and status == "SETTLED_LOST":
                     entry_notional += price * size
-                    realized_pnl -= price * size
+                    open_lots.append({"size": size, "price": price, "settled_lost": True})
                     continue
                 if action == "BUY":
                     entry_notional += price * size
-                    open_lots.append({"size": size, "price": price})
+                    open_lots.append({"size": size, "price": price, "settled_lost": False})
                     continue
                 if action != "SELL":
                     continue
@@ -1851,6 +2400,14 @@ class ScannerRepository:
                     lot["size"] = float(lot["size"]) - matched
                     if lot["size"] <= 1e-9:
                         open_lots.pop(0)
+            remaining_lots: list[dict[str, Any]] = []
+            for lot in open_lots:
+                remaining_size = float(lot["size"])
+                if bool(lot.get("settled_lost")):
+                    realized_pnl -= float(lot["price"]) * remaining_size
+                    continue
+                remaining_lots.append(lot)
+            open_lots = remaining_lots
             group["redeemed_size"] = redeemed_size
             group["open_size"] = sum(float(lot["size"]) for lot in open_lots)
             group["open_cost_basis"] = sum(float(lot["size"]) * float(lot["price"]) for lot in open_lots)
@@ -2119,7 +2676,8 @@ class ScannerRepository:
                    excluded_long_tail_count,
                    excluded_family_cap_count,
                    positive_edge_candidates_24h,
-                   near_close_funnel_json
+                   near_close_funnel_json,
+                   scan_rejection_counts_json
             FROM scan_cycles
             ORDER BY executed_at DESC, id DESC
             LIMIT 1
@@ -2131,6 +2689,7 @@ class ScannerRepository:
         row["shortlist_reason_counts"] = self._load_json(row.get("shortlist_reason_counts_json"), {})
         row["shortlist_markets"] = self._load_json(row.get("shortlist_markets_json"), [])
         row["near_close_funnel"] = self._load_json(row.get("near_close_funnel_json"), [])
+        row["scan_rejection_counts"] = self._load_json(row.get("scan_rejection_counts_json"), {})
         return row
 
     def paper_risk_summary(self) -> dict[str, Any]:
@@ -2209,12 +2768,12 @@ class ScannerRepository:
         )
         by_market: dict[str, float] = {}
         by_position: dict[str, dict[str, Any]] = {}
-        open_lots: dict[str, list[dict[str, float]]] = {}
+        open_lots: dict[str, list[dict[str, Any]]] = {}
         total = 0.0
         for row in rows:
             action = str(row["action"] or "").upper()
             status = str(row["status"] or "").upper()
-            price = float(row["target_price"] or 0.0)
+            price = self._effective_live_trade_price(row)
             size = float(row["requested_size"] or 0.0)
             if price <= 0 or size <= 0:
                 continue
@@ -2226,7 +2785,7 @@ class ScannerRepository:
             if action == "BUY" and status == "SETTLED_LOST":
                 continue
             if action == "BUY":
-                lots.append({"size": size, "price": price})
+                lots.append({"size": size, "price": price, "settled_lost": False})
                 continue
             if action != "SELL":
                 continue
@@ -2388,6 +2947,7 @@ class ScannerRepository:
             "watch_bucket_counts": scan_row.get("watch_bucket_counts", {}),
             "shortlist_reason_counts": scan_row.get("shortlist_reason_counts", {}),
             "near_close_funnel": scan_row.get("near_close_funnel", []),
+            "scan_rejection_counts": scan_row.get("scan_rejection_counts", {}),
             "excluded_long_tail_count": scan_row.get("excluded_long_tail_count", 0),
             "excluded_family_cap_count": scan_row.get("excluded_family_cap_count", 0),
             "positive_edge_candidates_24h": scan_row.get(

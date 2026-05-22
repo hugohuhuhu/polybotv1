@@ -11,6 +11,8 @@ from pathlib import Path
 from time import sleep, time
 from typing import Any
 
+import httpx
+
 from app.alerts.console_alerts import ConsoleAlerts
 from app.alerts.telegram_alerts import TelegramAlerts
 from app.clients.clob_client import ClobClient
@@ -31,8 +33,9 @@ from app.storage.backups import backup_sqlite_database
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
-from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter
+from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, resolve_funder_address
 from app.strategy.near_close_order_manager import NearCloseOrderManager
+from app.strategy.post_fill_hedge import execute_post_fill_hedges
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
 from app.utils.logging_utils import configure_logging, get_logger
@@ -42,6 +45,8 @@ logger = get_logger(__name__)
 RUNTIME_LOG_DIR = Path(__file__).resolve().parent.parent / "runtime-logs"
 WATCH_PID_FILE = RUNTIME_LOG_DIR / "watch.pid"
 WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
+LIVE_FILL_ACTIVITY_LIMIT = 50
+WATCH_AUXILIARY_TIMEOUT_SEC = 12.0
 
 
 def _read_pid(pid_file: Path) -> int | None:
@@ -189,6 +194,74 @@ def _split_cancel_response(order_ids: list[str], response: object) -> tuple[list
     return canceled_ids, uncertain_ids
 
 
+async def _sync_live_fills_to_db(
+    *,
+    repository: ScannerRepository,
+    live_trader: PolymarketLiveTradingAdapter,
+    settings: Settings,
+) -> int:
+    funder_address = str(settings.polymarket_funder_address or "").strip()
+    if not funder_address and (settings.polymarket_private_key or "").strip():
+        funder_address = str(resolve_funder_address(settings, settings.polymarket_private_key or "") or "").strip()
+    if not funder_address:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{settings.polymarket_data_api_base_url.rstrip('/')}/activity",
+                params={"user": funder_address, "limit": LIVE_FILL_ACTIVITY_LIMIT},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        repository.save_execution_event(
+            source="watch",
+            mode="live",
+            opportunity_id=None,
+            status="fill_sync_failed",
+            message=str(exc),
+            details={"trigger": "watch_activity_fill_sync"},
+        )
+        return 0
+    activities = [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+    if not activities:
+        return 0
+    inserted = repository.save_polymarket_activity_trades(activities, wallet_address=funder_address)
+    if inserted:
+        repository.save_execution_event(
+            source="watch",
+            mode="live",
+            opportunity_id=None,
+            status="live_fills_synced",
+            message=f"Synced {inserted} public activity fill(s) before stop-exit checks.",
+            details={"fill_count": inserted},
+        )
+    return inserted
+
+
+def _stop_exit_result_needs_second_chance(live_result: object) -> bool:
+    status = str(getattr(live_result, "status", "") or "").lower()
+    if status not in {"failed", "partial_failure"}:
+        return False
+    message = str(getattr(live_result, "message", "") or "").lower()
+    return "no orders found" in message or "no match" in message or "fak order" in message
+
+
+def _fallback_stop_exit_book(
+    *,
+    repository: ScannerRepository,
+    settings: Settings,
+    token_id: str,
+) -> object | None:
+    if not settings.near_close_stop_exit_stale_orderbook_enabled:
+        return None
+    books = repository.latest_orderbooks_for_tokens(
+        [token_id],
+        max_age_seconds=max(float(settings.near_close_stop_exit_stale_orderbook_max_age_sec), 0.0),
+    )
+    return books.get(token_id)
+
+
 async def _execute_near_close_taker_exits(
     *,
     repository: ScannerRepository,
@@ -206,12 +279,48 @@ async def _execute_near_close_taker_exits(
         if "updown" not in market_slug:
             continue
         book = watch_books.get(token_id)
-        if book is None or not manager.taker_exit_required(book=book):
+        book_source = "watch"
+        if book is None:
+            book = _fallback_stop_exit_book(repository=repository, settings=settings, token_id=token_id)
+            book_source = "stored_orderbook" if book is not None else "missing"
+        size = float(group.get("open_size") or 0.0)
+        entry_price = 0.0
+        if size > 1e-9:
+            entry_price = float(group.get("open_cost_basis") or 0.0) / size
+        reference_price = manager.taker_exit_reference_price(book=book) if book is not None else None
+        if book is None or not manager.taker_exit_required(book=book, entry_price=entry_price):
             continue
         target_price = manager.taker_exit_price(book=book)
         if target_price is None or target_price <= 0:
             continue
-        size = float(group.get("open_size") or 0.0)
+        assumed_fill = bool(group.get("assumed_fill"))
+        source_order_id = str(group.get("source_order_id") or "").strip()
+        cancel_response = None
+        if assumed_fill and not settings.near_close_assume_submitted_filled_stop_exit:
+            continue
+        if assumed_fill and source_order_id:
+            try:
+                cancel_response = await live_trader.cancel_orders([source_order_id])
+                canceled_ids, uncertain_ids = _split_cancel_response([source_order_id], cancel_response)
+                if source_order_id in canceled_ids and source_order_id not in uncertain_ids:
+                    repository.mark_live_orders_cancelled(
+                        [source_order_id],
+                        status="qualification_cancelled",
+                        cancel_response=cancel_response,
+                    )
+                    exits.append(
+                        {
+                            "market_slug": market_slug,
+                            "token_id": token_id,
+                            "status": "entry_cancelled_before_assumed_stop_exit",
+                            "reference_price": reference_price,
+                            "target_price": target_price,
+                            "size": size,
+                        }
+                    )
+                    continue
+            except Exception as exc:
+                cancel_response = {"error": str(exc)}
         plan = ExecutionPlan(
             opportunity_id=f"stop-exit:{market_slug}:{token_id}",
             summary=f"Taker stop exit on {market_slug} at {target_price:.4f}",
@@ -228,7 +337,14 @@ async def _execute_near_close_taker_exits(
                     metadata={
                         "strategy_variant": "near_close_stop_exit",
                         "stop_trigger_price": settings.near_close_taker_exit_price,
-                        "stop_reference_price": target_price,
+                        "stop_reference_price": reference_price,
+                        "stop_entry_price": entry_price,
+                        "stop_limit_price": target_price,
+                        "stop_slippage": settings.near_close_emergency_slippage,
+                        "stop_orderbook_source": book_source,
+                        "assumed_fill_stop_exit": assumed_fill,
+                        "source_order_id": source_order_id or None,
+                        "source_cancel_response": cancel_response,
                     },
                 )
             ],
@@ -241,6 +357,70 @@ async def _execute_near_close_taker_exits(
         )
         live_result = await live_trader.execute(plan)
         repository.save_live_execution(live_result)
+        second_chance_result = None
+        second_chance_target = None
+        if settings.near_close_second_chance_exit_enabled and _stop_exit_result_needs_second_chance(live_result):
+            second_chance_target = max(float(settings.near_close_second_chance_exit_price), 0.01)
+            second_chance_plan = ExecutionPlan(
+                opportunity_id=f"stop-exit-second-chance:{market_slug}:{token_id}",
+                summary=f"Second-chance taker stop exit on {market_slug} at {second_chance_target:.4f}",
+                legs=[
+                    ExecutionLeg(
+                        action="SELL",
+                        token_id=token_id,
+                        market_slug=market_slug,
+                        outcome_label=str(group.get("outcome_label") or "Outcome"),
+                        target_price=second_chance_target,
+                        size=size,
+                        order_type="FAK",
+                        post_only=False,
+                        metadata={
+                            "strategy_variant": "near_close_stop_exit",
+                            "stop_exit_stage": "second_chance",
+                            "stop_trigger_price": settings.near_close_taker_exit_price,
+                            "stop_reference_price": reference_price,
+                            "stop_entry_price": entry_price,
+                            "stop_limit_price": second_chance_target,
+                            "first_stop_limit_price": target_price,
+                            "stop_orderbook_source": book_source,
+                            "first_stop_status": live_result.status,
+                            "first_stop_message": live_result.message,
+                            "assumed_fill_stop_exit": assumed_fill,
+                            "source_order_id": source_order_id or None,
+                            "source_cancel_response": cancel_response,
+                        },
+                    )
+                ],
+                max_slippage_bps=10.0,
+                cancel_conditions=["Second-chance stop exit should take any immediately available liquidity."],
+                requires_manual_approval=False,
+                live_trading_allowed=True,
+                strategy_type="near_close_stop_exit",
+                metadata={"market_slug": market_slug, "token_id": token_id, "stop_exit_stage": "second_chance"},
+            )
+            second_chance_result = await live_trader.execute(second_chance_plan)
+            repository.save_live_execution(second_chance_result)
+            repository.save_execution_event(
+                source="watch",
+                mode="live",
+                opportunity_id=second_chance_plan.opportunity_id,
+                status=second_chance_result.status,
+                message=second_chance_result.message,
+                details={
+                    "stop_exit_stage": "second_chance",
+                    "first_status": live_result.status,
+                    "first_message": live_result.message,
+                    "reference_price": reference_price,
+                    "entry_price": entry_price,
+                    "first_target_price": target_price,
+                    "target_price": second_chance_target,
+                    "orderbook_source": book_source,
+                    "assumed_fill_stop_exit": assumed_fill,
+                    "market_slug": market_slug,
+                    "token_id": token_id,
+                    "legs": [leg.model_dump() for leg in second_chance_result.leg_results],
+                },
+            )
         repository.save_execution_event(
             source="watch",
             mode="live",
@@ -249,7 +429,18 @@ async def _execute_near_close_taker_exits(
             message=live_result.message,
             details={
                 "stop_trigger_price": settings.near_close_taker_exit_price,
-                "reference_price": target_price,
+                "reference_price": reference_price,
+                "entry_price": entry_price,
+                "target_price": target_price,
+                "slippage": settings.near_close_emergency_slippage,
+                "orderbook_source": book_source,
+                "assumed_fill_stop_exit": assumed_fill,
+                "source_order_id": source_order_id or None,
+                "source_cancel_response": cancel_response,
+                "second_chance_enabled": settings.near_close_second_chance_exit_enabled,
+                "second_chance_attempted": second_chance_result is not None,
+                "second_chance_target_price": second_chance_target,
+                "second_chance_status": getattr(second_chance_result, "status", None),
                 "market_slug": market_slug,
                 "token_id": token_id,
                 "legs": [leg.model_dump() for leg in live_result.leg_results],
@@ -259,8 +450,11 @@ async def _execute_near_close_taker_exits(
             {
                 "market_slug": market_slug,
                 "token_id": token_id,
-                "status": live_result.status,
-                "reference_price": target_price,
+                "status": getattr(second_chance_result, "status", live_result.status),
+                "reference_price": reference_price,
+                "target_price": second_chance_target if second_chance_result is not None else target_price,
+                "first_target_price": target_price,
+                "second_chance_attempted": second_chance_result is not None,
                 "size": size,
             }
         )
@@ -275,6 +469,7 @@ def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
         token_id = str(group.get("token_id") or "").strip()
         if token_id:
             token_ids.append(token_id)
+    token_ids.extend(repository.near_close_hedge_watch_token_ids(limit=50))
     return list(dict.fromkeys(token_ids))
 
 
@@ -586,8 +781,14 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
     async def wait_with_scan_budget(awaitable: Any, loop_started_at: float) -> Any:
         remaining = settings.watch_scan_timeout_sec - (asyncio.get_running_loop().time() - loop_started_at)
         if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
             raise TimeoutError
         return await asyncio.wait_for(awaitable, timeout=remaining)
+
+    async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
+        return await asyncio.wait_for(awaitable, timeout=WATCH_AUXILIARY_TIMEOUT_SEC)
 
     while True:
         _touch_watch_liveness()
@@ -613,10 +814,39 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 )
                 for snapshot in initial.books.values():
                     book_state.upsert_snapshot(snapshot)
-                open_position_books = await wait_with_scan_budget(
-                    _fetch_open_position_books(settings=settings, repository=repository),
-                    loop_started_at,
-                )
+                try:
+                    await wait_for_watch_auxiliary(
+                        _sync_live_fills_to_db(repository=repository, live_trader=live_trader, settings=settings)
+                    )
+                except TimeoutError:
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="live_fill_sync_timeout",
+                        message=(
+                            f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                            "continuing watch loop."
+                        ),
+                        details={"timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC},
+                    )
+                try:
+                    open_position_books = await wait_for_watch_auxiliary(
+                        _fetch_open_position_books(settings=settings, repository=repository)
+                    )
+                except TimeoutError:
+                    open_position_books = {}
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="open_position_scan_timeout",
+                        message=(
+                            f"Open-position book refresh exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                            "continuing watch loop."
+                        ),
+                        details={"timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC},
+                    )
                 for snapshot in open_position_books.values():
                     book_state.upsert_snapshot(snapshot)
                 repository.get_trading_controls(default_controls)
@@ -759,31 +989,48 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 controls = repository.get_trading_controls(default_controls)
                 runtime_settings = controls.apply(settings)
                 try:
-                    open_position_books = await wait_with_scan_budget(
-                        _fetch_open_position_books(settings=runtime_settings, repository=repository),
-                        loop_started_at,
+                    await wait_for_watch_auxiliary(
+                        _sync_live_fills_to_db(
+                            repository=repository,
+                            live_trader=live_trader,
+                            settings=runtime_settings,
+                        )
                     )
                 except TimeoutError:
-                    repository.save_watch_heartbeat(
+                    repository.save_execution_event(
                         source="watch",
-                        state="timeout",
+                        mode="live",
+                        opportunity_id=None,
+                        status="live_fill_sync_timeout",
                         message=(
-                            f"watch open-position scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
-                            f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
+                            f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                            "continuing to opportunity execution."
                         ),
                         details={
-                            "phase": "timeout",
+                            "timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC,
                             "scan_started_at": scan_started_at.isoformat(),
-                            "timeout_sec": settings.watch_scan_timeout_sec,
-                            "delay_sec": settings.watch_timeout_retry_sec,
                         },
                     )
-                    await _watch_delay(
-                        settings,
-                        message="watch open-position scan timed out; delaying before the next scan",
-                        details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
+                try:
+                    open_position_books = await wait_for_watch_auxiliary(
+                        _fetch_open_position_books(settings=runtime_settings, repository=repository)
                     )
-                    continue
+                except TimeoutError:
+                    open_position_books = {}
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="open_position_scan_timeout",
+                        message=(
+                            f"Open-position book refresh exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                            "continuing to opportunity execution."
+                        ),
+                        details={
+                            "timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC,
+                            "scan_started_at": scan_started_at.isoformat(),
+                        },
+                    )
                 for snapshot in open_position_books.values():
                     book_state.upsert_snapshot(snapshot)
                 await ensure_websocket(list(book_state.books.keys()))
@@ -842,6 +1089,25 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                                     f"Redeemed {redeem_result.market_slug} / {redeem_result.outcome_label}: "
                                     f"{redeem_result.redeemed_size:.4f} shares."
                                 )
+                try:
+                    await execute_post_fill_hedges(
+                        repository=repository,
+                        live_trader=live_trader,
+                        settings=runtime_settings,
+                        controls=controls,
+                        watch_books=book_state.books,
+                        source="watch",
+                    )
+                except Exception as exc:
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="hedge_loop_failed",
+                        message=str(exc),
+                        details={},
+                    )
+                    logger.warning("Post-fill hedge loop failed", context={"error": str(exc)})
                 if controls.armed and (preflight is None or preflight.ready):
                     await _cancel_unqualified_near_close_orders(
                         cycle=cycle,
