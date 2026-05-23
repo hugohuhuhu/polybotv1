@@ -126,6 +126,18 @@ class Settings(BaseSettings):
         default=0.9,
         alias="NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER",
     )
+    near_close_weekend_crypto_updown_min_best_ask: float | None = Field(
+        default=None,
+        alias="NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK",
+    )
+    near_close_weekend_crypto_updown_min_midpoint: float | None = Field(
+        default=None,
+        alias="NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT",
+    )
+    near_close_weekend_crypto_updown_min_entry_price: float | None = Field(
+        default=None,
+        alias="NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE",
+    )
     near_close_gtd_seconds: int = Field(default=1800, alias="NEAR_CLOSE_GTD_SECONDS")
     near_close_gtd_safety_buffer_sec: int = Field(default=60, alias="NEAR_CLOSE_GTD_SAFETY_BUFFER_SEC")
     near_close_reprice_threshold: float = Field(default=0.003, alias="NEAR_CLOSE_REPRICE_THRESHOLD")
@@ -434,6 +446,31 @@ class Settings(BaseSettings):
         else:
             value = self.near_close_max_spread
         return self._weekend_scaled(value, self.near_close_weekend_spread_multiplier)
+
+    def effective_near_close_min_best_ask(self, variant: str | None = None) -> float:
+        if variant == "crypto_updown":
+            if self.near_close_weekend_mode_active() and self.near_close_weekend_crypto_updown_min_best_ask is not None:
+                return self.near_close_weekend_crypto_updown_min_best_ask
+            return self.near_close_crypto_updown_min_best_ask
+        if variant == "crypto":
+            return self.near_close_crypto_min_best_ask
+        return self.near_close_min_best_ask
+
+    def effective_near_close_min_midpoint(self, variant: str | None = None) -> float:
+        if variant == "crypto_updown":
+            if self.near_close_weekend_mode_active() and self.near_close_weekend_crypto_updown_min_midpoint is not None:
+                return self.near_close_weekend_crypto_updown_min_midpoint
+            return self.near_close_crypto_updown_min_midpoint
+        if variant == "crypto":
+            return self.near_close_crypto_min_midpoint
+        return self.near_close_min_midpoint
+
+    def effective_near_close_min_entry_price(self, variant: str | None = None) -> float:
+        if variant == "crypto_updown":
+            if self.near_close_weekend_mode_active() and self.near_close_weekend_crypto_updown_min_entry_price is not None:
+                return self.near_close_weekend_crypto_updown_min_entry_price
+            return self.near_close_crypto_updown_min_entry_price
+        return 0.0
 
     def effective_near_close_start_distance(self, value: float) -> float:
         return self._weekend_scaled(value, self.near_close_weekend_start_distance_multiplier)

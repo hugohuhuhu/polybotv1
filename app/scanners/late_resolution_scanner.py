@@ -126,11 +126,11 @@ class LateResolutionScanner:
             if crypto_start_distance < required_start_distance:
                 reject("start_distance_below_min")
                 return None
-            min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
-            min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
+            min_best_ask = self.settings.effective_near_close_min_best_ask(decision.variant)
+            min_midpoint = self.settings.effective_near_close_min_midpoint(decision.variant)
             max_spread = self.settings.effective_near_close_max_spread(decision.variant)
             order_size = self.settings.effective_near_close_order_size(decision.variant)
-            min_entry_price = self.settings.near_close_crypto_updown_min_entry_price
+            min_entry_price = self.settings.effective_near_close_min_entry_price(decision.variant)
             max_entry_price = self.settings.near_close_crypto_updown_max_entry_price
             max_bid_price = min(self.settings.near_close_crypto_updown_max_bid_price, max_entry_price)
             min_depth = self.settings.near_close_crypto_updown_min_depth
