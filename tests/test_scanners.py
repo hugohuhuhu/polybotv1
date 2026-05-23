@@ -597,8 +597,8 @@ def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
         NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
         NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
         NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
-        NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.75,
-        NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00055,
+        NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.21,
+        NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00012,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
         NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
@@ -623,9 +623,9 @@ def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
     assert len(opportunities) == 1
     assert opportunities[0].max_safe_size == 2.5
     assert opportunities[0].details["weekend_mode"] is True
-    assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.00225
+    assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.00063
     assert round(opportunities[0].details["effective_max_spread"], 6) == 0.04
-    assert round(settings.effective_near_close_start_distance(0.00085), 7) == 0.0006375
+    assert round(settings.effective_near_close_start_distance(0.00085), 7) == 0.0001785
     assert settings.effective_near_close_start_distance(0.00085) > settings.near_close_crypto_updown_cancel_start_distance
 
 
