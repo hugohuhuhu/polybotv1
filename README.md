@@ -205,14 +205,16 @@ Relevant settings:
 - `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`
-- `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00075` remains the cancellation line for already-active maker orders.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00055` remains the cancellation line for already-active maker orders in the local launch scripts.
 
 Weekend light mode is enabled by the local dashboard and watch launch scripts. At startup the scripts enable U.S. equity session mode, so the bot checks the NYSE regular core session (`9:30-16:00 America/New_York`, with weekends and market holidays closed). When U.S. equities are closed it keeps the normal entry path but uses effective near-close limits; when U.S. equities are open, the dashboard lights `高頻模式` and the unscaled near-close limits apply.
 
 - order size is multiplied by `NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER` (`0.5` in the launch scripts)
 - market, total, and position exposure limits are multiplied by `NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER` (`0.7`)
 - max spread is multiplied by `NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER` (`0.8`)
-- crypto Up/Down start-distance requirements are multiplied by `NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER` (`0.9`)
+- crypto Up/Down start-distance requirements are multiplied by `NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER` (`0.75` in the launch scripts)
+
+This is intentionally the only weekend criteria relaxation. Spread remains tightened by the weekend multiplier, depth stays unchanged, and the bid skip still prevents chasing `best_bid >= 0.96`. The lowest dynamic start-distance rung remains above the cancel line (`0.00085 * 0.75 = 0.0006375 > 0.00055`) so a newly eligible order does not immediately trip the start-distance cancel guard.
 
 The post-fill hedge flow is intentionally sequential. The bot never places the opposite-side hedge at the same time as the entry. It waits until the original near-close maker BUY is confirmed filled in `live_trades`, then evaluates an opposite-outcome BUY hedge.
 
