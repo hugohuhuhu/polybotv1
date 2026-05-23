@@ -210,12 +210,13 @@ Relevant settings:
 Weekend light mode is enabled by the local dashboard and watch launch scripts. At startup the scripts enable U.S. equity session mode, so the bot checks the NYSE regular core session (`9:30-16:00 America/New_York`, with weekends and market holidays closed). When U.S. equities are closed it keeps the normal entry path but uses effective near-close limits; when U.S. equities are open, the dashboard lights `高頻模式` and the unscaled near-close limits apply.
 
 - order size is multiplied by `NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER` (`0.5` in the launch scripts)
+- crypto Up/Down order size is overridden to `NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_ORDER_SIZE=5` in the launch scripts because the live CLOB rejects smaller sizes
 - market, total, and position exposure limits are multiplied by `NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER` (`0.7`)
 - max spread is multiplied by `NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER` (`0.8`)
 - crypto Up/Down start-distance requirements are multiplied by `NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER` (`0.15` in the launch scripts)
 - crypto Up/Down price heat is relaxed only in weekend light mode: min ask `0.78`, min midpoint `0.76`, and min entry `0.78`
 
-These weekend-only overrides do not apply in high-frequency mode. Spread remains tightened by the weekend multiplier, depth stays unchanged, and the bid skip still prevents chasing `best_bid >= 0.96`. Weekend qualification uses the effective half-size order size, so the half-size order does not fail the later actionable-size check. The lowest dynamic start-distance rung remains above the cancel line (`0.00085 * 0.15 = 0.0001275 > 0.00012`) so a newly eligible order does not immediately trip the start-distance live guard.
+These weekend-only overrides do not apply in high-frequency mode. Spread remains tightened by the weekend multiplier, depth stays unchanged, and the bid skip still prevents chasing `best_bid >= 0.96`. Weekend qualification uses the effective order size, so scanner sizing and actionable sizing stay aligned. The lowest dynamic start-distance rung remains above the cancel line (`0.00085 * 0.15 = 0.0001275 > 0.00012`) so a newly eligible order does not immediately trip the start-distance live guard.
 
 The post-fill hedge flow is intentionally sequential. The bot never places the opposite-side hedge at the same time as the entry. It waits until the original near-close maker BUY is confirmed filled in `live_trades`, then evaluates an opposite-outcome BUY hedge.
 

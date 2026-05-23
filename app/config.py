@@ -114,6 +114,10 @@ class Settings(BaseSettings):
         default=0.5,
         alias="NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER",
     )
+    near_close_weekend_crypto_updown_order_size: float | None = Field(
+        default=None,
+        alias="NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_ORDER_SIZE",
+    )
     near_close_weekend_exposure_multiplier: float = Field(
         default=0.7,
         alias="NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER",
@@ -431,6 +435,8 @@ class Settings(BaseSettings):
 
     def effective_near_close_order_size(self, variant: str | None = None) -> float:
         if variant == "crypto_updown":
+            if self.near_close_weekend_mode_active() and self.near_close_weekend_crypto_updown_order_size is not None:
+                return max(float(self.near_close_weekend_crypto_updown_order_size), 0.0)
             value = self.near_close_crypto_updown_order_size
         elif variant == "crypto":
             value = self.near_close_crypto_order_size

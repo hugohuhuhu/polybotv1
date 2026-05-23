@@ -669,11 +669,24 @@ def test_weekend_mode_qualifies_crypto_updown_half_size_order() -> None:
     assert opportunities[0].details["qualification_tier"] == "actionable"
 
 
+def test_weekend_mode_can_override_crypto_updown_size_for_clob_minimum() -> None:
+    settings = Settings(
+        NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+        NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+        NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
+        NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_ORDER_SIZE=5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
+    )
+
+    assert settings.effective_near_close_order_size("crypto_updown") == 5.0
+
+
 def test_high_frequency_mode_keeps_crypto_updown_price_heat_thresholds() -> None:
     settings = Settings(
         NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
         NEAR_CLOSE_WEEKEND_MODE_FORCE=False,
         NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
+        NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_ORDER_SIZE=7,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK=0.78,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
