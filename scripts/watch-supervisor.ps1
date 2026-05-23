@@ -36,7 +36,7 @@ Set-Location $repoRoot
 $env:SQLITE_PATH = $sqlitePath
 $env:SQLITE_BACKUP_DIR = $sqliteBackupDir
 $env:SCAN_INTERVAL_SEC = "30"
-$env:WATCH_SCAN_TIMEOUT_SEC = "60"
+$env:WATCH_SCAN_TIMEOUT_SEC = "120"
 $env:WATCH_TIMEOUT_RETRY_SEC = "30"
 $childStaleKillSec = [math]::Max(
     $childStaleKillSec,
