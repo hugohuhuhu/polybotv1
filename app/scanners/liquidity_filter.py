@@ -70,13 +70,13 @@ class LiquidityFilter:
         ):
             variant = opportunity.details.get("near_close_variant")
             if variant == "crypto_updown":
-                order_size = self.settings.near_close_crypto_updown_order_size
+                order_size = self.settings.effective_near_close_order_size("crypto_updown")
                 min_depth = self.settings.near_close_crypto_updown_min_depth
             elif variant == "crypto":
-                order_size = self.settings.near_close_crypto_order_size
+                order_size = self.settings.effective_near_close_order_size("crypto")
                 min_depth = self.settings.near_close_min_depth
             else:
-                order_size = self.settings.near_close_order_size
+                order_size = self.settings.effective_near_close_order_size()
                 min_depth = self.settings.near_close_min_depth
             return min(order_size, min_depth)
         return self.settings.candidate_min_depth if relaxed else self.settings.min_depth

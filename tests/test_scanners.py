@@ -597,7 +597,7 @@ def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
         NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
         NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
         NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
-        NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.21,
+        NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.15,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK=0.78,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
@@ -629,16 +629,51 @@ def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
     assert opportunities[0].details["cancel_if"]["best_ask_below"] == 0.78
     assert opportunities[0].details["cancel_if"]["midpoint_below"] == 0.76
     assert opportunities[0].details["min_entry_price"] == 0.78
-    assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.00063
+    assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.00045
     assert round(opportunities[0].details["effective_max_spread"], 6) == 0.04
-    assert round(settings.effective_near_close_start_distance(0.00085), 7) == 0.0001785
+    assert round(settings.effective_near_close_start_distance(0.00085), 7) == 0.0001275
     assert settings.effective_near_close_start_distance(0.00085) > settings.near_close_crypto_updown_cancel_start_distance
+
+
+def test_weekend_mode_qualifies_crypto_updown_half_size_order() -> None:
+    settings = Settings(
+        NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+        NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+        NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
+        NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK=0.78,
+        NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
+        NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    market = _make_crypto_updown_market(minutes_left=4, start_distance=0.01)
+
+    opportunities = run_scanners(
+        settings,
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.89, size=10),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11, size=10),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].max_safe_size == 2.5
+    assert opportunities[0].details["qualification_tier"] == "actionable"
 
 
 def test_high_frequency_mode_keeps_crypto_updown_price_heat_thresholds() -> None:
     settings = Settings(
         NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
         NEAR_CLOSE_WEEKEND_MODE_FORCE=False,
+        NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK=0.78,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
@@ -647,6 +682,7 @@ def test_high_frequency_mode_keeps_crypto_updown_price_heat_thresholds() -> None
     assert settings.effective_near_close_min_best_ask("crypto_updown") == 0.84
     assert settings.effective_near_close_min_midpoint("crypto_updown") == 0.84
     assert settings.effective_near_close_min_entry_price("crypto_updown") == 0.86
+    assert settings.effective_near_close_order_size("crypto_updown") == 5.0
 
 
 def test_weekend_mode_accepts_relaxed_crypto_updown_price_heat() -> None:
