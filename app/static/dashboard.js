@@ -22,6 +22,7 @@ const watchToggle = document.getElementById("watchToggle");
 const liveTradingToggle = document.getElementById("liveTradingToggle");
 const autoExecuteToggle = document.getElementById("autoExecuteToggle");
 const finishWorkButton = document.getElementById("finishWorkButton");
+const marketModeLights = document.getElementById("marketModeLights");
 const tradingCard = document.getElementById("tradingCard");
 const armedIndicator = document.getElementById("armedIndicator");
 const armedIndicatorTitle = armedIndicator?.querySelector("strong");
@@ -1042,6 +1043,7 @@ function renderTrading(trading, wallet, risk, preflight, persistence, watch) {
   tradingCard.classList.toggle("armed", armed);
   body.classList.toggle("armed-state", armed);
   renderWatchIndicator(latestTradingState, latestWatchState, risk);
+  renderMarketModeLights(latestTradingState.market_mode || risk?.market_mode || {});
 
   liveTradingToggle.textContent = liveEnabled ? TEXT.liveOn : TEXT.liveOff;
   autoExecuteToggle.textContent = autoEnabled ? TEXT.autoOn : TEXT.autoOff;
@@ -1143,6 +1145,21 @@ function renderPreflight(preflight) {
       `;
     })
     .join("");
+}
+
+function renderMarketModeLights(mode) {
+  if (!marketModeLights) {
+    return;
+  }
+  const activeMode = mode?.active_mode || (mode?.high_frequency_mode ? "high_frequency" : "weekend_light");
+  marketModeLights.querySelectorAll(".mode-light").forEach((item) => {
+    const isActive = item.dataset.mode === activeMode;
+    item.classList.toggle("active", isActive);
+    item.classList.toggle("muted", !isActive);
+  });
+  marketModeLights.title = mode?.us_equity_market_open
+    ? "美股 regular session 進行中，套用高頻模式。"
+    : "美股 regular session 未開盤，套用周末輕量模式。";
 }
 
 function formatParameterValue(item) {

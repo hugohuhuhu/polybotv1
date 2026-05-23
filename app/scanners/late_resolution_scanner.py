@@ -104,6 +104,7 @@ class LateResolutionScanner:
         midpoint = book.midpoint
         spread = book.spread
         decision = classify_near_close_market(market)
+        weekend_mode = self.settings.near_close_weekend_mode_active()
 
         def reject(reason: str) -> None:
             self._record_crypto_updown_rejection(market, outcome_label, reason, rejection_counts)
@@ -127,8 +128,8 @@ class LateResolutionScanner:
                 return None
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
-            max_spread = self.settings.near_close_crypto_updown_max_spread
-            order_size = self.settings.near_close_crypto_updown_order_size
+            max_spread = self.settings.effective_near_close_max_spread(decision.variant)
+            order_size = self.settings.effective_near_close_order_size(decision.variant)
             min_entry_price = self.settings.near_close_crypto_updown_min_entry_price
             max_entry_price = self.settings.near_close_crypto_updown_max_entry_price
             max_bid_price = min(self.settings.near_close_crypto_updown_max_bid_price, max_entry_price)
@@ -146,8 +147,8 @@ class LateResolutionScanner:
                 return None
             min_best_ask = self.settings.near_close_crypto_min_best_ask
             min_midpoint = self.settings.near_close_crypto_min_midpoint
-            max_spread = self.settings.near_close_crypto_max_spread
-            order_size = self.settings.near_close_crypto_order_size
+            max_spread = self.settings.effective_near_close_max_spread(decision.variant)
+            order_size = self.settings.effective_near_close_order_size(decision.variant)
             min_entry_price = 0.0
             max_bid_price = self.settings.near_close_max_bid_price
             min_depth = self.settings.near_close_min_depth
@@ -155,8 +156,8 @@ class LateResolutionScanner:
         else:
             min_best_ask = self.settings.near_close_min_best_ask
             min_midpoint = self.settings.near_close_min_midpoint
-            max_spread = self.settings.near_close_max_spread
-            order_size = self.settings.near_close_order_size
+            max_spread = self.settings.effective_near_close_max_spread(decision.variant)
+            order_size = self.settings.effective_near_close_order_size(decision.variant)
             min_entry_price = 0.0
             max_bid_price = self.settings.near_close_max_bid_price
             min_depth = self.settings.near_close_min_depth
@@ -251,6 +252,10 @@ class LateResolutionScanner:
             "resolution_source": market.resolution_source,
             "market_filter_reason": decision.reason,
             "near_close_variant": decision.variant,
+            "weekend_mode": weekend_mode,
+            "weekend_mode_name": "light" if weekend_mode else None,
+            "effective_order_size": order_size,
+            "effective_max_spread": max_spread,
             "restricted": bool(market.restricted),
             "crypto_spot_price": market.raw.get("near_close_crypto_spot_price"),
             "crypto_strike_price": market.raw.get("near_close_crypto_strike_price"),
@@ -276,8 +281,8 @@ class LateResolutionScanner:
             "order_type": "GTD",
             "expiration_sec": self.settings.near_close_gtd_seconds,
             "gtd_safety_buffer_sec": self.settings.near_close_gtd_safety_buffer_sec,
-            "max_market_exposure": self.settings.near_close_max_market_exposure,
-            "max_total_exposure": self.settings.near_close_max_total_exposure,
+            "max_market_exposure": self.settings.effective_near_close_max_market_exposure(),
+            "max_total_exposure": self.settings.effective_near_close_max_total_exposure(),
             "soft_stop_price": round(entry_bid - self.settings.near_close_soft_stop_offset, 6),
             "hard_stop_midpoint": round(entry_bid - self.settings.near_close_hard_stop_offset, 6),
             "hard_stop_bid": self.settings.near_close_hard_stop_bid,
@@ -348,14 +353,20 @@ class LateResolutionScanner:
     def _crypto_updown_required_start_distance(self, minutes_left: float) -> tuple[float, str]:
         static_threshold = float(self.settings.near_close_crypto_updown_min_start_distance)
         if not self.settings.near_close_crypto_updown_dynamic_start_distance_enabled:
-            return static_threshold, "static"
+            return self._apply_weekend_start_distance(static_threshold, "static")
 
         ladder = self._parse_start_distance_ladder(self.settings.near_close_crypto_updown_start_distance_ladder)
         for upper_minutes, threshold in ladder:
             if minutes_left <= upper_minutes:
-                return threshold, f"<= {upper_minutes:g}m"
+                return self._apply_weekend_start_distance(threshold, f"<= {upper_minutes:g}m")
         upper_minutes, threshold = ladder[-1]
-        return threshold, f"> {upper_minutes:g}m"
+        return self._apply_weekend_start_distance(threshold, f"> {upper_minutes:g}m")
+
+    def _apply_weekend_start_distance(self, threshold: float, rule: str) -> tuple[float, str]:
+        effective = self.settings.effective_near_close_start_distance(threshold)
+        if effective == threshold:
+            return threshold, rule
+        return effective, f"{rule} * weekend {self.settings.near_close_weekend_start_distance_multiplier:g}"
 
     @staticmethod
     def _parse_start_distance_ladder(raw_ladder: str) -> list[tuple[float, float]]:

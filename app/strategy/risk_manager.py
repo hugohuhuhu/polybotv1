@@ -145,12 +145,14 @@ class RiskManager:
         estimated_notional: float,
         leg_count: int,
     ) -> RiskDecision | None:
-        if estimated_notional > self.settings.near_close_order_size:
+        variant = str(plan.metadata.get("near_close_variant") or "")
+        max_order_notional = self.settings.effective_near_close_order_size(variant)
+        if estimated_notional > max_order_notional:
             return RiskDecision(
                 allowed=False,
                 reason=(
                     f"Near-close order notional {estimated_notional:.2f} exceeds "
-                    f"{self.settings.near_close_order_size:.2f} pUSD."
+                    f"{max_order_notional:.2f} pUSD."
                 ),
                 estimated_notional=estimated_notional,
                 projected_daily_notional=estimated_notional,
@@ -205,7 +207,7 @@ class RiskManager:
             float(first_leg.size) if first_leg else 0.0
         )
         total_exposure = float(exposure["total"]) + estimated_notional
-        if projected_position_size > self.settings.near_close_max_position_size:
+        if projected_position_size > self.settings.effective_near_close_max_position_size():
             return RiskDecision(
                 allowed=False,
                 reason="Near-close maker same-position size limit reached.",
@@ -213,7 +215,7 @@ class RiskManager:
                 projected_daily_notional=total_exposure,
                 projected_daily_orders=leg_count,
             )
-        if total_exposure > self.settings.near_close_max_total_exposure:
+        if total_exposure > self.settings.effective_near_close_max_total_exposure():
             return RiskDecision(
                 allowed=False,
                 reason="Near-close maker total exposure limit reached.",

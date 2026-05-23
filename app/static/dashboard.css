@@ -421,6 +421,46 @@ body.armed-state .status-chip.hot .status-dot {
   line-height: 1.2;
 }
 
+.mode-lights {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.2rem;
+}
+
+.mode-light {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 0.38rem;
+  min-height: 1.35rem;
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  line-height: 1.2;
+}
+
+.mode-light i {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: rgba(23, 38, 31, 0.18);
+  box-shadow: 0 0 0 0.2rem rgba(23, 38, 31, 0.06);
+}
+
+.mode-light.active {
+  color: var(--teal-deep);
+  font-weight: 700;
+}
+
+.mode-light.active i {
+  background: var(--teal);
+  box-shadow: 0 0 0 0.22rem rgba(14, 106, 104, 0.16), 0 0 0.7rem rgba(14, 106, 104, 0.35);
+}
+
+.mode-light[data-mode="weekend_light"].active i {
+  background: var(--rose);
+  box-shadow: 0 0 0 0.22rem rgba(171, 95, 88, 0.16), 0 0 0.7rem rgba(171, 95, 88, 0.35);
+}
+
 .hero-meta {
   display: grid;
   gap: 0.85rem;

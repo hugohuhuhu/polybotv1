@@ -10,6 +10,9 @@ $sqliteBackupDir = Join-Path $repoRoot "data"
 $logDir = Join-Path $repoRoot "runtime-logs"
 $serveStdoutLog = Join-Path $logDir "serve.stdout.log"
 $serveStderrLog = Join-Path $logDir "serve.stderr.log"
+$watchSupervisorScript = Join-Path $PSScriptRoot "watch-supervisor.ps1"
+$watchSupervisorStdoutLog = Join-Path $logDir "watch-supervisor.start.stdout.log"
+$watchSupervisorStderrLog = Join-Path $logDir "watch-supervisor.start.stderr.log"
 
 function Test-DashboardPortOpen {
     try {
@@ -73,6 +76,14 @@ $env:NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES = "75"
 $env:NEAR_CLOSE_ORDER_SIZE = "5"
 $env:NEAR_CLOSE_MAX_MARKET_EXPOSURE = "5"
 $env:NEAR_CLOSE_MAX_TOTAL_EXPOSURE = "25"
+$env:NEAR_CLOSE_WEEKEND_MODE_ENABLED = "true"
+$env:NEAR_CLOSE_US_MARKET_MODE_ENABLED = "true"
+$env:NEAR_CLOSE_US_MARKET_TIMEZONE = "America/New_York"
+$env:NEAR_CLOSE_WEEKEND_TIMEZONE = "Asia/Singapore"
+$env:NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER = "0.5"
+$env:NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER = "0.7"
+$env:NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER = "0.8"
+$env:NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER = "0.9"
 $env:NEAR_CLOSE_MAX_MINUTES_TO_END = "15"
 $env:NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END = "7"
 $env:NEAR_CLOSE_MIN_BEST_ASK = "0.98"
@@ -111,7 +122,7 @@ $env:SCAN_INTERVAL_SEC = "30"
 $env:WATCH_SCAN_TIMEOUT_SEC = "60"
 $env:WATCH_TIMEOUT_RETRY_SEC = "30"
 
-Write-Host "[1/2] Starting dashboard..."
+Write-Host "[1/3] Starting dashboard..."
 Stop-WatchFromPidFiles
 $cleanupScript = Join-Path $PSScriptRoot "cleanup-near-close-orders.ps1"
 if (Test-Path $cleanupScript) {
@@ -126,7 +137,17 @@ if (-not (Test-DashboardPortOpen)) {
         -RedirectStandardError $serveStderrLog | Out-Null
 }
 
-Write-Host "[2/2] Opening browser..."
+Write-Host "[2/3] Starting watch supervisor..."
+if (Test-Path $watchSupervisorScript) {
+    Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$watchSupervisorScript`"" `
+        -WorkingDirectory $repoRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $watchSupervisorStdoutLog `
+        -RedirectStandardError $watchSupervisorStderrLog | Out-Null
+}
+
+Write-Host "[3/3] Opening browser..."
 Start-Sleep -Milliseconds 800
 Start-Process $url
 Write-Host "Done. If the dashboard is still loading, refresh the browser in a few seconds."

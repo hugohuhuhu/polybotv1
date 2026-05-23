@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v27" />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v28" />
   </head>
   <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
     <div class="ambient ambient-a"></div>
@@ -111,6 +111,10 @@
             <article class="toggle-card">
               <span class="toggle-card__label">收工</span>
               <button class="control-button caution" id="finishWorkButton" type="button">收工</button>
+              <div class="mode-lights" id="marketModeLights" aria-label="美股時段模式">
+                <span class="mode-light" data-mode="weekend_light"><i aria-hidden="true"></i>周末輕量模式</span>
+                <span class="mode-light" data-mode="high_frequency"><i aria-hidden="true"></i>高頻模式</span>
+              </div>
             </article>
           </div>
         </article>
@@ -311,7 +315,7 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v27" defer></script>
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v28" defer></script>
   </body>
 </html>
 

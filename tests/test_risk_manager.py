@@ -44,10 +44,13 @@ def make_near_close_plan(
     size: float = 5.0,
     price: float = 0.97,
     minutes_to_resolution: float | None = None,
+    variant: str | None = None,
 ) -> ExecutionPlan:
     metadata = {"strategy_variant": "near_close_maker"}
     if minutes_to_resolution is not None:
         metadata["minutes_to_resolution"] = minutes_to_resolution
+    if variant is not None:
+        metadata["near_close_variant"] = variant
     return ExecutionPlan(
         opportunity_id="near-close",
         summary="near close",
@@ -265,3 +268,71 @@ def test_risk_manager_counts_pending_near_close_size_per_position(tmp_path) -> N
 
     assert decision.allowed is False
     assert "same-position" in decision.reason
+
+
+def test_risk_manager_uses_weekend_order_size_limit_for_crypto_updown(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-weekend-order.db"))
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+            NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+            NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
+            NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5.0,
+            MAX_NOTIONAL_PER_PLAN=100.0,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(size=5.0, price=0.95, variant="crypto_updown"),
+        repository,
+        mode="paper",
+    )
+
+    assert decision.allowed is False
+    assert "2.50 pUSD" in decision.reason
+
+
+def test_risk_manager_uses_weekend_total_exposure_limit(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-weekend-exposure.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="existing-near-close",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="yes",
+                    market_slug="risk-market",
+                    outcome_label="Yes",
+                    target_price=0.97,
+                    requested_size=6.0,
+                    order_id="near-close-open",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+            NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+            NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=1.0,
+            NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER=0.5,
+            NEAR_CLOSE_MAX_TOTAL_EXPOSURE=15.0,
+            NEAR_CLOSE_MAX_POSITION_SIZE=20.0,
+            NEAR_CLOSE_ORDER_SIZE=10.0,
+            MAX_NOTIONAL_PER_PLAN=100.0,
+        )
+    )
+
+    decision = manager.assess(make_near_close_plan(size=2.0, price=0.97), repository, mode="live")
+
+    assert decision.allowed is False
+    assert "total exposure" in decision.reason

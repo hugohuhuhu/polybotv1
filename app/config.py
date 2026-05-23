@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -104,6 +105,27 @@ class Settings(BaseSettings):
     near_close_max_position_size: float = Field(default=10.0, alias="NEAR_CLOSE_MAX_POSITION_SIZE")
     near_close_daily_loss_limit: float = Field(default=2.0, alias="NEAR_CLOSE_DAILY_LOSS_LIMIT")
     near_close_max_consecutive_losses: int = Field(default=2, alias="NEAR_CLOSE_MAX_CONSECUTIVE_LOSSES")
+    near_close_weekend_mode_enabled: bool = Field(default=False, alias="NEAR_CLOSE_WEEKEND_MODE_ENABLED")
+    near_close_weekend_mode_force: bool | None = Field(default=None, alias="NEAR_CLOSE_WEEKEND_MODE_FORCE")
+    near_close_weekend_timezone: str = Field(default="Asia/Singapore", alias="NEAR_CLOSE_WEEKEND_TIMEZONE")
+    near_close_us_market_mode_enabled: bool = Field(default=False, alias="NEAR_CLOSE_US_MARKET_MODE_ENABLED")
+    near_close_us_market_timezone: str = Field(default="America/New_York", alias="NEAR_CLOSE_US_MARKET_TIMEZONE")
+    near_close_weekend_order_size_multiplier: float = Field(
+        default=0.5,
+        alias="NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER",
+    )
+    near_close_weekend_exposure_multiplier: float = Field(
+        default=0.7,
+        alias="NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER",
+    )
+    near_close_weekend_spread_multiplier: float = Field(
+        default=0.8,
+        alias="NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER",
+    )
+    near_close_weekend_start_distance_multiplier: float = Field(
+        default=0.9,
+        alias="NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER",
+    )
     near_close_gtd_seconds: int = Field(default=1800, alias="NEAR_CLOSE_GTD_SECONDS")
     near_close_gtd_safety_buffer_sec: int = Field(default=60, alias="NEAR_CLOSE_GTD_SAFETY_BUFFER_SEC")
     near_close_reprice_threshold: float = Field(default=0.003, alias="NEAR_CLOSE_REPRICE_THRESHOLD")
@@ -341,6 +363,154 @@ class Settings(BaseSettings):
     @property
     def persistence_backend(self) -> str:
         return "postgresql" if self.database_url else "sqlite"
+
+    def near_close_weekend_mode_active(self, at: datetime | None = None) -> bool:
+        if self.near_close_weekend_mode_force is not None:
+            return bool(self.near_close_weekend_mode_force)
+        if not self.near_close_weekend_mode_enabled:
+            return False
+        if self.near_close_us_market_mode_enabled:
+            return not self.us_equity_market_open(at)
+        current = at or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        try:
+            local_time = current.astimezone(ZoneInfo(self.near_close_weekend_timezone))
+        except ZoneInfoNotFoundError:
+            local_time = current.astimezone(timezone.utc)
+        return local_time.weekday() >= 5
+
+    def near_close_high_frequency_mode_active(self, at: datetime | None = None) -> bool:
+        if self.near_close_weekend_mode_force is True:
+            return False
+        if self.near_close_weekend_mode_force is False:
+            return True
+        return bool(self.near_close_us_market_mode_enabled and self.us_equity_market_open(at))
+
+    def market_mode_payload(self, at: datetime | None = None) -> dict[str, object]:
+        current = at or datetime.now(timezone.utc)
+        market_open = self.us_equity_market_open(current)
+        light_mode = self.near_close_weekend_mode_active(current)
+        high_frequency = self.near_close_high_frequency_mode_active(current)
+        return {
+            "source": "nyse_core_session" if self.near_close_us_market_mode_enabled else "weekend_calendar",
+            "us_equity_market_open": market_open,
+            "weekend_light_mode": light_mode,
+            "high_frequency_mode": high_frequency,
+            "active_mode": "high_frequency" if high_frequency else "weekend_light" if light_mode else "standard",
+            "checked_at": current.astimezone(timezone.utc).isoformat(),
+            "timezone": self.near_close_us_market_timezone,
+        }
+
+    def us_equity_market_open(self, at: datetime | None = None) -> bool:
+        current = at or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        try:
+            local_time = current.astimezone(ZoneInfo(self.near_close_us_market_timezone))
+        except ZoneInfoNotFoundError:
+            local_time = current.astimezone(timezone.utc)
+        local_day = local_time.date()
+        if local_day.weekday() >= 5 or local_day in self._us_equity_market_holidays(local_day.year):
+            return False
+        market_open = time(9, 30)
+        market_close = time(13, 0) if local_day in self._us_equity_market_early_closes(local_day.year) else time(16, 0)
+        return market_open <= local_time.time() < market_close
+
+    def effective_near_close_order_size(self, variant: str | None = None) -> float:
+        if variant == "crypto_updown":
+            value = self.near_close_crypto_updown_order_size
+        elif variant == "crypto":
+            value = self.near_close_crypto_order_size
+        else:
+            value = self.near_close_order_size
+        return self._weekend_scaled(value, self.near_close_weekend_order_size_multiplier)
+
+    def effective_near_close_max_spread(self, variant: str | None = None) -> float:
+        if variant == "crypto_updown":
+            value = self.near_close_crypto_updown_max_spread
+        elif variant == "crypto":
+            value = self.near_close_crypto_max_spread
+        else:
+            value = self.near_close_max_spread
+        return self._weekend_scaled(value, self.near_close_weekend_spread_multiplier)
+
+    def effective_near_close_start_distance(self, value: float) -> float:
+        return self._weekend_scaled(value, self.near_close_weekend_start_distance_multiplier)
+
+    def effective_near_close_max_market_exposure(self) -> float:
+        return self._weekend_scaled(self.near_close_max_market_exposure, self.near_close_weekend_exposure_multiplier)
+
+    def effective_near_close_max_total_exposure(self) -> float:
+        return self._weekend_scaled(self.near_close_max_total_exposure, self.near_close_weekend_exposure_multiplier)
+
+    def effective_near_close_max_position_size(self) -> float:
+        return self._weekend_scaled(self.near_close_max_position_size, self.near_close_weekend_exposure_multiplier)
+
+    def _weekend_scaled(self, value: float, multiplier: float) -> float:
+        numeric = max(float(value), 0.0)
+        if not self.near_close_weekend_mode_active():
+            return numeric
+        return max(numeric * max(float(multiplier), 0.0), 0.0)
+
+    @classmethod
+    def _us_equity_market_holidays(cls, year: int) -> set[date]:
+        return {
+            cls._observed(date(year, 1, 1)),
+            cls._nth_weekday(year, 1, 0, 3),
+            cls._nth_weekday(year, 2, 0, 3),
+            cls._easter_date(year) - timedelta(days=2),
+            cls._last_weekday(year, 5, 0),
+            cls._observed(date(year, 6, 19)),
+            cls._observed(date(year, 7, 4)),
+            cls._nth_weekday(year, 9, 0, 1),
+            cls._nth_weekday(year, 11, 3, 4),
+            cls._observed(date(year, 12, 25)),
+            cls._observed(date(year + 1, 1, 1)),
+        }
+
+    @classmethod
+    def _us_equity_market_early_closes(cls, year: int) -> set[date]:
+        thanksgiving = cls._nth_weekday(year, 11, 3, 4)
+        christmas_eve = date(year, 12, 24)
+        return {thanksgiving + timedelta(days=1), christmas_eve}
+
+    @staticmethod
+    def _observed(day: date) -> date:
+        if day.weekday() == 5:
+            return day - timedelta(days=1)
+        if day.weekday() == 6:
+            return day + timedelta(days=1)
+        return day
+
+    @staticmethod
+    def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> date:
+        current = date(year, month, 1)
+        offset = (weekday - current.weekday()) % 7
+        return current + timedelta(days=offset + 7 * (occurrence - 1))
+
+    @staticmethod
+    def _last_weekday(year: int, month: int, weekday: int) -> date:
+        current = date(year + 1, 1, 1) - timedelta(days=1) if month == 12 else date(year, month + 1, 1) - timedelta(days=1)
+        return current - timedelta(days=(current.weekday() - weekday) % 7)
+
+    @staticmethod
+    def _easter_date(year: int) -> date:
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        month = (h + l - 7 * m + 114) // 31
+        day = ((h + l - 7 * m + 114) % 31) + 1
+        return date(year, month, day)
 
 
 def get_settings() -> Settings:

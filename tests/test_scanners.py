@@ -56,6 +56,30 @@ def test_settings_clamps_near_close_gtd_to_gemini_30m() -> None:
     assert Settings(NEAR_CLOSE_GTD_SECONDS=5400).near_close_gtd_seconds == 1800
 
 
+def test_settings_switches_light_mode_when_us_equity_market_is_closed() -> None:
+    settings = Settings(NEAR_CLOSE_WEEKEND_MODE_ENABLED=True, NEAR_CLOSE_US_MARKET_MODE_ENABLED=True)
+    saturday = datetime(2026, 5, 23, 15, 0, tzinfo=timezone.utc)
+
+    payload = settings.market_mode_payload(saturday)
+
+    assert payload["us_equity_market_open"] is False
+    assert payload["weekend_light_mode"] is True
+    assert payload["high_frequency_mode"] is False
+    assert payload["active_mode"] == "weekend_light"
+
+
+def test_settings_switches_high_frequency_mode_during_us_equity_market_hours() -> None:
+    settings = Settings(NEAR_CLOSE_WEEKEND_MODE_ENABLED=True, NEAR_CLOSE_US_MARKET_MODE_ENABLED=True)
+    friday_core_session = datetime(2026, 5, 22, 15, 0, tzinfo=timezone.utc)
+
+    payload = settings.market_mode_payload(friday_core_session)
+
+    assert payload["us_equity_market_open"] is True
+    assert payload["weekend_light_mode"] is False
+    assert payload["high_frequency_mode"] is True
+    assert payload["active_mode"] == "high_frequency"
+
+
 def test_binary_sum_scanner_detects_underround() -> None:
     settings = Settings(MIN_NET_EDGE=0.001, MIN_DEPTH=10, MAX_SPREAD=0.2)
     scanner = BinarySumArbScanner(settings, LiquidityFilter(settings))
@@ -565,6 +589,72 @@ def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladde
 
         assert opportunities == []
         assert rejection_counts == {"start_distance_below_min": 1}
+
+
+def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
+    settings = Settings(
+        NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+        NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+        NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
+        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
+        NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.9,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=30, start_distance=0.0028)
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].max_safe_size == 2.5
+    assert opportunities[0].details["weekend_mode"] is True
+    assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.0027
+    assert round(opportunities[0].details["effective_max_spread"], 6) == 0.04
+
+
+def test_weekend_mode_rejects_crypto_updown_spread_after_tightening() -> None:
+    settings = Settings(
+        NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
+        NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
+        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=30, start_distance=0.01)
+    rejection_counts: dict[str, int] = {}
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.84, ask=0.885, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+        },
+        rejection_counts=rejection_counts,
+    )
+
+    assert opportunities == []
+    assert rejection_counts == {"spread_above_max": 1}
 
 
 def _make_crypto_updown_market(*, minutes_left: float, start_distance: float) -> MarketRecord:
