@@ -975,6 +975,34 @@ def test_late_resolution_scanner_accepts_small_crypto_updown_distance_and_depth(
     assert opportunities[0].available_liquidity == 12
 
 
+def test_late_resolution_scanner_falls_back_to_best_bid_when_tick_would_cross() -> None:
+    settings = Settings(
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.04,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=4, start_distance=0.01)
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.869, ask=0.87, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.12, ask=0.13, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].prices["entry_bid"] == 0.869
+    assert opportunities[0].details["entry_bid"] < opportunities[0].details["entry_ask"]
+    assert "fallback best_bid" in opportunities[0].details["entry_formula"]
+
+
 def test_run_scanners_keeps_small_crypto_updown_order_size() -> None:
     settings = Settings(
         NEAR_CLOSE_CRYPTO_ENABLED=True,

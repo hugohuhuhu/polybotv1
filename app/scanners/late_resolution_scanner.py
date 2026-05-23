@@ -192,6 +192,11 @@ class LateResolutionScanner:
                 midpoint - self.settings.near_close_crypto_updown_midpoint_discount,
             )
         entry_bid = self._floor_to_tick(min(entry_candidate, max_bid_price), tick)
+        if entry_bid >= best_ask:
+            passive_entry = self._floor_to_tick(min(best_bid, max_bid_price), tick)
+            if passive_entry > 0 and passive_entry < best_ask:
+                entry_bid = passive_entry
+                entry_formula = f"{entry_formula}; fallback best_bid to avoid crossing"
         if entry_bid < min_entry_price or entry_bid > max_bid_price:
             reject("entry_price_out_of_range")
             return None
