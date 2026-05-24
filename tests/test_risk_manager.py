@@ -116,6 +116,38 @@ def test_risk_manager_blocks_live_after_daily_budget(tmp_path) -> None:
     assert "MAX_DAILY_LIVE_NOTIONAL" in decision.reason
 
 
+def test_risk_manager_allows_live_when_daily_notional_cap_disabled(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-live-no-notional-cap.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="existing-live",
+            status="submitted",
+            message="ok",
+            order_type="FOK",
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="yes",
+                    market_slug="risk-market",
+                    outcome_label="Yes",
+                    target_price=0.50,
+                    requested_size=100.0,
+                    order_id="live-1",
+                    status="submitted",
+                    response={"ok": True},
+                )
+            ],
+        )
+    )
+    manager = RiskManager(Settings(MAX_DAILY_LIVE_NOTIONAL=0.0, MAX_NOTIONAL_PER_PLAN=1000.0))
+
+    decision = manager.assess(make_plan(size=80.0, price=0.45), repository, mode="live")
+
+    assert decision.allowed is True
+    assert decision.projected_daily_notional == 122.0
+
+
 def test_risk_manager_does_not_block_live_on_daily_order_count(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "risk-live-orders.db"))
     repository.save_live_execution(

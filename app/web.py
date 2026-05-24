@@ -477,7 +477,11 @@ def _trading_parameters_payload(
         diagnostics.append({"level": "watch", "label": "候選尚未進入 Live 時間窗", "detail": f"最新列表有 {latest_actionable_count} 個 actionable，但沒有 tradable_live；目前 Live 只在結束前 {settings.near_close_live_max_minutes_to_end:g} 分鐘內送單。"})
     if heartbeat_details.get("previous_phase") == "timeout" or latest_heartbeat.get("state") == "timeout":
         diagnostics.append({"level": "watch", "label": "watch 最近 timeout", "detail": f"單輪掃描超過 {settings.watch_scan_timeout_sec:.0f} 秒會 drop，之後 delay {settings.watch_timeout_retry_sec:.0f} 秒再掃。"})
-    if float(risk_summary.get("live_notional_today") or 0.0) >= float(settings.max_daily_live_notional):
+    live_notional_limit_enabled = settings.max_daily_live_notional > 0
+    if (
+        live_notional_limit_enabled
+        and float(risk_summary.get("live_notional_today") or 0.0) >= float(settings.max_daily_live_notional)
+    ):
         diagnostics.append({"level": "blocked", "label": "Live 金額上限", "detail": "今日 Live 名目金額已達上限。"})
     if int(risk_summary.get("live_orders_today") or 0) >= int(settings.max_daily_live_orders):
         diagnostics.append({"level": "blocked", "label": "Live 筆數上限", "detail": "今日 Live 送單筆數已達上限。"})
@@ -588,7 +592,14 @@ def _trading_parameters_payload(
                 "title": "風控",
                 "items": [
                     {"label": "單筆上限", "value": settings.max_notional_per_plan, "unit": "pUSD"},
-                    {"label": "今日 Live 金額", "value": f"{float(risk_summary.get('live_notional_today') or 0):g} / {settings.max_daily_live_notional:g} pUSD"},
+                    {
+                        "label": "今日 Live 金額",
+                        "value": (
+                            f"{float(risk_summary.get('live_notional_today') or 0):g} / {settings.max_daily_live_notional:g} pUSD"
+                            if live_notional_limit_enabled
+                            else f"{float(risk_summary.get('live_notional_today') or 0):g} / no daily cap"
+                        ),
+                    },
                     {"label": "今日 Live 筆數", "value": f"{int(risk_summary.get('live_orders_today') or 0)} / {settings.max_daily_live_orders}"},
                     {"label": "今日 paper 金額", "value": f"{float(risk_summary.get('paper_notional_today') or 0):g} / {settings.max_daily_paper_notional:g} pUSD"},
                     {"label": "今日 paper 筆數", "value": f"{int(risk_summary.get('paper_trades_today') or 0)} / {settings.max_daily_paper_trades}"},

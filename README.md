@@ -179,7 +179,7 @@ Risk controls:
 - `MAX_NOTIONAL_PER_PLAN`
 - `MAX_DAILY_PAPER_NOTIONAL`
 - `MAX_DAILY_PAPER_TRADES`
-- `MAX_DAILY_LIVE_NOTIONAL`
+- `MAX_DAILY_LIVE_NOTIONAL` (`<=0` disables this daily notional cap)
 - `MAX_DAILY_LIVE_ORDERS`
 
 ## Near-Close Crypto Up/Down Hedge Branch
@@ -217,6 +217,8 @@ Weekend light mode is enabled by the local dashboard and watch launch scripts. A
 - crypto Up/Down price heat is relaxed only in weekend light mode: min ask `0.78`, min midpoint `0.76`, and min entry `0.78`
 
 These weekend-only overrides do not apply in high-frequency mode. Spread remains tightened by the weekend multiplier, depth stays unchanged, and the bid skip still prevents chasing `best_bid >= 0.96`. Weekend qualification uses the effective order size, so scanner sizing and actionable sizing stay aligned. The lowest dynamic start-distance rung remains above the cancel line (`0.00085 * 0.15 = 0.0001275 > 0.00012`) so a newly eligible order does not immediately trip the start-distance live guard.
+
+For the continuous-order weekend test mode, the local launch scripts set `MAX_DAILY_LIVE_NOTIONAL=0`, which disables only the daily live notional cap. The kill switch, per-order cap, daily order count cap, post-only checks, spread/depth filters, exposure limits, and live preflight still apply.
 
 The post-fill hedge flow is intentionally sequential. The bot never places the opposite-side hedge at the same time as the entry. It waits until the original near-close maker BUY is confirmed filled in `live_trades`, then evaluates an opposite-outcome BUY hedge.
 

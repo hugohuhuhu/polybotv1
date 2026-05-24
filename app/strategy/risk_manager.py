@@ -117,7 +117,7 @@ class RiskManager:
         summary = repository.live_risk_summary()
         projected_notional = float(summary["live_notional_today"]) + estimated_notional
         projected_orders = int(summary["live_orders_today"]) + leg_count
-        if projected_notional > self.settings.max_daily_live_notional:
+        if self.settings.max_daily_live_notional > 0 and projected_notional > self.settings.max_daily_live_notional:
             return RiskDecision(
                 allowed=False,
                 reason=(

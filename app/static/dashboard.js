@@ -1068,9 +1068,11 @@ function renderTrading(trading, wallet, risk, preflight, persistence, watch) {
     tradingSummary.textContent = "\u76ee\u524d\u662f\u7d14\u6383\u63cf\u6a21\u5f0f\uff0c\u5c1a\u672a\u555f\u7528 Live \u4ea4\u6613\u3002";
   }
 
+  const liveNotionalCap = Number(risk?.max_daily_live_notional || 0);
+  const liveNotionalLimitText = liveNotionalCap > 0 ? formatToken(liveNotionalCap) : "no daily cap";
   riskSummaryNote.textContent = killSwitchEnabled
     ? "Kill switch \u5df2\u555f\u7528\uff0c\u6240\u6709 Live \u9001\u55ae\u90fd\u6703\u88ab\u963b\u64cb\u3002"
-    : `\u7d19\u4e0a ${formatToken(risk?.paper_notional_today)} / ${formatToken(risk?.max_daily_paper_notional)}\uff0cLive ${formatToken(risk?.live_notional_today)} / ${formatToken(risk?.max_daily_live_notional)}\uff0c\u55ae\u7b46\u4e0a\u9650 ${formatToken(risk?.max_notional_per_plan)}\u3002 Near-close maker\uff1a${formatNumber(risk?.near_close?.signal_count || 0)} / ${formatNumber(risk?.near_close?.paper_required || 100)} paper signals\uff0c\u66dd\u96aa ${formatToken(risk?.near_close?.live_exposure || 0)} / ${formatToken(risk?.near_close?.max_total_exposure || 3)} pUSD\u3002`;
+    : `\u7d19\u4e0a ${formatToken(risk?.paper_notional_today)} / ${formatToken(risk?.max_daily_paper_notional)}\uff0cLive ${formatToken(risk?.live_notional_today)} / ${liveNotionalLimitText}\uff0c\u55ae\u7b46\u4e0a\u9650 ${formatToken(risk?.max_notional_per_plan)}\u3002 Near-close maker\uff1a${formatNumber(risk?.near_close?.signal_count || 0)} / ${formatNumber(risk?.near_close?.paper_required || 100)} paper signals\uff0c\u66dd\u96aa ${formatToken(risk?.near_close?.live_exposure || 0)} / ${formatToken(risk?.near_close?.max_total_exposure || 3)} pUSD\u3002`;
 
   const banners = [];
   if (killSwitchEnabled) {
