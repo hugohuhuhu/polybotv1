@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from app.models.core import EventRecord, LiveExecutionResult, MarketRecord, Opportunity, OrderBookSnapshot, PaperTradeResult
@@ -986,6 +986,28 @@ class ScannerRepository:
             return str(row["slug"]), str(label or outcome_label or "Unknown")
         return f"clob-market-{token_id[-8:]}", str(outcome_label or "Unknown")
 
+    def _recent_market_lookup_by_token(self, limit: int = 2500) -> dict[str, tuple[str, str]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT slug, outcome_labels_json, token_ids_json
+            FROM markets
+            ORDER BY discovered_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        lookup: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            slug = str(row["slug"])
+            token_ids = [str(value) for value in self._load_json(row.get("token_ids_json"), [])]
+            labels = [str(value) for value in self._load_json(row.get("outcome_labels_json"), [])]
+            for index, token in enumerate(token_ids):
+                if not token or token in lookup:
+                    continue
+                label = labels[index] if index < len(labels) else "Unknown"
+                lookup[token] = (slug, str(label or "Unknown"))
+        return lookup
+
     def save_clob_fills(self, fills: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
         inserted = 0
         wallet = str(wallet_address or "").lower().strip()
@@ -1400,11 +1422,37 @@ class ScannerRepository:
             )
         )
 
-    def save_polymarket_activity_trades(self, activities: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
+    def save_polymarket_activity_trades(
+        self,
+        activities: Iterable[dict[str, Any]],
+        wallet_address: str | None = None,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> int:
         inserted = 0
         wallet = str(wallet_address or "").lower().strip()
+        market_lookup: dict[str, tuple[str, str]] | None = None
+
+        def report_progress() -> None:
+            if progress_callback is not None:
+                progress_callback()
+
+        def resolve_market(token_id: str, fallback_label: str | None = None) -> tuple[str, str]:
+            nonlocal market_lookup
+            if market_lookup is None:
+                report_progress()
+                market_lookup = self._recent_market_lookup_by_token()
+                report_progress()
+            market_slug, outcome_label = market_lookup.get(
+                token_id,
+                (f"clob-market-{token_id[-8:]}", str(fallback_label or "Unknown")),
+            )
+            if outcome_label == "Unknown" and fallback_label:
+                outcome_label = fallback_label
+            return market_slug, outcome_label
+
         with self.connection.transaction():
             for activity in activities:
+                report_progress()
                 if str(activity.get("type") or "").upper().strip() != "TRADE":
                     continue
                 proxy_wallet = str(activity.get("proxyWallet") or "").lower().strip()
@@ -1449,6 +1497,7 @@ class ScannerRepository:
                         ("CONFIRMED", json.dumps(activity), created_at, existing_tx["id"]),
                     )
                     inserted += 1
+                    report_progress()
                     continue
 
                 local_order = self.connection.fetchone(
@@ -1465,8 +1514,16 @@ class ScannerRepository:
                     """,
                     (token_id, action, price, created_at),
                 )
-                market_slug, outcome_label = self._market_for_token(token_id, str(activity.get("outcome") or "Unknown"))
+                activity_slug = str(activity.get("slug") or "").strip()
+                activity_outcome = str(activity.get("outcome") or "").strip()
                 if local_order:
+                    if str(local_order["market_slug"] or "") and str(local_order["outcome_label"] or ""):
+                        market_slug = str(local_order["market_slug"])
+                        outcome_label = str(local_order["outcome_label"])
+                    elif activity_slug and activity_outcome:
+                        market_slug, outcome_label = activity_slug, activity_outcome
+                    else:
+                        market_slug, outcome_label = resolve_market(token_id, activity_outcome or "Unknown")
                     self.connection.execute(
                         """
                         UPDATE live_trades
@@ -1489,8 +1546,13 @@ class ScannerRepository:
                         ),
                     )
                     inserted += 1
+                    report_progress()
                     continue
 
+                if activity_slug and activity_outcome:
+                    market_slug, outcome_label = activity_slug, activity_outcome
+                else:
+                    market_slug, outcome_label = resolve_market(token_id, activity_outcome or "Unknown")
                 self.connection.execute(
                     """
                     INSERT INTO live_trades (
@@ -1503,8 +1565,8 @@ class ScannerRepository:
                         1,
                         action,
                         token_id,
-                        str(activity.get("slug") or market_slug),
-                        str(activity.get("outcome") or outcome_label),
+                        market_slug,
+                        outcome_label,
                         price,
                         size,
                         f"data-api:{transaction_hash}:{token_id}:{action}",
@@ -1514,6 +1576,7 @@ class ScannerRepository:
                     ),
                 )
                 inserted += 1
+                report_progress()
         return inserted
 
     def redeem_candidate_live_trades(self, limit: int = 50) -> list[dict[str, Any]]:

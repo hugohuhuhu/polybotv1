@@ -227,7 +227,18 @@ async def _sync_live_fills_to_db(
     activities = [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
     if not activities:
         return 0
-    inserted = repository.save_polymarket_activity_trades(activities, wallet_address=funder_address)
+    sync_task = asyncio.create_task(
+        asyncio.to_thread(
+            repository.save_polymarket_activity_trades,
+            activities,
+            wallet_address=funder_address,
+            progress_callback=_touch_watch_liveness,
+        )
+    )
+    while not sync_task.done():
+        _touch_watch_liveness()
+        await asyncio.wait({sync_task}, timeout=5.0)
+    inserted = sync_task.result()
     if inserted:
         repository.save_execution_event(
             source="watch",
@@ -843,16 +854,43 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         websocket_task = asyncio.create_task(websocket_client.subscribe_forever(normalized_asset_ids))
 
     async def wait_with_scan_budget(awaitable: Any, loop_started_at: float) -> Any:
-        remaining = settings.watch_scan_timeout_sec - (asyncio.get_running_loop().time() - loop_started_at)
-        if remaining <= 0:
-            close = getattr(awaitable, "close", None)
-            if callable(close):
-                close()
-            raise TimeoutError
-        return await asyncio.wait_for(awaitable, timeout=remaining)
+        task = asyncio.create_task(awaitable)
+        try:
+            while not task.done():
+                _touch_watch_liveness()
+                remaining = settings.watch_scan_timeout_sec - (asyncio.get_running_loop().time() - loop_started_at)
+                if remaining <= 0:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise TimeoutError
+                done, _pending = await asyncio.wait({task}, timeout=min(5.0, remaining))
+                if done:
+                    break
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
-        return await asyncio.wait_for(awaitable, timeout=WATCH_AUXILIARY_TIMEOUT_SEC)
+        task = asyncio.create_task(awaitable)
+        try:
+            deadline = asyncio.get_running_loop().time() + WATCH_AUXILIARY_TIMEOUT_SEC
+            while not task.done():
+                _touch_watch_liveness()
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise TimeoutError
+                done, _pending = await asyncio.wait({task}, timeout=min(5.0, remaining))
+                if done:
+                    break
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
 
     while True:
         _touch_watch_liveness()

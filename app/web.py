@@ -42,6 +42,7 @@ from app.utils.execution_utils import build_execution_claim_key
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME_LOG_DIR = BASE_DIR.parent / "runtime-logs"
 WATCH_PID_FILE = RUNTIME_LOG_DIR / "watch.pid"
+WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
 WATCH_SUPERVISOR_PID_FILE = RUNTIME_LOG_DIR / "watch-supervisor.pid"
 WATCH_SCRIPT_PATH = BASE_DIR.parent / "scripts" / "watch-supervisor.ps1"
 DASHBOARD_COMPONENT_TIMEOUT_SEC = 2.5
@@ -782,6 +783,12 @@ def build_watch_status(
     if heartbeat_dt is not None:
         heartbeat_age_sec = max((now - heartbeat_dt).total_seconds(), 0.0)
         heartbeat_fresh = heartbeat_age_sec <= max_scan_lag_sec
+    liveness_dt = _file_mtime_utc(WATCH_LIVENESS_FILE)
+    liveness_age_sec = None
+    liveness_fresh = False
+    if liveness_dt is not None:
+        liveness_age_sec = max((now - liveness_dt).total_seconds(), 0.0)
+        liveness_fresh = liveness_age_sec <= max_scan_lag_sec
     phase = str(heartbeat_details.get("phase") or heartbeat_state or "")
     pid_updated_at = _file_mtime_utc(WATCH_PID_FILE) or _file_mtime_utc(WATCH_SUPERVISOR_PID_FILE)
     startup_age_sec = None
@@ -789,14 +796,14 @@ def build_watch_status(
         startup_age_sec = max((now - pid_updated_at).total_seconds(), 0.0)
     startup_grace_sec = max(settings.watch_scan_timeout_sec + 15, 45)
 
-    running = watch_running and (scan_recent or heartbeat_fresh)
-    if watch_running and heartbeat_fresh and phase == "scanning":
+    running = watch_running and (scan_recent or heartbeat_fresh or liveness_fresh)
+    if watch_running and (heartbeat_fresh or liveness_fresh) and phase == "scanning":
         state = "running"
         message = heartbeat_message or "watch 正在掃描。"
-    elif watch_running and heartbeat_fresh and phase == "delay":
+    elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "delay":
         state = "running"
         message = heartbeat_message or "watch 掃描完成，正在 delay 30 秒。"
-    elif watch_running and heartbeat_fresh and phase == "timeout":
+    elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "timeout":
         state = "running"
         message = heartbeat_message or "watch 上一輪掃描超時，正在等待下一輪。"
     elif running:
@@ -828,6 +835,7 @@ def build_watch_status(
         "latest_scan_at": latest_scan_at,
         "last_scan_age_sec": round(last_scan_age_sec, 1) if last_scan_age_sec is not None else None,
         "heartbeat_age_sec": round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        "liveness_age_sec": round(liveness_age_sec, 1) if liveness_age_sec is not None else None,
         "phase": phase,
         "phase_started_at": heartbeat_details.get("scan_started_at") or heartbeat_details.get("delay_started_at"),
         "phase_until": heartbeat_details.get("delay_until"),
