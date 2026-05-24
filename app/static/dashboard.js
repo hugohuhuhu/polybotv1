@@ -620,8 +620,8 @@ function renderSummary(summary) {
   const cards = [
     {
       label: "\u5df2\u63a2\u7d22\u5e02\u5834",
-      value: formatNumber(summary.total_markets || summary.latest_discovered_market_count),
-      footnote: `\u6700\u8fd1\u63a2\u7d22\uff1a${formatTime(summary.latest_discovered_at)}`,
+      value: formatNumber(summary.latest_discovered_market_count || 0),
+      footnote: `\u6700\u8fd1\u63a2\u7d22\uff1a${formatTime(summary.latest_discovered_at)}\uff0c\u7d2f\u8a08 ${formatNumber(summary.total_markets)} \u500b`,
     },
     {
       label: "\u5373\u6642\u76e3\u770b\u4e2d",
