@@ -531,6 +531,93 @@ def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
     activity_order = next(order for order in repository.recent_live_orders(limit=10) if order["order_id"] == "0xlocalorder")
     assert activity_order["transaction_hash"] == "0xtx"
 
+    duplicate_created_at = datetime(2026, 5, 24, 8, 29, 31, tzinfo=timezone.utc)
+    assert repository.save_polymarket_activity_trades(
+        [
+            {
+                "proxyWallet": "0xabc",
+                "timestamp": int(duplicate_created_at.timestamp()),
+                "type": "TRADE",
+                "size": 3.285453,
+                "usdcSize": 2.562654,
+                "transactionHash": "0xduplicatetx",
+                "price": 0.78000020088554,
+                "asset": "duplicate-token",
+                "side": "BUY",
+                "slug": "sol-updown-5m-1779611100",
+                "outcome": "Up",
+            }
+        ],
+        wallet_address="0xABC",
+    ) == 1
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="local-maker-after-activity",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=duplicate_created_at - timedelta(seconds=2),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="duplicate-token",
+                    market_slug="sol-updown-5m-1779611100",
+                    outcome_label="Up",
+                    target_price=0.78000020088554,
+                    requested_size=3.285453,
+                    order_id="0xlocalmaker",
+                    status="submitted",
+                )
+            ],
+        )
+    )
+    assert repository.save_clob_fills(
+        [
+            {
+                "id": "fill-duplicate",
+                "transactionHash": "0xduplicatetx",
+                "taker_order_id": "0xcounterparty",
+                "asset_id": "counterparty-token",
+                "side": "SELL",
+                "size": "3.285453",
+                "price": "0.21999979911446",
+                "status": "CONFIRMED",
+                "outcome": "Down",
+                "maker_orders": [
+                    {
+                        "order_id": "0xlocalmaker",
+                        "maker_address": "0xabc",
+                        "asset_id": "duplicate-token",
+                        "side": "BUY",
+                        "matched_amount": "3.285453",
+                        "price": "0.78000020088554",
+                        "outcome": "Up",
+                    }
+                ],
+                "match_time": str(int(duplicate_created_at.timestamp())),
+            }
+        ],
+        wallet_address="0xABC",
+    ) == 1
+    duplicate_rows = repository.connection.fetchall(
+        """
+        SELECT order_id, status
+        FROM live_trades
+        WHERE response_json LIKE ?
+        ORDER BY order_id
+        """,
+        ("%0xduplicatetx%",),
+    )
+    assert {row["order_id"]: row["status"] for row in duplicate_rows} == {
+        "0xlocalmaker": "CONFIRMED",
+        "data-api:0xduplicatetx:duplicate-token:BUY": "MISATTRIBUTED_FILL_IGNORED",
+    }
+    duplicate_group = next(
+        group for group in repository.live_trade_groups(limit=10) if group["market_slug"] == "sol-updown-5m-1779611100"
+    )
+    assert round(float(duplicate_group["entry_notional"]), 6) == 2.562654
+
     latest = repository.latest_opportunities(limit=5)
     assert latest[0]["qualification_tier"] == "actionable"
     assert latest[0]["title"].startswith("[可直接警示]")

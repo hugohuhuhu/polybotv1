@@ -1026,6 +1026,17 @@ class ScannerRepository:
                         if maker_address == wallet:
                             user_fill = {**fill, **maker_order}
                             selected_maker_order = True
+                            maker_order_id = str(maker_order.get("order_id") or "").strip()
+                            if maker_order_id:
+                                local_order = self.connection.fetchone(
+                                    """
+                                    SELECT id, market_slug, outcome_label
+                                    FROM live_trades
+                                    WHERE order_id = ?
+                                    LIMIT 1
+                                    """,
+                                    (maker_order_id,),
+                                )
                             break
                 if user_fill is fill and isinstance(maker_orders, list):
                     for maker_order in maker_orders:
@@ -1084,6 +1095,7 @@ class ScannerRepository:
 
                 market_slug, outcome_label = self._market_for_token(token_id, str(user_fill.get("outcome") or "Unknown"))
                 match_time = fill.get("match_time") or fill.get("created_at")
+                transaction_hash = self._transaction_hash_from_payload(fill)
                 created_at = self._now().isoformat()
                 if match_time is not None:
                     try:
@@ -1097,6 +1109,7 @@ class ScannerRepository:
                 if exists:
                     existing_status = str(exists["status"] or "").upper()
                     if existing_status in {"REDEEMED", "SETTLED_LOST", "MISATTRIBUTED_FILL_IGNORED"}:
+                        self._ignore_duplicate_activity_trade_rows(transaction_hash, keep_id=int(exists["id"]))
                         continue
                     if str(exists["order_id"] or "") == order_id:
                         self.connection.execute(
@@ -1126,10 +1139,11 @@ class ScannerRepository:
                                 exists["id"],
                             ),
                         )
+                        self._ignore_duplicate_activity_trade_rows(transaction_hash, keep_id=int(exists["id"]))
                         inserted += 1
                     continue
 
-                self.connection.execute(
+                cursor = self.connection.execute(
                     """
                     INSERT INTO live_trades (
                         opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
@@ -1150,6 +1164,10 @@ class ScannerRepository:
                         json.dumps(fill),
                         created_at,
                     ),
+                )
+                self._ignore_duplicate_activity_trade_rows(
+                    transaction_hash,
+                    keep_id=int(getattr(cursor, "lastrowid", 0) or 0) or None,
                 )
                 inserted += 1
         return inserted
@@ -1179,6 +1197,28 @@ class ScannerRepository:
             **activity,
             "activity_trade": activity,
         }
+
+    @staticmethod
+    def _transaction_hash_from_payload(payload: dict[str, Any]) -> str:
+        return str(payload.get("transactionHash") or payload.get("transaction_hash") or "").strip()
+
+    def _ignore_duplicate_activity_trade_rows(self, transaction_hash: str, *, keep_id: int | None = None) -> int:
+        tx_hash = str(transaction_hash or "").strip()
+        if not tx_hash:
+            return 0
+        query = """
+            UPDATE live_trades
+            SET status = 'MISATTRIBUTED_FILL_IGNORED'
+            WHERE response_json LIKE ?
+              AND opportunity_id LIKE 'data-api-trade:%'
+              AND UPPER(status) != 'MISATTRIBUTED_FILL_IGNORED'
+        """
+        params: list[Any] = [f"%{tx_hash}%"]
+        if keep_id is not None:
+            query += " AND id != ?"
+            params.append(keep_id)
+        cursor = self.connection.execute(query, tuple(params))
+        return int(getattr(cursor, "rowcount", 0) or 0)
 
     def market_outcomes(self, market_slug: str) -> list[dict[str, str]]:
         row = self.connection.fetchone(
@@ -1475,14 +1515,17 @@ class ScannerRepository:
 
                 existing_tx = self.connection.fetchone(
                     """
-                    SELECT id, status
+                    SELECT id, status, opportunity_id, response_json
                     FROM live_trades
                     WHERE response_json LIKE ?
+                    ORDER BY CASE WHEN opportunity_id LIKE 'data-api-trade:%' THEN 1 ELSE 0 END,
+                             id DESC
                     LIMIT 1
                     """,
                     (f"%{transaction_hash}%",),
                 )
                 if existing_tx:
+                    self._ignore_duplicate_activity_trade_rows(transaction_hash, keep_id=int(existing_tx["id"]))
                     existing_status = str(existing_tx["status"] or "").upper()
                     if existing_status in {"REDEEMED", "SETTLED_LOST", "MISATTRIBUTED_FILL_IGNORED"}:
                         continue
@@ -1494,7 +1537,12 @@ class ScannerRepository:
                             created_at = ?
                         WHERE id = ?
                         """,
-                        ("CONFIRMED", json.dumps(activity), created_at, existing_tx["id"]),
+                        (
+                            "CONFIRMED",
+                            json.dumps(self._merge_activity_response(existing_tx.get("response_json"), activity)),
+                            created_at,
+                            existing_tx["id"],
+                        ),
                     )
                     inserted += 1
                     report_progress()
