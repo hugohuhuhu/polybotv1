@@ -1103,7 +1103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             inserted += repo.save_polymarket_activity_trades(activities, wallet_address=funder_address)
             return inserted
 
-    async def maybe_sync_live_fills() -> int:
+    async def maybe_sync_live_fills(*, wait_for_result: bool = True) -> int:
         loop_time = asyncio.get_running_loop().time()
         running_task = app.state.live_fill_sync_task
         if running_task is not None:
@@ -1130,6 +1130,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.live_fill_sync_at = loop_time
         task = asyncio.create_task(asyncio.to_thread(sync_live_fills_to_db))
         app.state.live_fill_sync_task = task
+        if not wait_for_result:
+            return 0
         try:
             inserted = await asyncio.wait_for(
                 asyncio.shield(task),
@@ -1398,7 +1400,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         async with app.state.stop_exit_lock:
             try:
-                await maybe_sync_live_fills()
+                await maybe_sync_live_fills(wait_for_result=False)
             except Exception as exc:
                 with repository_scope() as repo:
                     repo.save_execution_event(
