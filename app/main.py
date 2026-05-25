@@ -169,9 +169,22 @@ async def _watch_delay(
         remaining = delay_until_ts - time()
         if remaining <= 0:
             return
+        monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         if monitor_callback is not None:
-            await monitor_callback()
-        sleep_for = min(remaining, max(float(settings.near_close_open_position_monitor_sec), 0.5))
+            monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
+            try:
+                await asyncio.wait_for(monitor_callback(), timeout=monitor_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "Fast open-position monitor timed out during watch delay.",
+                    context={"timeout_sec": monitor_timeout},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fast open-position monitor failed during watch delay.",
+                    context={"error": str(exc)},
+                )
+        sleep_for = min(remaining, monitor_interval)
         await asyncio.sleep(sleep_for)
 
 
@@ -613,6 +626,32 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         },
                     )
 
+    async def monitor_open_positions_with_budget(phase: str) -> None:
+        monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
+        monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
+        try:
+            await asyncio.wait_for(monitor_open_positions_once(), timeout=monitor_timeout)
+        except TimeoutError:
+            logger.warning(
+                "Fast open-position monitor timed out",
+                context={"phase": phase, "timeout_sec": monitor_timeout},
+            )
+            with contextlib.suppress(Exception):
+                with closing(connect_db(settings)) as connection:
+                    ScannerRepository(connection).save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="fast_position_monitor_timeout",
+                        message=f"Fast open-position monitor exceeded {monitor_timeout:.1f}s during {phase}.",
+                        details={
+                            "phase": phase,
+                            "monitor_interval_sec": settings.near_close_open_position_monitor_sec,
+                            "timeout_sec": monitor_timeout,
+                            "trigger_price": settings.near_close_taker_exit_price,
+                        },
+                    )
+
     async def wait_with_scan_budget(awaitable: Any, loop_started_at: float) -> Any:
         task = asyncio.create_task(awaitable)
         last_monitor_at = 0.0
@@ -629,7 +668,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
                 if now - last_monitor_at >= monitor_interval:
                     last_monitor_at = now
-                    await monitor_open_positions_once()
+                    await monitor_open_positions_with_budget("scan")
                 done, _pending = await asyncio.wait({task}, timeout=min(monitor_interval, remaining))
                 if done:
                     break
