@@ -745,8 +745,23 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         )
         process.start()
         try:
-            while process.is_alive():
+            while True:
                 _touch_watch_liveness()
+                try:
+                    status, payload = output_queue.get_nowait()
+                except queue.Empty:
+                    status = None
+                    payload = None
+                if status == "ok":
+                    with contextlib.suppress(Exception):
+                        process.terminate()
+                    return payload
+                if status == "error":
+                    with contextlib.suppress(Exception):
+                        process.terminate()
+                    raise RuntimeError(str(payload))
+                if not process.is_alive():
+                    raise RuntimeError(f"scan worker exited without returning a result; code={process.exitcode}")
                 now = asyncio.get_running_loop().time()
                 remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
                 if remaining <= 0:
@@ -755,16 +770,6 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                     await asyncio.sleep(1.0)
                     raise TimeoutError
                 await asyncio.sleep(min(max(float(settings.near_close_open_position_monitor_sec), 0.5), remaining))
-            _touch_watch_liveness()
-            if process.exitcode not in (0, None):
-                raise RuntimeError(f"scan worker exited with code {process.exitcode}")
-            try:
-                status, payload = output_queue.get_nowait()
-            except queue.Empty as exc:
-                raise RuntimeError("scan worker exited without returning a result") from exc
-            if status == "ok":
-                return payload
-            raise RuntimeError(str(payload))
         finally:
             with contextlib.suppress(Exception):
                 output_queue.cancel_join_thread()
