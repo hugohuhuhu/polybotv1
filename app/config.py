@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     near_close_scan_event_limit: int = Field(default=750, alias="NEAR_CLOSE_SCAN_EVENT_LIMIT")
     near_close_scan_pool_limit: int = Field(default=30, alias="NEAR_CLOSE_SCAN_POOL_LIMIT")
     near_close_scan_lookahead_minutes: float = Field(default=75.0, alias="NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES")
+    near_close_open_position_monitor_sec: float = Field(default=2.0, alias="NEAR_CLOSE_OPEN_POSITION_MONITOR_SEC")
     near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
@@ -159,7 +160,7 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_ASSUME_SUBMITTED_FILLED_STOP_EXIT",
     )
     near_close_second_chance_exit_enabled: bool = Field(
-        default=True,
+        default=False,
         alias="NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED",
     )
     near_close_second_chance_exit_price: float = Field(
@@ -185,9 +186,17 @@ class Settings(BaseSettings):
     near_close_crypto_cancel_strike_distance: float = Field(default=0.015, alias="NEAR_CLOSE_CRYPTO_CANCEL_STRIKE_DISTANCE")
     near_close_crypto_updown_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED")
     near_close_crypto_updown_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE")
+    near_close_crypto_updown_symbols: str = Field(
+        default="BTCUSDT,ETHUSDT",
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS",
+    )
     near_close_crypto_updown_min_minutes_to_end: float = Field(
         default=0.35,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END",
+    )
+    near_close_crypto_updown_no_new_entry_last_seconds: float = Field(
+        default=90.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS",
     )
     near_close_crypto_updown_max_minutes_to_end: float = Field(
         default=45.0,
@@ -477,6 +486,19 @@ class Settings(BaseSettings):
                 return self.near_close_weekend_crypto_updown_min_entry_price
             return self.near_close_crypto_updown_min_entry_price
         return 0.0
+
+    def allowed_crypto_updown_symbols(self) -> set[str]:
+        raw = str(self.near_close_crypto_updown_symbols or "").strip()
+        if not raw:
+            return set()
+        values = {item.strip().upper() for item in raw.split(",") if item.strip()}
+        if values & {"*", "ALL"}:
+            return set()
+        return values
+
+    def effective_crypto_updown_min_minutes_to_end(self) -> float:
+        no_new_entry_minutes = max(float(self.near_close_crypto_updown_no_new_entry_last_seconds), 0.0) / 60.0
+        return max(float(self.near_close_crypto_updown_min_minutes_to_end), no_new_entry_minutes)
 
     def effective_near_close_start_distance(self, value: float) -> float:
         return self._weekend_scaled(value, self.near_close_weekend_start_distance_multiplier)

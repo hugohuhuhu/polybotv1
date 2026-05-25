@@ -82,8 +82,6 @@ class LateResolutionScanner:
         if not decision.allowed:
             return False
         min_minutes, max_minutes = self._time_window(decision.variant)
-        if minutes_left < min_minutes:
-            return False
         if minutes_left > max_minutes:
             return False
         if not market.resolution_source:
@@ -108,6 +106,11 @@ class LateResolutionScanner:
 
         def reject(reason: str) -> None:
             self._record_crypto_updown_rejection(market, outcome_label, reason, rejection_counts)
+
+        min_minutes, _max_minutes = self._time_window(decision.variant)
+        if minutes_left < min_minutes:
+            reject("too_close_to_end")
+            return None
 
         crypto_start_distance: float | None = None
         if decision.variant == "crypto_updown":
@@ -252,6 +255,9 @@ class LateResolutionScanner:
             "current_midpoint": midpoint,
             "target_exit_price": 1.0,
             "minutes_to_resolution": round(minutes_left, 1),
+            "no_new_entry_last_seconds": self.settings.near_close_crypto_updown_no_new_entry_last_seconds
+            if decision.variant == "crypto_updown"
+            else None,
             "redeem_net_edge": round(gross_edge, 6),
             "primary_exit_mode": "redeem",
             "resolution_source": market.resolution_source,
@@ -398,7 +404,7 @@ class LateResolutionScanner:
     def _time_window(self, variant: str) -> tuple[float, float]:
         if variant == "crypto_updown":
             return (
-                self.settings.near_close_crypto_updown_min_minutes_to_end,
+                self.settings.effective_crypto_updown_min_minutes_to_end(),
                 self.settings.near_close_crypto_updown_max_minutes_to_end,
             )
         if variant == "crypto":

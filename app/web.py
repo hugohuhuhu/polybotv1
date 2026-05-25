@@ -544,7 +544,7 @@ def _trading_parameters_payload(
                 "items": [
                     {"label": "啟用", "value": "開" if settings.near_close_crypto_updown_enabled else "關"},
                     {"label": "下單大小", "value": settings.effective_near_close_order_size("crypto_updown"), "unit": "pUSD"},
-                    {"label": "時間窗", "value": f"{settings.near_close_crypto_updown_min_minutes_to_end:g}-{settings.near_close_crypto_updown_max_minutes_to_end:g} 分"},
+                    {"label": "時間窗", "value": f"{settings.effective_crypto_updown_min_minutes_to_end():g}-{settings.near_close_crypto_updown_max_minutes_to_end:g} 分"},
                     {"label": "動態 start distance", "value": "開" if settings.near_close_crypto_updown_dynamic_start_distance_enabled else "關"},
                     {"label": "start distance ladder", "value": settings.near_close_crypto_updown_start_distance_ladder},
                     {"label": "start distance", "value": settings.near_close_crypto_updown_min_start_distance},

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.config import Settings
-from app.models.core import ExecutionLeg, ExecutionPlan
+from app.models.core import ExecutionLeg, ExecutionPlan, LiveExecutionLegResult
 from app.storage.repositories import ScannerRepository
 from app.strategy.near_close_order_manager import NearCloseOrderManager
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter
@@ -27,14 +27,6 @@ def _split_cancel_response(order_ids: list[str], response: object) -> tuple[list
     return canceled_ids, uncertain_ids
 
 
-def _stop_exit_result_needs_second_chance(live_result: object) -> bool:
-    status = str(getattr(live_result, "status", "") or "").lower()
-    if status not in {"failed", "partial_failure"}:
-        return False
-    message = str(getattr(live_result, "message", "") or "").lower()
-    return "no orders found" in message or "no match" in message or "fak order" in message
-
-
 def _fallback_stop_exit_book(
     *,
     repository: ScannerRepository,
@@ -48,6 +40,102 @@ def _fallback_stop_exit_book(
         max_age_seconds=max(float(settings.near_close_stop_exit_stale_orderbook_max_age_sec), 0.0),
     )
     return books.get(token_id)
+
+
+def _unique_order_ids(order_ids: list[str]) -> list[str]:
+    return list(dict.fromkeys(order_id for order_id in order_ids if order_id))
+
+
+def _book_telemetry(book: Any | None) -> dict[str, object]:
+    if book is None:
+        return {}
+    best_bid = getattr(book, "best_bid", None)
+    best_ask = getattr(book, "best_ask", None)
+    return {
+        "observed_best_bid": best_bid,
+        "observed_best_ask": best_ask,
+        "observed_midpoint": getattr(book, "midpoint", None),
+        "observed_spread": getattr(book, "spread", None),
+        "observed_top_bid_size": book.depth_for_side("bid", best_bid) if best_bid is not None else None,
+        "observed_top_ask_size": book.depth_for_side("ask", best_ask) if best_ask is not None else None,
+    }
+
+
+def _execution_price_from_leg(leg: LiveExecutionLegResult) -> float | None:
+    candidates = (
+        leg.response.get("average_price"),
+        leg.response.get("avg_price"),
+        leg.response.get("price"),
+        leg.response.get("matched_price"),
+        leg.response.get("target_price"),
+        leg.target_price,
+    )
+    for value in candidates:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _execution_telemetry(legs: list[LiveExecutionLegResult]) -> list[dict[str, object]]:
+    return [
+        {
+            "action": leg.action,
+            "order_id": leg.order_id,
+            "status": leg.status,
+            "target_price": leg.target_price,
+            "requested_size": leg.requested_size,
+            "reported_execution_price": _execution_price_from_leg(leg),
+            "response": leg.response,
+        }
+        for leg in legs
+    ]
+
+
+async def _cancel_orders_for_panic_exit(
+    *,
+    repository: ScannerRepository,
+    live_trader: PolymarketLiveTradingAdapter,
+    opportunity_id: str,
+    order_ids: list[str],
+    status: str,
+    message: str,
+) -> tuple[list[str], list[str], object | None]:
+    cleaned = _unique_order_ids(order_ids)
+    if not cleaned:
+        return [], [], None
+    try:
+        response = await live_trader.cancel_orders(cleaned)
+    except Exception as exc:
+        repository.save_execution_event(
+            source="watch",
+            mode="live",
+            opportunity_id=opportunity_id,
+            status=f"{status}_failed_continuing",
+            message=str(exc),
+            details={"order_ids": cleaned},
+        )
+        return [], cleaned, {"error": str(exc)}
+    canceled_ids, uncertain_ids = _split_cancel_response(cleaned, response)
+    if canceled_ids:
+        repository.mark_live_orders_cancelled(canceled_ids, status=status, cancel_response=response)
+    if uncertain_ids:
+        repository.mark_live_orders_cancelled(uncertain_ids, status="cancel_unconfirmed", cancel_response=response)
+    repository.save_execution_event(
+        source="watch",
+        mode="live",
+        opportunity_id=opportunity_id,
+        status=status,
+        message=message,
+        details={
+            "order_ids": cleaned,
+            "canceled_order_ids": canceled_ids,
+            "unconfirmed_order_ids": uncertain_ids,
+            "cancel_response": response,
+        },
+    )
+    return canceled_ids, uncertain_ids, response
 
 
 async def execute_near_close_taker_exits(
@@ -72,46 +160,64 @@ async def execute_near_close_taker_exits(
             book = _fallback_stop_exit_book(repository=repository, settings=settings, token_id=token_id)
             book_source = "stored_orderbook" if book is not None else "missing"
         size = float(group.get("open_size") or 0.0)
-        entry_price = 0.0
-        if size > 1e-9:
-            entry_price = float(group.get("open_cost_basis") or 0.0) / size
+        entry_price = float(group.get("open_cost_basis") or 0.0) / size if size > 1e-9 else 0.0
         reference_price = manager.taker_exit_reference_price(book=book) if book is not None else None
         if book is None or not manager.taker_exit_required(book=book, entry_price=entry_price):
             continue
         target_price = manager.taker_exit_price(book=book)
         if target_price is None or target_price <= 0:
             continue
+
+        opportunity_id = f"stop-exit:{market_slug}:{token_id}"
         assumed_fill = bool(group.get("assumed_fill"))
         source_order_id = str(group.get("source_order_id") or "").strip()
-        cancel_response = None
-        profit_take_cancel_response = None
-        profit_take_cancelled_order_ids: list[str] = []
-        profit_take_uncertain_order_ids: list[str] = []
         if assumed_fill and not settings.near_close_assume_submitted_filled_stop_exit:
             continue
+
+        active_maker_order_ids = [
+            str(order.get("order_id") or "").strip()
+            for order in repository.near_close_active_orders_for_market(
+                market_slug=market_slug,
+                token_id=token_id,
+            )
+            if str(order.get("order_id") or "").strip()
+        ]
+        source_cancel_response = None
+        source_canceled_ids: list[str] = []
+        source_uncertain_ids: list[str] = []
         if assumed_fill and source_order_id:
-            try:
-                cancel_response = await live_trader.cancel_orders([source_order_id])
-                canceled_ids, uncertain_ids = _split_cancel_response([source_order_id], cancel_response)
-                if source_order_id in canceled_ids and source_order_id not in uncertain_ids:
-                    repository.mark_live_orders_cancelled(
-                        [source_order_id],
-                        status="qualification_cancelled",
-                        cancel_response=cancel_response,
-                    )
-                    exits.append(
-                        {
-                            "market_slug": market_slug,
-                            "token_id": token_id,
-                            "status": "entry_cancelled_before_assumed_stop_exit",
-                            "reference_price": reference_price,
-                            "target_price": target_price,
-                            "size": size,
-                        }
-                    )
-                    continue
-            except Exception as exc:
-                cancel_response = {"error": str(exc)}
+            source_canceled_ids, source_uncertain_ids, source_cancel_response = await _cancel_orders_for_panic_exit(
+                repository=repository,
+                live_trader=live_trader,
+                opportunity_id=opportunity_id,
+                order_ids=[source_order_id],
+                status="qualification_cancelled",
+                message="Cancelled assumed-fill maker entry before panic stop-exit.",
+            )
+            if source_order_id in source_canceled_ids and source_order_id not in source_uncertain_ids:
+                exits.append(
+                    {
+                        "market_slug": market_slug,
+                        "token_id": token_id,
+                        "status": "entry_cancelled_before_assumed_stop_exit",
+                        "reference_price": reference_price,
+                        "target_price": target_price,
+                        "size": size,
+                        "second_chance_attempted": False,
+                    }
+                )
+                continue
+
+        maker_cancel_ids = [order_id for order_id in active_maker_order_ids if order_id != source_order_id]
+        maker_canceled_ids, maker_uncertain_ids, maker_cancel_response = await _cancel_orders_for_panic_exit(
+            repository=repository,
+            live_trader=live_trader,
+            opportunity_id=opportunity_id,
+            order_ids=maker_cancel_ids,
+            status="panic_exit_cancelled_maker",
+            message="Cancelled active near-close maker orders before panic taker exit.",
+        )
+
         profit_take_order_ids = [
             str(order.get("order_id") or "").strip()
             for order in repository.near_close_active_profit_take_orders_for_position(
@@ -120,51 +226,19 @@ async def execute_near_close_taker_exits(
             )
             if str(order.get("order_id") or "").strip()
         ]
-        if profit_take_order_ids:
-            try:
-                profit_take_cancel_response = await live_trader.cancel_orders(profit_take_order_ids)
-                profit_take_cancelled_order_ids, profit_take_uncertain_order_ids = _split_cancel_response(
-                    profit_take_order_ids,
-                    profit_take_cancel_response,
-                )
-                if profit_take_cancelled_order_ids:
-                    repository.mark_live_orders_cancelled(
-                        profit_take_cancelled_order_ids,
-                        status="stop_exit_cancelled_profit_take",
-                        cancel_response=profit_take_cancel_response,
-                    )
-                if profit_take_uncertain_order_ids:
-                    repository.mark_live_orders_cancelled(
-                        profit_take_uncertain_order_ids,
-                        status="cancel_unconfirmed",
-                        cancel_response=profit_take_cancel_response,
-                    )
-                    repository.save_execution_event(
-                        source="watch",
-                        mode="live",
-                        opportunity_id=f"stop-exit:{market_slug}:{token_id}",
-                        status="profit_take_cancel_unconfirmed_before_stop_exit",
-                        message="Profit-taking SELL could not be confirmed cancelled before stop-exit.",
-                        details={
-                            "order_ids": profit_take_order_ids,
-                            "uncertain_order_ids": profit_take_uncertain_order_ids,
-                            "cancel_response": profit_take_cancel_response,
-                        },
-                    )
-                    continue
-            except Exception as exc:
-                repository.save_execution_event(
-                    source="watch",
-                    mode="live",
-                    opportunity_id=f"stop-exit:{market_slug}:{token_id}",
-                    status="profit_take_cancel_failed_before_stop_exit",
-                    message=str(exc),
-                    details={"order_ids": profit_take_order_ids},
-                )
-                continue
+        profit_take_canceled_ids, profit_take_uncertain_ids, profit_take_cancel_response = await _cancel_orders_for_panic_exit(
+            repository=repository,
+            live_trader=live_trader,
+            opportunity_id=opportunity_id,
+            order_ids=profit_take_order_ids,
+            status="stop_exit_cancelled_profit_take",
+            message="Cancelled active profit-taking SELL before panic taker exit.",
+        )
+
+        orderbook_telemetry = _book_telemetry(book)
         plan = ExecutionPlan(
-            opportunity_id=f"stop-exit:{market_slug}:{token_id}",
-            summary=f"Taker stop exit on {market_slug} at {target_price:.4f}",
+            opportunity_id=opportunity_id,
+            summary=f"Panic taker stop exit on {market_slug} at {target_price:.4f}",
             legs=[
                 ExecutionLeg(
                     action="SELL",
@@ -177,6 +251,7 @@ async def execute_near_close_taker_exits(
                     post_only=False,
                     metadata={
                         "strategy_variant": "near_close_stop_exit",
+                        "panic_exit": True,
                         "stop_trigger_price": settings.near_close_taker_exit_price,
                         "stop_reference_price": reference_price,
                         "stop_entry_price": entry_price,
@@ -185,89 +260,29 @@ async def execute_near_close_taker_exits(
                         "stop_orderbook_source": book_source,
                         "assumed_fill_stop_exit": assumed_fill,
                         "source_order_id": source_order_id or None,
-                        "source_cancel_response": cancel_response,
-                        "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
-                        "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                        "source_cancel_response": source_cancel_response,
+                        "source_canceled_order_ids": source_canceled_ids,
+                        "source_uncertain_order_ids": source_uncertain_ids,
+                        "maker_cancelled_order_ids": maker_canceled_ids,
+                        "maker_uncertain_order_ids": maker_uncertain_ids,
+                        "maker_cancel_response": maker_cancel_response,
+                        "profit_take_cancelled_order_ids": profit_take_canceled_ids,
+                        "profit_take_uncertain_order_ids": profit_take_uncertain_ids,
                         "profit_take_cancel_response": profit_take_cancel_response,
+                        **orderbook_telemetry,
                     },
                 )
             ],
             max_slippage_bps=10.0,
-            cancel_conditions=["Stop exit should take immediately available liquidity."],
+            cancel_conditions=["Panic exit: cancel maker orders, then take immediately available liquidity."],
             requires_manual_approval=False,
             live_trading_allowed=True,
             strategy_type="near_close_stop_exit",
-            metadata={"market_slug": market_slug, "token_id": token_id},
+            metadata={"market_slug": market_slug, "token_id": token_id, "panic_exit": True},
         )
         live_result = await live_trader.execute(plan)
         repository.save_live_execution(live_result)
-        second_chance_result = None
-        second_chance_target = None
-        if settings.near_close_second_chance_exit_enabled and _stop_exit_result_needs_second_chance(live_result):
-            second_chance_target = max(float(settings.near_close_second_chance_exit_price), 0.01)
-            second_chance_plan = ExecutionPlan(
-                opportunity_id=f"stop-exit-second-chance:{market_slug}:{token_id}",
-                summary=f"Second-chance taker stop exit on {market_slug} at {second_chance_target:.4f}",
-                legs=[
-                    ExecutionLeg(
-                        action="SELL",
-                        token_id=token_id,
-                        market_slug=market_slug,
-                        outcome_label=str(group.get("outcome_label") or "Outcome"),
-                        target_price=second_chance_target,
-                        size=size,
-                        order_type="FAK",
-                        post_only=False,
-                        metadata={
-                            "strategy_variant": "near_close_stop_exit",
-                            "stop_exit_stage": "second_chance",
-                            "stop_trigger_price": settings.near_close_taker_exit_price,
-                            "stop_reference_price": reference_price,
-                            "stop_entry_price": entry_price,
-                            "stop_limit_price": second_chance_target,
-                            "first_stop_limit_price": target_price,
-                            "stop_orderbook_source": book_source,
-                            "first_stop_status": live_result.status,
-                            "first_stop_message": live_result.message,
-                            "assumed_fill_stop_exit": assumed_fill,
-                            "source_order_id": source_order_id or None,
-                            "source_cancel_response": cancel_response,
-                            "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
-                            "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
-                            "profit_take_cancel_response": profit_take_cancel_response,
-                        },
-                    )
-                ],
-                max_slippage_bps=10.0,
-                cancel_conditions=["Second-chance stop exit should take any immediately available liquidity."],
-                requires_manual_approval=False,
-                live_trading_allowed=True,
-                strategy_type="near_close_stop_exit",
-                metadata={"market_slug": market_slug, "token_id": token_id, "stop_exit_stage": "second_chance"},
-            )
-            second_chance_result = await live_trader.execute(second_chance_plan)
-            repository.save_live_execution(second_chance_result)
-            repository.save_execution_event(
-                source="watch",
-                mode="live",
-                opportunity_id=second_chance_plan.opportunity_id,
-                status=second_chance_result.status,
-                message=second_chance_result.message,
-                details={
-                    "stop_exit_stage": "second_chance",
-                    "first_status": live_result.status,
-                    "first_message": live_result.message,
-                    "reference_price": reference_price,
-                    "entry_price": entry_price,
-                    "first_target_price": target_price,
-                    "target_price": second_chance_target,
-                    "orderbook_source": book_source,
-                    "assumed_fill_stop_exit": assumed_fill,
-                    "market_slug": market_slug,
-                    "token_id": token_id,
-                    "legs": [leg.model_dump() for leg in second_chance_result.leg_results],
-                },
-            )
+        execution_telemetry = _execution_telemetry(live_result.leg_results)
         repository.save_execution_event(
             source="watch",
             mode="live",
@@ -275,6 +290,7 @@ async def execute_near_close_taker_exits(
             status=live_result.status,
             message=live_result.message,
             details={
+                "panic_exit": True,
                 "stop_trigger_price": settings.near_close_taker_exit_price,
                 "reference_price": reference_price,
                 "entry_price": entry_price,
@@ -283,16 +299,21 @@ async def execute_near_close_taker_exits(
                 "orderbook_source": book_source,
                 "assumed_fill_stop_exit": assumed_fill,
                 "source_order_id": source_order_id or None,
-                "source_cancel_response": cancel_response,
-                "profit_take_cancelled_order_ids": profit_take_cancelled_order_ids,
-                "profit_take_uncertain_order_ids": profit_take_uncertain_order_ids,
+                "source_cancel_response": source_cancel_response,
+                "source_canceled_order_ids": source_canceled_ids,
+                "source_uncertain_order_ids": source_uncertain_ids,
+                "maker_cancelled_order_ids": maker_canceled_ids,
+                "maker_uncertain_order_ids": maker_uncertain_ids,
+                "maker_cancel_response": maker_cancel_response,
+                "profit_take_cancelled_order_ids": profit_take_canceled_ids,
+                "profit_take_uncertain_order_ids": profit_take_uncertain_ids,
                 "profit_take_cancel_response": profit_take_cancel_response,
-                "second_chance_enabled": settings.near_close_second_chance_exit_enabled,
-                "second_chance_attempted": second_chance_result is not None,
-                "second_chance_target_price": second_chance_target,
-                "second_chance_status": getattr(second_chance_result, "status", None),
+                "second_chance_enabled": False,
+                "second_chance_attempted": False,
                 "market_slug": market_slug,
                 "token_id": token_id,
+                **orderbook_telemetry,
+                "execution": execution_telemetry,
                 "legs": [leg.model_dump() for leg in live_result.leg_results],
             },
         )
@@ -300,12 +321,14 @@ async def execute_near_close_taker_exits(
             {
                 "market_slug": market_slug,
                 "token_id": token_id,
-                "status": getattr(second_chance_result, "status", live_result.status),
+                "status": live_result.status,
                 "reference_price": reference_price,
-                "target_price": second_chance_target if second_chance_result is not None else target_price,
+                "target_price": target_price,
                 "first_target_price": target_price,
-                "second_chance_attempted": second_chance_result is not None,
+                "second_chance_attempted": False,
                 "size": size,
+                **orderbook_telemetry,
+                "execution": execution_telemetry,
             }
         )
     return exits

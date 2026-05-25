@@ -4,11 +4,15 @@ import asyncio
 import json
 
 from app.config import Settings
-from app.main import _execute_near_close_taker_exits, _sync_live_fills_to_db
-from app.models.core import BookLevel, LiveExecutionResult, OrderBookSnapshot
+from app.main import _sync_live_fills_to_db
+from app.models.core import BookLevel, LiveExecutionLegResult, LiveExecutionResult, OrderBookSnapshot
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.near_close_order_manager import NearCloseOrderManager
+from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
+
+
+_execute_near_close_taker_exits = execute_near_close_taker_exits
 
 
 def make_book(*, bid: float, ask: float) -> OrderBookSnapshot:
@@ -125,6 +129,75 @@ def test_near_close_taker_exit_uses_fak_to_take_available_liquidity(tmp_path) ->
 
     assert trader.order_type == "FAK"
     assert trader.target_price == 0.5
+
+
+def test_near_close_taker_exit_records_observed_bid_and_execution_telemetry(tmp_path) -> None:
+    class FakeTrader:
+        async def execute(self, plan):
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[
+                    LiveExecutionLegResult(
+                        leg_index=1,
+                        action="SELL",
+                        token_id=plan.legs[0].token_id,
+                        market_slug=plan.legs[0].market_slug,
+                        outcome_label=plan.legs[0].outcome_label,
+                        target_price=plan.legs[0].target_price,
+                        requested_size=plan.legs[0].size,
+                        order_id="0xexit",
+                        status="submitted",
+                        response={"price": "0.50"},
+                    )
+                ],
+            )
+
+    repository = ScannerRepository(connect_db(tmp_path / "stop-exit-telemetry.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "open-telemetry",
+                1,
+                "BUY",
+                "token-up",
+                "btc-updown-15m-test",
+                "Up",
+                0.83,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                "{}",
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=FakeTrader(),
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52),
+            watch_books={"token-up": make_book(bid=0.51, ask=0.54)},
+        )
+    )
+    event = repository.connection.fetchone(
+        "SELECT details_json FROM execution_audit_log WHERE opportunity_id = ? ORDER BY id DESC LIMIT 1",
+        ("stop-exit:btc-updown-15m-test:token-up",),
+    )
+    details = json.loads(event["details_json"])
+
+    assert exits[0]["observed_best_bid"] == 0.51
+    assert details["observed_best_bid"] == 0.51
+    assert details["execution"][0]["reported_execution_price"] == 0.5
+    assert details["second_chance_attempted"] is False
 
 
 def test_near_close_taker_exit_includes_matched_cancel_unconfirmed_order(tmp_path) -> None:
@@ -530,7 +603,7 @@ def test_near_close_taker_exit_uses_entry_relative_stop_before_deep_crash(tmp_pa
     assert round(trader.plan.legs[0].metadata["stop_entry_price"], 6) == 0.87
 
 
-def test_near_close_taker_exit_uses_second_chance_floor_when_first_fak_has_no_match(tmp_path) -> None:
+def test_near_close_taker_exit_does_not_attempt_second_chance_when_first_fak_has_no_match(tmp_path) -> None:
     class FakeTrader:
         def __init__(self) -> None:
             self.plans = []
@@ -587,18 +660,16 @@ def test_near_close_taker_exit_uses_second_chance_floor_when_first_fak_has_no_ma
                 NEAR_CLOSE_TAKER_EXIT_PRICE=0.52,
                 NEAR_CLOSE_HARD_STOP_OFFSET=0.025,
                 NEAR_CLOSE_EMERGENCY_SLIPPAGE=0.03,
-                NEAR_CLOSE_SECOND_CHANCE_EXIT_PRICE=0.01,
+                NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED=False,
             ),
             watch_books={"token-doge": make_book(bid=0.87, ask=0.9)},
         )
     )
 
-    assert len(trader.plans) == 2
+    assert len(trader.plans) == 1
     assert trader.plans[0].legs[0].target_price == 0.84
-    assert trader.plans[1].legs[0].target_price == 0.01
-    assert trader.plans[1].legs[0].metadata["stop_exit_stage"] == "second_chance"
-    assert exits[0]["second_chance_attempted"] is True
-    assert exits[0]["status"] == "submitted"
+    assert exits[0]["second_chance_attempted"] is False
+    assert exits[0]["status"] == "failed"
 
 
 def test_near_close_taker_exit_cancels_active_profit_take_before_stop(tmp_path) -> None:

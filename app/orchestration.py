@@ -162,8 +162,12 @@ def _parse_crypto_updown_market(market: MarketRecord) -> tuple[str, datetime] | 
     return symbol, start_time
 
 
-def _is_crypto_updown_market(market: MarketRecord) -> bool:
-    return _parse_crypto_updown_market(market) is not None
+def _is_allowed_crypto_updown_market(settings: Settings, market: MarketRecord) -> bool:
+    updown = _parse_crypto_updown_market(market)
+    if updown is None:
+        return False
+    allowed_symbols = settings.allowed_crypto_updown_symbols()
+    return not allowed_symbols or updown[0].upper() in allowed_symbols
 
 
 async def enrich_crypto_near_close_markets(settings: Settings, markets: list[MarketRecord]) -> None:
@@ -188,12 +192,15 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         updown = _parse_crypto_updown_market(market)
         if updown is not None:
             symbol, start_time = updown
+            allowed_symbols = settings.allowed_crypto_updown_symbols()
+            if allowed_symbols and symbol.upper() not in allowed_symbols:
+                continue
             updown_by_market[market.market_id] = updown
             symbols.add(symbol)
             minutes_left = _minutes_to_resolution(market, now)
             in_updown_window = (
                 minutes_left is not None
-                and settings.near_close_crypto_updown_min_minutes_to_end <= minutes_left <= updown_max_minutes
+                and settings.effective_crypto_updown_min_minutes_to_end() <= minutes_left <= updown_max_minutes
             )
             if in_updown_window and start_time <= now:
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
@@ -265,7 +272,7 @@ def _is_near_close_pool_candidate(settings: Settings, market: MarketRecord, now:
 def _near_close_time_window(settings: Settings, variant: str) -> tuple[float, float]:
     if variant == "crypto_updown":
         return (
-            settings.near_close_crypto_updown_min_minutes_to_end,
+            settings.effective_crypto_updown_min_minutes_to_end(),
             settings.near_close_crypto_updown_max_minutes_to_end,
         )
     if variant == "crypto":
@@ -347,7 +354,7 @@ def build_near_close_funnel(
             "description": (
                 f"\u5b98\u65b9\u76e4 {settings.near_close_max_minutes_to_end:g}-{settings.near_close_min_minutes_to_end:g} \u5206\u9418\uff1b"
                 f"crypto \u56fa\u5b9a\u9580\u6abb {settings.near_close_crypto_max_minutes_to_end:g}-{settings.near_close_crypto_min_minutes_to_end:g} \u5206\u9418\uff1b"
-                f"crypto Up/Down {settings.near_close_crypto_updown_max_minutes_to_end:g}-{settings.near_close_crypto_updown_min_minutes_to_end:g} \u5206\u9418\u3002"
+                f"crypto Up/Down {settings.near_close_crypto_updown_max_minutes_to_end:g}-{settings.effective_crypto_updown_min_minutes_to_end():g} \u5206\u9418\u3002"
             ),
         },
         {
@@ -375,7 +382,11 @@ def shortlist_near_close_markets(
     limit: int | None = None,
 ) -> tuple[list[MarketRecord], dict[str, object]]:
     now = datetime.now(timezone.utc)
-    candidate_markets = [market for market in markets if _is_crypto_updown_market(market)] if settings.near_close_scan_crypto_updown_only else markets
+    candidate_markets = (
+        [market for market in markets if _is_allowed_crypto_updown_market(settings, market)]
+        if settings.near_close_scan_crypto_updown_only
+        else markets
+    )
     candidates = [
         market
         for market in candidate_markets
@@ -423,6 +434,7 @@ def shortlist_near_close_markets(
         "shortlist_mode": "near_close",
         "near_close_scan_crypto_updown_only": settings.near_close_scan_crypto_updown_only,
         "crypto_updown_discovered_count": len(candidate_markets) if settings.near_close_scan_crypto_updown_only else None,
+        "crypto_updown_allowed_symbols": sorted(settings.allowed_crypto_updown_symbols()) or ["ALL"],
         "near_close_candidates": len(candidates),
         "near_close_funnel": build_near_close_funnel(settings, candidate_markets, shortlisted=selected, now=now),
     }
@@ -742,7 +754,7 @@ async def execute_scan_cycle(
     )
     markets = [market for market in markets if not _is_excluded_market(market)]
     if settings.near_close_scan_crypto_updown_only:
-        markets = [market for market in markets if _is_crypto_updown_market(market)]
+        markets = [market for market in markets if _is_allowed_crypto_updown_market(settings, market)]
     await enrich_crypto_near_close_markets(settings, markets)
     positive_edge_hits = (
         repository.recent_positive_edge_by_slug(hours=settings.watch_positive_edge_lookback_hours)

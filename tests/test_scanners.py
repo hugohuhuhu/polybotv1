@@ -543,6 +543,7 @@ def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladde
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.95,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=0.35,
+        NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
@@ -589,6 +590,38 @@ def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladde
 
         assert opportunities == []
         assert rejection_counts == {"start_distance_below_min": 1}
+
+
+def test_late_resolution_scanner_blocks_crypto_updown_inside_last_90_seconds() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=0.35,
+        NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.0005,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=1.0, start_distance=0.01)
+    rejection_counts: dict[str, int] = {}
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+        },
+        rejection_counts=rejection_counts,
+    )
+
+    assert opportunities == []
+    assert rejection_counts == {"too_close_to_end": 1}
 
 
 def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:

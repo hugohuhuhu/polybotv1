@@ -399,6 +399,46 @@ def test_near_close_pool_crypto_updown_only_filters_first() -> None:
     assert [market.slug for market in shortlisted] == ["ethereum-updown"]
     assert diagnostics["near_close_scan_crypto_updown_only"] is True
     assert diagnostics["crypto_updown_discovered_count"] == 1
+    assert diagnostics["crypto_updown_allowed_symbols"] == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=5,
+        NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
+        NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+    )
+    now = datetime.now(timezone.utc)
+    doge = make_market(
+        "doge-updown",
+        event_id="crypto",
+        slug="doge-updown",
+        question="Dogecoin Up or Down - May 2, 5:55AM-6:00AM ET",
+        yes_price=0.68,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "event_title": "Dogecoin Up or Down - May 2, 5:55AM-6:00AM ET",
+            "outcome_labels": ["Up", "Down"],
+            "token_ids": ["doge-up", "doge-down"],
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://data.chain.link/streams/doge-usd",
+            "raw": {
+                "eventStartTime": (now - timedelta(minutes=7)).isoformat(),
+                "near_close_crypto_variant": "updown_proxy",
+                "near_close_crypto_spot_price": 0.23,
+                "near_close_crypto_start_price": 0.22,
+                "near_close_crypto_start_distance": 0.045,
+                "near_close_crypto_winning_outcome": "Up",
+            },
+        }
+    )
+
+    shortlisted, diagnostics = shortlist_near_close_markets([doge], settings=settings)
+
+    assert shortlisted == []
+    assert diagnostics["crypto_updown_discovered_count"] == 0
 
 
 def test_near_close_pool_excludes_xrp_related_markets() -> None:

@@ -197,15 +197,26 @@ The local live launch scripts enable a time-funnel start-distance rule for crypt
 5-6 min to close     -> start distance >= 0.0018
 3.5-5 min to close   -> start distance >= 0.00121
 1.5-3.5 min to close -> start distance >= 0.0010
-0.35-1.5 min to close -> start distance >= 0.00085
+0.35-1.5 min to close -> no new live entries by default
 ```
 
 Relevant settings:
 
 - `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT` limits the live crypto Up/Down universe to BTC and ETH.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=90` blocks new crypto Up/Down entries inside the final 90 seconds.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`
 - `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00012` remains the cancellation line for already-active maker orders in the local launch scripts.
+- `NEAR_CLOSE_OPEN_POSITION_MONITOR_SEC=2` makes watch check only open-position orderbooks during scan waits and delay windows.
+- `NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED=false` keeps panic exits to one immediate FAK taker attempt; no maker repost or second-chance order is attempted.
+
+Survival-first stop-exit behavior:
+
+- Panic exit is triggered from the observed open-position orderbook, not the full market discovery pass.
+- When the stop threshold breaks, the bot cancels active maker and profit-taking orders for that position, then immediately sends a FAK taker SELL.
+- The exit audit records the observed best bid, best ask, midpoint, spread, top bid size, target limit price, and CLOB execution response for later loss autopsy.
+- The local PC is not assumed to be low-latency infrastructure; the strategy gives up the final 90 seconds instead of fighting for the last theoretical edge.
 
 Weekend light mode is enabled by the local dashboard and watch launch scripts. At startup the scripts enable U.S. equity session mode, so the bot checks the NYSE regular core session (`9:30-16:00 America/New_York`, with weekends and market holidays closed). When U.S. equities are closed it keeps the normal entry path but uses effective near-close limits; when U.S. equities are open, the dashboard lights `高頻模式` and the unscaled near-close limits apply.
 

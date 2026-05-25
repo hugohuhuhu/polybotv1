@@ -31,6 +31,8 @@ class ScannerRepository:
         "CANCEL_UNCONFIRMED",
         "QUALIFICATION_CANCELLED",
         "REPRICE_CANCELLED",
+        "PANIC_EXIT_CANCELLED_MAKER",
+        "STOP_EXIT_CANCELLED_PROFIT_TAKE",
         "REDEEMED",
         "SETTLED_LOST",
     )

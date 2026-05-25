@@ -42,7 +42,7 @@ class NearCloseOrderManager:
         reasons: list[str] = []
         midpoint = book.midpoint
         if variant == "crypto_updown":
-            min_minutes = self.settings.near_close_crypto_updown_min_minutes_to_end
+            min_minutes = self.settings.effective_crypto_updown_min_minutes_to_end()
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
             max_spread = self.settings.near_close_crypto_updown_max_spread
