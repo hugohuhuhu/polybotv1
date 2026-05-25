@@ -96,6 +96,14 @@ def normalize_private_key(private_key: str) -> str:
     return normalized if normalized.startswith("0x") else f"0x{normalized}"
 
 
+def validate_private_key(private_key: str) -> str:
+    normalized = normalize_private_key(private_key)
+    hex_key = normalized[2:] if normalized.startswith("0x") else normalized
+    if len(hex_key) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in hex_key):
+        raise LiveTradingError("POLYMARKET_PRIVATE_KEY must be a 32-byte hex string.")
+    return normalized
+
+
 def resolve_funder_address(settings: Settings, private_key: str) -> str | None:
     funder = (settings.polymarket_funder_address or "").strip() or None
     if settings.polymarket_signature_type == 0:
@@ -109,7 +117,7 @@ def create_authenticated_clob_v2_client(settings: Settings) -> ClobClient:
             "py-clob-client-v2 is not installed. Install project dependencies before enabling live trading."
         ) from _V2_SDK_IMPORT_ERROR
 
-    private_key = normalize_private_key(settings.polymarket_private_key or "")
+    private_key = validate_private_key(settings.polymarket_private_key or "")
     funder = resolve_funder_address(settings, private_key)
     if settings.polymarket_signature_type != 0 and funder is None:
         raise LiveTradingError("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types.")
@@ -566,7 +574,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
         private_key = (self.settings.polymarket_private_key or "").strip()
         if not private_key:
             raise LiveTradingError("POLYMARKET_PRIVATE_KEY is not configured.")
-        normalized_private_key = normalize_private_key(private_key)
+        normalized_private_key = validate_private_key(private_key)
         funder = resolve_funder_address(self.settings, normalized_private_key)
         if self.settings.polymarket_signature_type != 0 and funder is None:
             raise LiveTradingError("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types.")

@@ -29,10 +29,33 @@ public static class SleepControl {
 $ES_CONTINUOUS = [uint32]2147483648
 $ES_SYSTEM_REQUIRED = [uint32]1
 
+function Clear-InvalidPrivateKeyOverride {
+    $raw = [Environment]::GetEnvironmentVariable("POLYMARKET_PRIVATE_KEY", "Process")
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return
+    }
+    $normalized = $raw.Trim()
+    $hex = $normalized
+    if ($normalized.StartsWith("0x", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $hex = $normalized.Substring(2)
+    }
+    if (($hex.Length -ne 64) -or ($hex -notmatch '^[0-9a-fA-F]{64}$')) {
+        Remove-Item Env:\POLYMARKET_PRIVATE_KEY -ErrorAction SilentlyContinue
+        Write-SupervisorLog "Ignoring invalid inherited POLYMARKET_PRIVATE_KEY; .env will be used if configured."
+    }
+}
+
+function Write-SupervisorLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $supervisorLog -Value "[$timestamp] $Message"
+}
+
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $localDataRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $sqliteBackupDir -Force | Out-Null
 Set-Location $repoRoot
+Clear-InvalidPrivateKeyOverride
 $env:SQLITE_PATH = $sqlitePath
 $env:SQLITE_BACKUP_DIR = $sqliteBackupDir
 $env:SCAN_INTERVAL_SEC = "30"
@@ -111,12 +134,6 @@ $env:NEAR_CLOSE_PROFIT_TAKE_SHADOW_ENABLED = "true"
 $env:NEAR_CLOSE_PROFIT_TAKE_ORDER_TYPE = "GTD"
 $env:NEAR_CLOSE_PROFIT_TAKE_GTD_SECONDS = "240"
 $env:NEAR_CLOSE_PROFIT_TAKE_LADDER = "0.865:0.950,0.885:0.955,0.905:0.965,0.925:0.970,0.940:0.985"
-
-function Write-SupervisorLog {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $supervisorLog -Value "[$timestamp] $Message"
-}
 
 $createdNew = $false
 $mutex = $null

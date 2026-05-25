@@ -44,6 +44,22 @@ function Stop-WatchFromPidFiles {
     }
 }
 
+function Clear-InvalidPrivateKeyOverride {
+    $raw = [Environment]::GetEnvironmentVariable("POLYMARKET_PRIVATE_KEY", "Process")
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return
+    }
+    $normalized = $raw.Trim()
+    $hex = $normalized
+    if ($normalized.StartsWith("0x", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $hex = $normalized.Substring(2)
+    }
+    if (($hex.Length -ne 64) -or ($hex -notmatch '^[0-9a-fA-F]{64}$')) {
+        Remove-Item Env:\POLYMARKET_PRIVATE_KEY -ErrorAction SilentlyContinue
+        Write-Host "Ignoring invalid inherited POLYMARKET_PRIVATE_KEY; .env will be used if configured."
+    }
+}
+
 if (-not (Test-Path $python)) {
     Write-Host "Python not found:"
     Write-Host $python
@@ -60,6 +76,7 @@ if (-not (Test-Path $entry)) {
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $localDataRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $sqliteBackupDir -Force | Out-Null
+Clear-InvalidPrivateKeyOverride
 $env:DASHBOARD_REFRESH_SEC = "30"
 $env:SQLITE_PATH = $sqlitePath
 $env:SQLITE_BACKUP_DIR = $sqliteBackupDir

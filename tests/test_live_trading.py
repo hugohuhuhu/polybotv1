@@ -191,6 +191,28 @@ def test_live_trader_requires_enable_flag() -> None:
         asyncio.run(adapter.execute(make_plan()))
 
 
+def test_live_trader_rejects_invalid_private_key_before_client_creation(monkeypatch) -> None:
+    created_clients: list[object] = []
+
+    class FakeClobClient:
+        def __init__(self, *args, **kwargs):
+            created_clients.append(self)
+
+    monkeypatch.setattr("app.strategy.polymarket_live_trading._V2_SDK_IMPORT_ERROR", None)
+    monkeypatch.setattr("app.strategy.polymarket_live_trading.ClobClient", FakeClobClient)
+    adapter = PolymarketLiveTradingAdapter(
+        Settings(
+            ENABLE_LIVE_TRADING=True,
+            POLYMARKET_PRIVATE_KEY="0x1",
+            POLYMARKET_SIGNATURE_TYPE=0,
+        )
+    )
+
+    with pytest.raises(LiveTradingError, match="32-byte hex string"):
+        asyncio.run(adapter.cancel_orders(["oid-1"]))
+    assert created_clients == []
+
+
 def test_live_trader_submits_near_close_gtd_post_only(monkeypatch) -> None:
     submitted: list[dict] = []
 
