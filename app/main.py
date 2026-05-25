@@ -747,8 +747,6 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 now = asyncio.get_running_loop().time()
                 remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
                 if remaining <= 0:
-                    with contextlib.suppress(Exception):
-                        process.terminate()
                     raise TimeoutError
                 await asyncio.sleep(min(max(float(settings.near_close_open_position_monitor_sec), 0.5), remaining))
             _touch_watch_liveness()
@@ -762,8 +760,8 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 return payload
             raise RuntimeError(str(payload))
         finally:
-            output_queue.cancel_join_thread()
-            output_queue.close()
+            with contextlib.suppress(Exception):
+                output_queue.cancel_join_thread()
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
         task = asyncio.create_task(awaitable)
