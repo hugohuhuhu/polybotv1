@@ -649,13 +649,12 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         _touch_watch_liveness()
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
+        task = asyncio.create_task(asyncio.to_thread(run_fast_monitor_worker_sync))
+        done, _pending = await asyncio.wait({task}, timeout=monitor_timeout)
+        if not done:
+            raise TimeoutError
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(run_fast_monitor_worker_sync),
-                timeout=monitor_timeout,
-            )
-        except TimeoutError:
-            raise
+            task.result()
         except Exception as exc:
             logger.warning("Fast open-position monitor failed", context={"error": str(exc)})
             with contextlib.suppress(Exception):
