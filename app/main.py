@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from time import sleep, time
 from typing import Any
 
@@ -554,6 +555,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
     websocket_task: asyncio.Task[None] | None = None
     subscribed_asset_ids: list[str] = []
     book_state = OrderBookState()
+    fast_monitor_lock = Lock()
     last_redeem_loop_time = 0.0
 
     async def get_preflight(*, force: bool = False) -> PreflightReport:
@@ -588,49 +590,70 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         websocket_client = MarketWebSocketClient(settings.ws_market_url, book_state.handle_message)
         websocket_task = asyncio.create_task(websocket_client.subscribe_forever(normalized_asset_ids))
 
+    async def run_fast_monitor_worker() -> None:
+        with closing(connect_db(settings)) as connection:
+            repository = ScannerRepository(connection)
+            controls = repository.get_trading_controls(default_controls)
+            if not controls.armed:
+                return
+            runtime_settings = controls.apply(settings)
+            token_ids = _open_position_token_ids(repository)
+        if not token_ids:
+            return
+
+        clob = ClobClient(
+            runtime_settings.clob_base_url,
+            concurrency=min(max(len(token_ids), 1), runtime_settings.book_fetch_concurrency),
+        )
+        try:
+            open_position_books = await clob.get_order_books(token_ids)
+        finally:
+            await clob.close()
+        if not open_position_books:
+            return
+
+        worker_live_trader = PolymarketLiveTradingAdapter(runtime_settings)
+        with closing(connect_db(settings)) as connection:
+            repository = ScannerRepository(connection)
+            await execute_near_close_taker_exits(
+                repository=repository,
+                live_trader=worker_live_trader,
+                settings=runtime_settings,
+                watch_books=open_position_books,
+            )
+
+    def run_fast_monitor_worker_sync() -> None:
+        if not fast_monitor_lock.acquire(blocking=False):
+            return
+        try:
+            asyncio.run(run_fast_monitor_worker())
+        except Exception as exc:
+            logger.warning("Fast open-position monitor failed", context={"error": str(exc)})
+            with contextlib.suppress(Exception):
+                with closing(connect_db(settings)) as connection:
+                    ScannerRepository(connection).save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="fast_position_monitor_failed",
+                        message=str(exc),
+                        details={
+                            "monitor_interval_sec": settings.near_close_open_position_monitor_sec,
+                            "trigger_price": settings.near_close_taker_exit_price,
+                        },
+                    )
+        finally:
+            fast_monitor_lock.release()
+
     async def monitor_open_positions_once() -> None:
         _touch_watch_liveness()
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
-
-        def load_monitor_inputs() -> tuple[TradingControls, list[str]]:
-            with closing(connect_db(settings)) as connection:
-                repository = ScannerRepository(connection)
-                controls = repository.get_trading_controls(default_controls)
-                if not controls.armed:
-                    return controls, []
-                return controls, _open_position_token_ids(repository)
-
         try:
-            controls, token_ids = await asyncio.wait_for(
-                asyncio.to_thread(load_monitor_inputs),
+            await asyncio.wait_for(
+                asyncio.to_thread(run_fast_monitor_worker_sync),
                 timeout=monitor_timeout,
             )
-            if not controls.armed or not token_ids:
-                return
-            runtime_settings = controls.apply(settings)
-            live_trader.settings = runtime_settings
-            clob = ClobClient(
-                runtime_settings.clob_base_url,
-                concurrency=min(max(len(token_ids), 1), runtime_settings.book_fetch_concurrency),
-            )
-            try:
-                open_position_books = await clob.get_order_books(token_ids)
-            finally:
-                await clob.close()
-            if not open_position_books:
-                return
-            for snapshot in open_position_books.values():
-                book_state.upsert_snapshot(snapshot)
-            await ensure_websocket(list(book_state.books.keys()))
-            with closing(connect_db(settings)) as connection:
-                repository = ScannerRepository(connection)
-                await execute_near_close_taker_exits(
-                    repository=repository,
-                    live_trader=live_trader,
-                    settings=runtime_settings,
-                    watch_books=book_state.books,
-                )
         except TimeoutError:
             raise
         except Exception as exc:
