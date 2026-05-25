@@ -816,7 +816,6 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 for snapshot in initial.books.values():
                     book_state.upsert_snapshot(snapshot)
                 try:
-                    persist_scan_cycle(repository, initial, settings)
                     repository.save_watch_heartbeat(
                         source="watch",
                         state="running",
@@ -833,6 +832,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             "opportunity_count": len(initial.opportunities),
                         },
                     )
+                    persist_scan_cycle(repository, initial, settings)
                 except Exception as exc:
                     if not _is_sqlite_lock_error(exc):
                         raise
