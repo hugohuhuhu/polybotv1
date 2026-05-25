@@ -556,6 +556,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
     subscribed_asset_ids: list[str] = []
     book_state = OrderBookState()
     fast_monitor_lock = Lock()
+    scan_worker_lock = Lock()
     last_redeem_loop_time = 0.0
 
     async def get_preflight(*, force: bool = False) -> PreflightReport:
@@ -697,30 +698,61 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         },
                     )
 
-    async def wait_with_scan_budget(awaitable: Any, loop_started_at: float) -> Any:
-        task = asyncio.create_task(awaitable)
-        last_monitor_at = 0.0
+    class ScanWorkerBusy(RuntimeError):
+        pass
+
+    def run_scan_cycle_worker_sync(previous_midpoints: dict[str, float] | None) -> Any:
+        if not scan_worker_lock.acquire(blocking=False):
+            raise ScanWorkerBusy("previous scan worker is still running")
+
+        async def run_scan() -> Any:
+            with closing(connect_db(settings)) as connection:
+                repository = ScannerRepository(connection)
+                return await execute_scan_cycle(
+                    settings,
+                    limit=args.limit,
+                    previous_midpoints=previous_midpoints,
+                    repository=repository,
+                )
+
         try:
-            while not task.done():
-                _touch_watch_liveness()
-                now = asyncio.get_running_loop().time()
-                remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
-                if remaining <= 0:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-                    raise TimeoutError
-                monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
-                if now - last_monitor_at >= monitor_interval:
-                    last_monitor_at = now
-                    await monitor_open_positions_with_budget("scan")
-                done, _pending = await asyncio.wait({task}, timeout=min(monitor_interval, remaining))
-                if done:
-                    break
-            return task.result()
+            return asyncio.run(run_scan())
         finally:
-            if not task.done():
-                task.cancel()
+            scan_worker_lock.release()
+
+    def consume_timed_out_scan_result(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("Timed-out scan worker finished with error", context={"error": str(exc)})
+
+    async def run_scan_cycle_with_budget(
+        *,
+        loop_started_at: float,
+        previous_midpoints: dict[str, float] | None = None,
+    ) -> Any:
+        task = asyncio.create_task(asyncio.to_thread(run_scan_cycle_worker_sync, previous_midpoints))
+        last_monitor_at = 0.0
+        while not task.done():
+            _touch_watch_liveness()
+            now = asyncio.get_running_loop().time()
+            remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
+            if remaining <= 0:
+                task.add_done_callback(consume_timed_out_scan_result)
+                raise TimeoutError
+            monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
+            if now - last_monitor_at >= monitor_interval:
+                last_monitor_at = now
+                await monitor_open_positions_with_budget("scan")
+            done, _pending = await asyncio.wait({task}, timeout=min(monitor_interval, remaining))
+            if done:
+                break
+        try:
+            return task.result()
+        except ScanWorkerBusy as exc:
+            raise TimeoutError from exc
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
         task = asyncio.create_task(awaitable)
@@ -758,12 +790,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             },
         )
         try:
+            initial = await run_scan_cycle_with_budget(loop_started_at=loop_started_at)
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
-                initial = await wait_with_scan_budget(
-                    execute_scan_cycle(settings, limit=args.limit, repository=repository),
-                    loop_started_at,
-                )
                 for snapshot in initial.books.values():
                     book_state.upsert_snapshot(snapshot)
                 try:
@@ -874,14 +903,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
                 try:
-                    cycle = await wait_with_scan_budget(
-                        execute_scan_cycle(
-                            settings,
-                            limit=args.limit,
-                            previous_midpoints=previous_midpoints,
-                            repository=repository,
-                        ),
-                        loop_started_at,
+                    cycle = await run_scan_cycle_with_budget(
+                        loop_started_at=loop_started_at,
+                        previous_midpoints=previous_midpoints,
                     )
                 except TimeoutError:
                     repository.save_watch_heartbeat(
