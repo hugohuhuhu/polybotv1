@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import multiprocessing
 import os
+import queue
 import sqlite3
+import traceback
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -269,6 +272,30 @@ async def _sync_live_fills_to_db(
 
 
 _execute_near_close_taker_exits = execute_near_close_taker_exits
+
+
+def _run_scan_cycle_process(
+    *,
+    limit: int | None,
+    previous_midpoints: dict[str, float] | None,
+    output_queue: Any,
+) -> None:
+    try:
+        settings = get_settings()
+
+        async def run_scan() -> Any:
+            with closing(connect_db(settings)) as connection:
+                repository = ScannerRepository(connection)
+                return await execute_scan_cycle(
+                    settings,
+                    limit=limit,
+                    previous_midpoints=previous_midpoints,
+                    repository=repository,
+                )
+
+        output_queue.put(("ok", asyncio.run(run_scan())))
+    except BaseException:
+        output_queue.put(("error", traceback.format_exc()))
 
 
 def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
@@ -556,7 +583,6 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
     subscribed_asset_ids: list[str] = []
     book_state = OrderBookState()
     fast_monitor_lock = Lock()
-    scan_worker_lock = Lock()
     last_redeem_loop_time = 0.0
 
     async def get_preflight(*, force: bool = False) -> PreflightReport:
@@ -698,57 +724,49 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         },
                     )
 
-    class ScanWorkerBusy(RuntimeError):
-        pass
-
-    def run_scan_cycle_worker_sync(previous_midpoints: dict[str, float] | None) -> Any:
-        if not scan_worker_lock.acquire(blocking=False):
-            raise ScanWorkerBusy("previous scan worker is still running")
-
-        async def run_scan() -> Any:
-            with closing(connect_db(settings)) as connection:
-                repository = ScannerRepository(connection)
-                return await execute_scan_cycle(
-                    settings,
-                    limit=args.limit,
-                    previous_midpoints=previous_midpoints,
-                    repository=repository,
-                )
-
-        try:
-            return asyncio.run(run_scan())
-        finally:
-            scan_worker_lock.release()
-
-    def consume_timed_out_scan_result(task: asyncio.Task[Any]) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            logger.warning("Timed-out scan worker finished with error", context={"error": str(exc)})
-
     async def run_scan_cycle_with_budget(
         *,
         loop_started_at: float,
         previous_midpoints: dict[str, float] | None = None,
     ) -> Any:
-        task = asyncio.create_task(asyncio.to_thread(run_scan_cycle_worker_sync, previous_midpoints))
-        while not task.done():
-            _touch_watch_liveness()
-            now = asyncio.get_running_loop().time()
-            remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
-            if remaining <= 0:
-                task.add_done_callback(consume_timed_out_scan_result)
-                raise TimeoutError
-            monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
-            done, _pending = await asyncio.wait({task}, timeout=min(monitor_interval, remaining))
-            if done:
-                break
+        process_context = multiprocessing.get_context("spawn")
+        output_queue = process_context.Queue(maxsize=1)
+        process = process_context.Process(
+            target=_run_scan_cycle_process,
+            kwargs={
+                "limit": args.limit,
+                "previous_midpoints": previous_midpoints,
+                "output_queue": output_queue,
+            },
+            daemon=True,
+        )
+        process.start()
         try:
-            return task.result()
-        except ScanWorkerBusy as exc:
-            raise TimeoutError from exc
+            while process.is_alive():
+                _touch_watch_liveness()
+                now = asyncio.get_running_loop().time()
+                remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
+                if remaining <= 0:
+                    process.terminate()
+                    await asyncio.to_thread(process.join, 5.0)
+                    if process.is_alive():
+                        process.kill()
+                        await asyncio.to_thread(process.join, 5.0)
+                    raise TimeoutError
+                await asyncio.sleep(min(max(float(settings.near_close_open_position_monitor_sec), 0.5), remaining))
+            _touch_watch_liveness()
+            if process.exitcode not in (0, None):
+                raise RuntimeError(f"scan worker exited with code {process.exitcode}")
+            try:
+                status, payload = output_queue.get_nowait()
+            except queue.Empty as exc:
+                raise RuntimeError("scan worker exited without returning a result") from exc
+            if status == "ok":
+                return payload
+            raise RuntimeError(str(payload))
+        finally:
+            output_queue.close()
+            output_queue.join_thread()
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
         task = asyncio.create_task(awaitable)
