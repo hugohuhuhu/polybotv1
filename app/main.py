@@ -734,7 +734,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         previous_midpoints: dict[str, float] | None = None,
     ) -> Any:
         task = asyncio.create_task(asyncio.to_thread(run_scan_cycle_worker_sync, previous_midpoints))
-        last_monitor_at = 0.0
+        last_monitor_at = asyncio.get_running_loop().time()
         while not task.done():
             _touch_watch_liveness()
             now = asyncio.get_running_loop().time()
@@ -743,12 +743,13 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 task.add_done_callback(consume_timed_out_scan_result)
                 raise TimeoutError
             monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
-            if now - last_monitor_at >= monitor_interval:
-                last_monitor_at = now
-                await monitor_open_positions_with_budget("scan")
             done, _pending = await asyncio.wait({task}, timeout=min(monitor_interval, remaining))
             if done:
                 break
+            now = asyncio.get_running_loop().time()
+            if now - last_monitor_at >= monitor_interval:
+                last_monitor_at = now
+                await monitor_open_positions_with_budget("scan")
         try:
             return task.result()
         except ScanWorkerBusy as exc:
