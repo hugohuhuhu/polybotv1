@@ -293,7 +293,10 @@ def _run_scan_cycle_process(
                     repository=repository,
                 )
 
-        output_queue.put(("ok", asyncio.run(run_scan())))
+        result = asyncio.run(run_scan())
+        result.events = []
+        result.markets = list(result.shortlisted_markets)
+        output_queue.put(("ok", result))
     except BaseException:
         output_queue.put(("error", traceback.format_exc()))
 
