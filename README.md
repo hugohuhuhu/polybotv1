@@ -203,7 +203,7 @@ The local live launch scripts enable a time-funnel start-distance rule for crypt
 Relevant settings:
 
 - `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
-- `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT` limits the live crypto Up/Down universe to BTC and ETH.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT` limits the live crypto Up/Down universe to BTC, ETH, and SOL.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=90` blocks new crypto Up/Down entries inside the final 90 seconds.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`

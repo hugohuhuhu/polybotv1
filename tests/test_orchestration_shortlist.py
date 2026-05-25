@@ -399,7 +399,7 @@ def test_near_close_pool_crypto_updown_only_filters_first() -> None:
     assert [market.slug for market in shortlisted] == ["ethereum-updown"]
     assert diagnostics["near_close_scan_crypto_updown_only"] is True
     assert diagnostics["crypto_updown_discovered_count"] == 1
-    assert diagnostics["crypto_updown_allowed_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert diagnostics["crypto_updown_allowed_symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
 def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
@@ -439,6 +439,45 @@ def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
 
     assert shortlisted == []
     assert diagnostics["crypto_updown_discovered_count"] == 0
+
+
+def test_near_close_pool_crypto_updown_only_allows_sol() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=5,
+        NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
+        NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+    )
+    now = datetime.now(timezone.utc)
+    sol = make_market(
+        "sol-updown",
+        event_id="crypto",
+        slug="sol-updown",
+        question="Solana Up or Down - May 2, 5:55AM-6:00AM ET",
+        yes_price=0.68,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "event_title": "Solana Up or Down - May 2, 5:55AM-6:00AM ET",
+            "outcome_labels": ["Up", "Down"],
+            "token_ids": ["sol-up", "sol-down"],
+            "end_date": now + timedelta(minutes=8),
+            "resolution_source": "https://data.chain.link/streams/sol-usd",
+            "raw": {
+                "eventStartTime": (now - timedelta(minutes=7)).isoformat(),
+                "near_close_crypto_variant": "updown_proxy",
+                "near_close_crypto_spot_price": 181.0,
+                "near_close_crypto_start_price": 180.0,
+                "near_close_crypto_start_distance": 0.005556,
+                "near_close_crypto_winning_outcome": "Up",
+            },
+        }
+    )
+
+    shortlisted, diagnostics = shortlist_near_close_markets([sol], settings=settings)
+
+    assert [market.slug for market in shortlisted] == ["sol-updown"]
+    assert diagnostics["crypto_updown_discovered_count"] == 1
 
 
 def test_near_close_pool_excludes_xrp_related_markets() -> None:

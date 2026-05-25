@@ -187,7 +187,7 @@ class Settings(BaseSettings):
     near_close_crypto_updown_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED")
     near_close_crypto_updown_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE")
     near_close_crypto_updown_symbols: str = Field(
-        default="BTCUSDT,ETHUSDT",
+        default="BTCUSDT,ETHUSDT,SOLUSDT",
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS",
     )
     near_close_crypto_updown_min_minutes_to_end: float = Field(
