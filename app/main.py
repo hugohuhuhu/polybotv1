@@ -792,6 +792,28 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 for snapshot in initial.books.values():
                     book_state.upsert_snapshot(snapshot)
                 try:
+                    persist_scan_cycle(repository, initial, settings)
+                    repository.save_watch_heartbeat(
+                        source="watch",
+                        state="running",
+                        latest_scan_at=initial.executed_at,
+                        message="watch initial scan completed",
+                        details={
+                            "phase": "completed",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "scan_completed_at": initial.executed_at.isoformat(),
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                            "scan_timeout_sec": settings.watch_scan_timeout_sec,
+                            "monitored_markets": len(initial.shortlisted_markets),
+                            "book_count": len(initial.books),
+                            "opportunity_count": len(initial.opportunities),
+                        },
+                    )
+                except Exception as exc:
+                    if not _is_sqlite_lock_error(exc):
+                        raise
+                    logger.warning("watch initial persistence skipped because SQLite is locked: %s", exc)
+                try:
                     await wait_for_watch_auxiliary(
                         _sync_live_fills_to_db(repository=repository, live_trader=live_trader, settings=settings)
                     )
@@ -827,28 +849,6 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 for snapshot in open_position_books.values():
                     book_state.upsert_snapshot(snapshot)
                 repository.get_trading_controls(default_controls)
-                try:
-                    persist_scan_cycle(repository, initial, settings)
-                    repository.save_watch_heartbeat(
-                        source="watch",
-                        state="running",
-                        latest_scan_at=initial.executed_at,
-                        message="watch initial scan completed",
-                        details={
-                            "phase": "completed",
-                            "scan_started_at": scan_started_at.isoformat(),
-                            "scan_completed_at": initial.executed_at.isoformat(),
-                            "delay_sec": settings.watch_timeout_retry_sec,
-                            "scan_timeout_sec": settings.watch_scan_timeout_sec,
-                            "monitored_markets": len(initial.shortlisted_markets),
-                            "book_count": len(initial.books),
-                            "opportunity_count": len(initial.opportunities),
-                        },
-                    )
-                except Exception as exc:
-                    if not _is_sqlite_lock_error(exc):
-                        raise
-                    logger.warning("watch initial persistence skipped because SQLite is locked: %s", exc)
             break
         except TimeoutError:
             with contextlib.suppress(Exception):
