@@ -590,26 +590,49 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
 
     async def monitor_open_positions_once() -> None:
         _touch_watch_liveness()
-        try:
+        monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
+        monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
+
+        def load_monitor_inputs() -> tuple[TradingControls, list[str]]:
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
                 controls = repository.get_trading_controls(default_controls)
                 if not controls.armed:
-                    return
-                runtime_settings = controls.apply(settings)
-                live_trader.settings = runtime_settings
-                open_position_books = await _fetch_open_position_books(settings=runtime_settings, repository=repository)
-                if not open_position_books:
-                    return
-                for snapshot in open_position_books.values():
-                    book_state.upsert_snapshot(snapshot)
-                await ensure_websocket(list(book_state.books.keys()))
+                    return controls, []
+                return controls, _open_position_token_ids(repository)
+
+        try:
+            controls, token_ids = await asyncio.wait_for(
+                asyncio.to_thread(load_monitor_inputs),
+                timeout=monitor_timeout,
+            )
+            if not controls.armed or not token_ids:
+                return
+            runtime_settings = controls.apply(settings)
+            live_trader.settings = runtime_settings
+            clob = ClobClient(
+                runtime_settings.clob_base_url,
+                concurrency=min(max(len(token_ids), 1), runtime_settings.book_fetch_concurrency),
+            )
+            try:
+                open_position_books = await clob.get_order_books(token_ids)
+            finally:
+                await clob.close()
+            if not open_position_books:
+                return
+            for snapshot in open_position_books.values():
+                book_state.upsert_snapshot(snapshot)
+            await ensure_websocket(list(book_state.books.keys()))
+            with closing(connect_db(settings)) as connection:
+                repository = ScannerRepository(connection)
                 await execute_near_close_taker_exits(
                     repository=repository,
                     live_trader=live_trader,
                     settings=runtime_settings,
                     watch_books=book_state.books,
                 )
+        except TimeoutError:
+            raise
         except Exception as exc:
             logger.warning("Fast open-position monitor failed", context={"error": str(exc)})
             with contextlib.suppress(Exception):
