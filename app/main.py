@@ -3,11 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import multiprocessing
 import os
-import queue
 import sqlite3
-import traceback
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -272,33 +269,6 @@ async def _sync_live_fills_to_db(
 
 
 _execute_near_close_taker_exits = execute_near_close_taker_exits
-
-
-def _run_scan_cycle_process(
-    *,
-    limit: int | None,
-    previous_midpoints: dict[str, float] | None,
-    output_queue: Any,
-) -> None:
-    try:
-        settings = get_settings()
-
-        async def run_scan() -> Any:
-            with closing(connect_db(settings)) as connection:
-                repository = ScannerRepository(connection)
-                return await execute_scan_cycle(
-                    settings,
-                    limit=limit,
-                    previous_midpoints=previous_midpoints,
-                    repository=repository,
-                )
-
-        result = asyncio.run(run_scan())
-        result.events = []
-        result.markets = list(result.shortlisted_markets)
-        output_queue.put(("ok", result))
-    except BaseException:
-        output_queue.put(("error", traceback.format_exc()))
 
 
 def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
@@ -732,47 +702,34 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         loop_started_at: float,
         previous_midpoints: dict[str, float] | None = None,
     ) -> Any:
-        process_context = multiprocessing.get_context("spawn")
-        output_queue = process_context.Queue(maxsize=1)
-        process = process_context.Process(
-            target=_run_scan_cycle_process,
-            kwargs={
-                "limit": args.limit,
-                "previous_midpoints": previous_midpoints,
-                "output_queue": output_queue,
-            },
-            daemon=True,
-        )
-        process.start()
+        async def run_scan() -> Any:
+            with closing(connect_db(settings)) as connection:
+                repository = ScannerRepository(connection)
+                return await execute_scan_cycle(
+                    settings,
+                    limit=args.limit,
+                    previous_midpoints=previous_midpoints,
+                    repository=repository,
+                )
+
+        task = asyncio.create_task(run_scan())
         try:
-            while True:
+            while not task.done():
                 _touch_watch_liveness()
-                try:
-                    status, payload = output_queue.get_nowait()
-                except queue.Empty:
-                    status = None
-                    payload = None
-                if status == "ok":
-                    with contextlib.suppress(Exception):
-                        process.terminate()
-                    return payload
-                if status == "error":
-                    with contextlib.suppress(Exception):
-                        process.terminate()
-                    raise RuntimeError(str(payload))
-                if not process.is_alive():
-                    raise RuntimeError(f"scan worker exited without returning a result; code={process.exitcode}")
                 now = asyncio.get_running_loop().time()
                 remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
                 if remaining <= 0:
-                    with contextlib.suppress(Exception):
-                        process.kill()
-                    await asyncio.sleep(1.0)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
                     raise TimeoutError
-                await asyncio.sleep(min(max(float(settings.near_close_open_position_monitor_sec), 0.5), remaining))
+                done, _pending = await asyncio.wait({task}, timeout=min(1.0, remaining))
+                if done:
+                    break
+            return task.result()
         finally:
-            with contextlib.suppress(Exception):
-                output_queue.cancel_join_thread()
+            if not task.done():
+                task.cancel()
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
         task = asyncio.create_task(awaitable)
