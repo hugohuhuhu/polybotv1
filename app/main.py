@@ -22,7 +22,9 @@ from app.config import Settings, get_settings
 from app.models.runtime import TradingControls
 from app.orchestration import (
     collect_previous_midpoints,
+    execute_monitor_cycle,
     execute_scan_cycle,
+    persist_monitor_cycle,
     persist_scan_cycle,
     shortlist_markets,
 )
@@ -173,8 +175,12 @@ async def _watch_delay(
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         if monitor_callback is not None:
             monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
+            monitor_task = asyncio.create_task(monitor_callback())
             try:
-                await asyncio.wait_for(monitor_callback(), timeout=monitor_timeout)
+                done, _pending = await asyncio.wait({monitor_task}, timeout=monitor_timeout)
+                if not done:
+                    monitor_task.cancel()
+                    raise TimeoutError
             except TimeoutError:
                 logger.warning(
                     "Fast open-position monitor timed out during watch delay.",
@@ -185,6 +191,9 @@ async def _watch_delay(
                     "Fast open-position monitor failed during watch delay.",
                     context={"error": str(exc)},
                 )
+            finally:
+                if not monitor_task.done():
+                    monitor_task.cancel()
         sleep_for = min(remaining, monitor_interval)
         await asyncio.sleep(sleep_for)
 
@@ -289,12 +298,18 @@ async def _fetch_open_position_books(
     settings: Settings,
     repository: ScannerRepository,
 ) -> dict[str, object]:
-    token_ids = _open_position_token_ids(repository)
+    def load_token_ids() -> list[str]:
+        with closing(connect_db(settings)) as connection:
+            return _open_position_token_ids(ScannerRepository(connection))
+
+    token_ids = await asyncio.to_thread(load_token_ids)
     if not token_ids:
         return {}
     clob = ClobClient(
         settings.clob_base_url,
+        timeout=settings.book_fetch_timeout_sec,
         concurrency=min(max(len(token_ids), 1), settings.book_fetch_concurrency),
+        retries=settings.book_fetch_retries,
     )
     try:
         return await clob.get_order_books(token_ids)
@@ -603,7 +618,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
 
         clob = ClobClient(
             runtime_settings.clob_base_url,
+            timeout=runtime_settings.book_fetch_timeout_sec,
             concurrency=min(max(len(token_ids), 1), runtime_settings.book_fetch_concurrency),
+            retries=runtime_settings.book_fetch_retries,
         )
         try:
             open_position_books = await clob.get_order_books(token_ids)
@@ -701,10 +718,17 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         *,
         loop_started_at: float,
         previous_midpoints: dict[str, float] | None = None,
+        monitored_markets: list[Any] | None = None,
     ) -> Any:
         async def run_scan() -> Any:
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
+                if monitored_markets is not None:
+                    return await execute_monitor_cycle(
+                        settings,
+                        monitored_markets,
+                        previous_midpoints=previous_midpoints,
+                    )
                 return await execute_scan_cycle(
                     settings,
                     limit=args.limit,
@@ -720,8 +744,8 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
                 if remaining <= 0:
                     task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                        await asyncio.wait_for(task, timeout=2.0)
                     raise TimeoutError
                 done, _pending = await asyncio.wait({task}, timeout=min(1.0, remaining))
                 if done:
@@ -740,8 +764,8 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                        await asyncio.wait_for(task, timeout=2.0)
                     raise TimeoutError
                 done, _pending = await asyncio.wait({task}, timeout=min(5.0, remaining))
                 if done:
@@ -789,27 +813,32 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             "opportunity_count": len(initial.opportunities),
                         },
                     )
-                    persist_scan_cycle(repository, initial, settings)
+                    persist_monitor_cycle(
+                        repository,
+                        initial,
+                        discovered_market_count=len(initial.markets),
+                    )
                 except Exception as exc:
                     if not _is_sqlite_lock_error(exc):
                         raise
                     logger.warning("watch initial persistence skipped because SQLite is locked: %s", exc)
-                try:
-                    await wait_for_watch_auxiliary(
-                        _sync_live_fills_to_db(repository=repository, live_trader=live_trader, settings=settings)
-                    )
-                except TimeoutError:
-                    repository.save_execution_event(
-                        source="watch",
-                        mode="live",
-                        opportunity_id=None,
-                        status="live_fill_sync_timeout",
-                        message=(
-                            f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
-                            "continuing watch loop."
-                        ),
-                        details={"timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC},
-                    )
+                if settings.watch_live_fill_sync_enabled:
+                    try:
+                        await wait_for_watch_auxiliary(
+                            _sync_live_fills_to_db(repository=repository, live_trader=live_trader, settings=settings)
+                        )
+                    except TimeoutError:
+                        repository.save_execution_event(
+                            source="watch",
+                            mode="live",
+                            opportunity_id=None,
+                            status="live_fill_sync_timeout",
+                            message=(
+                                f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                                "continuing watch loop."
+                            ),
+                            details={"timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC},
+                        )
                 try:
                     open_position_books = await wait_for_watch_auxiliary(
                         _fetch_open_position_books(settings=settings, repository=repository)
@@ -852,7 +881,26 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 settings,
                 message="watch initial scan timed out; delaying before the next scan",
                 details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
-                monitor_callback=monitor_open_positions_once,
+            )
+        except Exception as exc:
+            logger.warning("watch initial scan failed", context={"error": str(exc)})
+            with contextlib.suppress(Exception):
+                with closing(connect_db(settings)) as connection:
+                    ScannerRepository(connection).save_watch_heartbeat(
+                        source="watch",
+                        state="error",
+                        message="watch initial scan failed; delaying before the next scan.",
+                        details={
+                            "phase": "error",
+                            "scan_started_at": scan_started_at.isoformat(),
+                            "error": str(exc),
+                            "delay_sec": settings.watch_timeout_retry_sec,
+                        },
+                    )
+            await _watch_delay(
+                settings,
+                message="watch initial scan failed; delaying before the next scan",
+                details={"previous_phase": "error", "scan_started_at": scan_started_at.isoformat()},
             )
     console.show_discovery_summary(initial.events, initial.markets)
     console.show_opportunities(initial.opportunities[:10])
@@ -860,8 +908,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
 
     try:
         previous_midpoints = collect_previous_midpoints(book_state.books)
+        monitored_markets = list(initial.shortlisted_markets)
         while True:
-            await _watch_delay(settings, monitor_callback=monitor_open_positions_once)
+            await _watch_delay(settings)
             _touch_watch_liveness()
             scan_started_at = datetime.now(timezone.utc)
             loop_started_at = asyncio.get_running_loop().time()
@@ -883,31 +932,56 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                     cycle = await run_scan_cycle_with_budget(
                         loop_started_at=loop_started_at,
                         previous_midpoints=previous_midpoints,
+                        monitored_markets=monitored_markets or None,
                     )
                 except TimeoutError:
-                    repository.save_watch_heartbeat(
-                        source="watch",
-                        state="timeout",
-                        message=(
-                            f"watch scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
-                            f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
-                        ),
-                        details={
-                            "phase": "timeout",
-                            "scan_started_at": scan_started_at.isoformat(),
-                            "timeout_sec": settings.watch_scan_timeout_sec,
-                            "delay_sec": settings.watch_timeout_retry_sec,
-                        },
-                    )
+                    with contextlib.suppress(Exception):
+                        repository.save_watch_heartbeat(
+                            source="watch",
+                            state="timeout",
+                            message=(
+                                f"watch scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
+                                f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
+                            ),
+                            details={
+                                "phase": "timeout",
+                                "scan_started_at": scan_started_at.isoformat(),
+                                "timeout_sec": settings.watch_scan_timeout_sec,
+                                "delay_sec": settings.watch_timeout_retry_sec,
+                            },
+                        )
                     await _watch_delay(
                         settings,
                         message="watch scan timed out; delaying before the next scan",
                         details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
-                        monitor_callback=monitor_open_positions_once,
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning("watch scan failed", context={"error": str(exc)})
+                    with contextlib.suppress(Exception):
+                        repository.save_watch_heartbeat(
+                            source="watch",
+                            state="error",
+                            message="watch scan failed; delaying before the next scan.",
+                            details={
+                                "phase": "error",
+                                "scan_started_at": scan_started_at.isoformat(),
+                                "error": str(exc),
+                                "delay_sec": settings.watch_timeout_retry_sec,
+                            },
+                        )
+                    await _watch_delay(
+                        settings,
+                        message="watch scan failed; delaying before the next scan",
+                        details={"previous_phase": "error", "scan_started_at": scan_started_at.isoformat()},
                     )
                     continue
                 try:
-                    persist_scan_cycle(repository, cycle, settings)
+                    persist_monitor_cycle(
+                        repository,
+                        cycle,
+                        discovered_market_count=len(cycle.markets),
+                    )
                 except Exception as exc:
                     if not _is_sqlite_lock_error(exc):
                         raise
@@ -940,32 +1014,34 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 book_state.books = {}
                 for snapshot in cycle.books.values():
                     book_state.upsert_snapshot(snapshot)
+                monitored_markets = list(cycle.shortlisted_markets)
 
                 controls = repository.get_trading_controls(default_controls)
                 runtime_settings = controls.apply(settings)
-                try:
-                    await wait_for_watch_auxiliary(
-                        _sync_live_fills_to_db(
-                            repository=repository,
-                            live_trader=live_trader,
-                            settings=runtime_settings,
+                if runtime_settings.watch_live_fill_sync_enabled:
+                    try:
+                        await wait_for_watch_auxiliary(
+                            _sync_live_fills_to_db(
+                                repository=repository,
+                                live_trader=live_trader,
+                                settings=runtime_settings,
+                            )
                         )
-                    )
-                except TimeoutError:
-                    repository.save_execution_event(
-                        source="watch",
-                        mode="live",
-                        opportunity_id=None,
-                        status="live_fill_sync_timeout",
-                        message=(
-                            f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
-                            "continuing to opportunity execution."
-                        ),
-                        details={
-                            "timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC,
-                            "scan_started_at": scan_started_at.isoformat(),
-                        },
-                    )
+                    except TimeoutError:
+                        repository.save_execution_event(
+                            source="watch",
+                            mode="live",
+                            opportunity_id=None,
+                            status="live_fill_sync_timeout",
+                            message=(
+                                f"Live fill sync exceeded {WATCH_AUXILIARY_TIMEOUT_SEC:.0f}s after scan; "
+                                "continuing to opportunity execution."
+                            ),
+                            details={
+                                "timeout_sec": WATCH_AUXILIARY_TIMEOUT_SEC,
+                                "scan_started_at": scan_started_at.isoformat(),
+                            },
+                        )
                 try:
                     open_position_books = await wait_for_watch_auxiliary(
                         _fetch_open_position_books(settings=runtime_settings, repository=repository)

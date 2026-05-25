@@ -77,7 +77,12 @@ SCAN_REJECTION_REASON_LABELS = {
 
 
 async def _fetch_orderbooks_for_tokens(settings: Settings, token_ids: list[str]) -> dict[str, Any]:
-    clob = ClobClient(settings.clob_base_url, concurrency=min(max(len(token_ids), 1), settings.book_fetch_concurrency))
+    clob = ClobClient(
+        settings.clob_base_url,
+        timeout=settings.book_fetch_timeout_sec,
+        concurrency=min(max(len(token_ids), 1), settings.book_fetch_concurrency),
+        retries=settings.book_fetch_retries,
+    )
     try:
         return await clob.get_order_books(token_ids)
     finally:

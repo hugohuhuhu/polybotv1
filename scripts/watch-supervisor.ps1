@@ -13,9 +13,9 @@ $watchPidFile = Join-Path $logDir "watch.pid"
 $watchLivenessFile = Join-Path $logDir "watch.liveness"
 $supervisorPidFile = Join-Path $logDir "watch-supervisor.pid"
 $mutexName = "Global\PolymarketMispricingWatchSupervisor"
-$childStaleKillSec = 150
-$childStartupGraceSec = 30
-$restartDelaySec = 30
+$childStaleKillSec = 45
+$childStartupGraceSec = 10
+$restartDelaySec = 5
 
 Add-Type @"
 using System;
@@ -59,11 +59,12 @@ Clear-InvalidPrivateKeyOverride
 $env:SQLITE_PATH = $sqlitePath
 $env:SQLITE_BACKUP_DIR = $sqliteBackupDir
 $env:SCAN_INTERVAL_SEC = "30"
-$env:WATCH_SCAN_TIMEOUT_SEC = "120"
+$env:WATCH_SCAN_TIMEOUT_SEC = "5"
 $env:WATCH_TIMEOUT_RETRY_SEC = "21"
+$env:WATCH_LIVE_FILL_SYNC_ENABLED = "false"
 $childStaleKillSec = [math]::Max(
     $childStaleKillSec,
-    [int]$env:WATCH_SCAN_TIMEOUT_SEC + [int]$env:WATCH_TIMEOUT_RETRY_SEC + 45
+    [int]$env:WATCH_SCAN_TIMEOUT_SEC + [int]$env:WATCH_TIMEOUT_RETRY_SEC + 15
 )
 $env:DISCOVERY_REFRESH_SEC = "900"
 $env:DISCOVERY_EVENT_LIMIT = "100"
@@ -72,7 +73,12 @@ $env:WATCH_BUCKET_GENERAL_LIMIT = "8"
 $env:WATCH_BUCKET_EVENT_LIMIT = "4"
 $env:WATCH_BUCKET_RECENT_LIMIT = "4"
 $env:WATCH_BUCKET_SPECIAL_LIMIT = "2"
-$env:BOOK_FETCH_CONCURRENCY = "5"
+$env:BOOK_FETCH_CONCURRENCY = "12"
+$env:GAMMA_TIMEOUT_SEC = "2"
+$env:GAMMA_RETRIES = "1"
+$env:CRYPTO_PRICE_TIMEOUT_SEC = "1"
+$env:BOOK_FETCH_TIMEOUT_SEC = "1.5"
+$env:BOOK_FETCH_RETRIES = "1"
 $env:DASHBOARD_REFRESH_SEC = "30"
 $env:AUTO_REDEEM_ENABLED = "true"
 $env:AUTO_REDEEM_REFRESH_SEC = "300"

@@ -206,7 +206,7 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
     if not symbols:
         return
-    client = CryptoPriceClient()
+    client = CryptoPriceClient(timeout=settings.crypto_price_timeout_sec)
     try:
         prices = await client.get_prices(symbols)
         start_prices = await client.get_open_prices_for_requests(start_price_requests) if start_price_requests else {}
@@ -584,17 +584,24 @@ async def discover_markets(
     *,
     include_near_close_window: bool = False,
 ) -> tuple[list[EventRecord], list[MarketRecord]]:
-    gamma = GammaClient(settings.gamma_base_url)
+    gamma = GammaClient(
+        settings.gamma_base_url,
+        timeout=settings.gamma_timeout_sec,
+        retries=settings.gamma_retries,
+    )
     try:
-        if include_near_close_window:
-            now = datetime.now(timezone.utc)
-            return await gamma.discover_markets_by_end_date(
-                end_date_min=now,
-                end_date_max=now + timedelta(minutes=settings.near_close_scan_lookahead_minutes),
-                limit=settings.near_close_scan_event_limit,
-            )
-        events, markets = await gamma.discover_active_markets(limit=limit or settings.discovery_event_limit)
-        return events, markets
+        try:
+            if include_near_close_window:
+                now = datetime.now(timezone.utc)
+                return await gamma.discover_markets_by_end_date(
+                    end_date_min=now,
+                    end_date_max=now + timedelta(minutes=settings.near_close_scan_lookahead_minutes),
+                    limit=settings.near_close_scan_event_limit,
+                )
+            events, markets = await gamma.discover_active_markets(limit=limit or settings.discovery_event_limit)
+            return events, markets
+        except Exception:
+            return [], []
     finally:
         await gamma.close()
 
@@ -687,7 +694,12 @@ def shortlist_markets(
 
 async def fetch_books(settings: Settings, markets: list[MarketRecord]) -> dict[str, OrderBookSnapshot]:
     token_ids = [token_id for market in markets for token_id in market.token_ids]
-    clob = ClobClient(settings.clob_base_url, concurrency=settings.book_fetch_concurrency)
+    clob = ClobClient(
+        settings.clob_base_url,
+        timeout=settings.book_fetch_timeout_sec,
+        concurrency=settings.book_fetch_concurrency,
+        retries=settings.book_fetch_retries,
+    )
     try:
         return await clob.get_order_books(token_ids)
     finally:

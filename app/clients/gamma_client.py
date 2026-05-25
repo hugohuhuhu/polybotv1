@@ -15,23 +15,23 @@ from app.utils.time_utils import parse_datetime
 class GammaClient:
     """Client for market discovery via the public Gamma API."""
 
-    def __init__(self, base_url: str, timeout: float = 15.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 15.0, retries: int = 3) -> None:
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=timeout)
+        self._retries = max(int(retries), 1)
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        retries = 3
         backoff = 1.0
-        for attempt in range(retries):
+        for attempt in range(self._retries):
             try:
                 response = await self._client.get(path, params=params)
                 response.raise_for_status()
                 return response.json()
             except httpx.HTTPError:
-                if attempt == retries - 1:
+                if attempt == self._retries - 1:
                     raise
                 await asyncio.sleep(backoff)
                 backoff *= 2

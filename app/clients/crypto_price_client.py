@@ -34,16 +34,17 @@ class CryptoPriceClient:
         await self._client.aclose()
 
     async def get_prices(self, symbols: set[str]) -> dict[str, float]:
-        prices: dict[str, float] = {}
-        for symbol in sorted(symbols):
+        async def fetch_price(symbol: str) -> tuple[str, float | None]:
             try:
                 response = await self._client.get("/api/v3/ticker/price", params={"symbol": symbol})
                 response.raise_for_status()
                 payload: dict[str, Any] = response.json()
-                prices[symbol] = float(payload["price"])
+                return symbol, float(payload["price"])
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
-                continue
-        return prices
+                return symbol, None
+
+        fetched = await asyncio.gather(*(fetch_price(symbol) for symbol in sorted(symbols)))
+        return {symbol: price for symbol, price in fetched if price is not None}
 
     async def get_open_prices_at(self, symbols_by_start_ms: dict[str, int]) -> dict[str, float]:
         prices: dict[str, float] = {}

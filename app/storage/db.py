@@ -355,7 +355,7 @@ class DatabaseSession:
     def execute(self, statement: str, params: Sequence[Any] | None = None) -> Any:
         sql = self._sql(statement)
         parameters = tuple(params or ())
-        attempts = 6 if self.backend == "sqlite" else 1
+        attempts = 3 if self.backend == "sqlite" else 1
         delay_sec = 0.15
         for attempt in range(attempts):
             try:
@@ -611,7 +611,7 @@ _required_scan_cycle_columns = {
 def _configure_sqlite_connection(connection: sqlite3.Connection) -> None:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA busy_timeout = 1000")
 
 
 def _is_sqlite_lock_error(exc: Exception) -> bool:
@@ -705,7 +705,7 @@ def connect_db(target: Settings | Path) -> DatabaseSession:
         warnings.warn(warning, RuntimeWarning, stacklevel=2)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        connection = sqlite3.connect(sqlite_path, timeout=30.0, check_same_thread=False)
+        connection = sqlite3.connect(sqlite_path, timeout=1.0, check_same_thread=False)
         _configure_sqlite_connection(connection)
         session = DatabaseSession("sqlite", connection)
         _initialize_sqlite_database(session, sqlite_path.resolve())
@@ -718,7 +718,7 @@ def connect_db(target: Settings | Path) -> DatabaseSession:
         if not _is_sqlite_corruption_error(exc):
             raise
         _quarantine_sqlite_database(sqlite_path.resolve())
-        connection = sqlite3.connect(sqlite_path, timeout=30.0, check_same_thread=False)
+        connection = sqlite3.connect(sqlite_path, timeout=1.0, check_same_thread=False)
         _configure_sqlite_connection(connection)
         session = DatabaseSession("sqlite", connection)
         _initialize_sqlite_database(session, sqlite_path.resolve())
