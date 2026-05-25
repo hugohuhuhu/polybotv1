@@ -813,7 +813,7 @@ def build_watch_status(
         message = heartbeat_message or "watch 正在掃描。"
     elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "delay":
         state = "running"
-        message = heartbeat_message or "watch 掃描完成，正在 delay 30 秒。"
+        message = heartbeat_message or f"watch 掃描完成，正在 delay {settings.watch_timeout_retry_sec:.0f} 秒。"
     elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "timeout":
         state = "running"
         message = heartbeat_message or "watch 上一輪掃描超時，正在等待下一輪。"

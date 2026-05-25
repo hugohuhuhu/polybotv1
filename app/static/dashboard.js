@@ -244,7 +244,7 @@ function renderSyncCountdown() {
   const details = heartbeat.details || {};
   const phase = latestWatchState?.phase || details.phase || heartbeat.state || latestWatchState?.state;
   const scanTimeoutSec = Number(latestWatchState?.watch_scan_timeout_sec || details.timeout_sec || 60);
-  const delaySec = Number(latestWatchState?.watch_delay_sec || details.delay_sec || 30);
+  const delaySec = Number(latestWatchState?.watch_delay_sec || details.delay_sec || 21);
   let progress = 0;
 
   refreshLabel.textContent = `掃描 → delay ${formatNumber(delaySec)} 秒 → 再次掃描`;

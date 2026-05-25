@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     watch_positive_edge_lookback_hours: int = Field(default=24, alias="WATCH_POSITIVE_EDGE_LOOKBACK_HOURS")
     scan_interval_sec: int = Field(default=30, alias="SCAN_INTERVAL_SEC")
     watch_scan_timeout_sec: float = Field(default=60.0, alias="WATCH_SCAN_TIMEOUT_SEC")
-    watch_timeout_retry_sec: float = Field(default=30.0, alias="WATCH_TIMEOUT_RETRY_SEC")
+    watch_timeout_retry_sec: float = Field(default=21.0, alias="WATCH_TIMEOUT_RETRY_SEC")
     discovery_refresh_sec: int = Field(default=900, alias="DISCOVERY_REFRESH_SEC")
     book_fetch_concurrency: int = Field(default=5, alias="BOOK_FETCH_CONCURRENCY")
     min_minutes_to_resolution: int = Field(default=120, alias="MIN_MINUTES_TO_RESOLUTION")
