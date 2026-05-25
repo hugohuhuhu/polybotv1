@@ -747,6 +747,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 now = asyncio.get_running_loop().time()
                 remaining = settings.watch_scan_timeout_sec - (now - loop_started_at)
                 if remaining <= 0:
+                    with contextlib.suppress(Exception):
+                        process.kill()
+                    await asyncio.sleep(1.0)
                     raise TimeoutError
                 await asyncio.sleep(min(max(float(settings.near_close_open_position_monitor_sec), 0.5), remaining))
             _touch_watch_liveness()
