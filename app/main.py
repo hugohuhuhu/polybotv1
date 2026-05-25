@@ -765,8 +765,8 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 return payload
             raise RuntimeError(str(payload))
         finally:
+            output_queue.cancel_join_thread()
             output_queue.close()
-            output_queue.join_thread()
 
     async def wait_for_watch_auxiliary(awaitable: Any) -> Any:
         task = asyncio.create_task(awaitable)
