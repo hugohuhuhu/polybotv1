@@ -959,6 +959,174 @@ def test_near_close_entry_bucket_report_groups_live_trade_performance(tmp_path) 
     assert round(float(report["60-30"]["average_crypto_start_distance"]), 3) == 0.004
 
 
+def test_near_close_signal_replay_report_groups_settled_opportunities(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "signal-replay-report.db"))
+    now = datetime.now(timezone.utc)
+    repository.save_markets(
+        [
+            EventRecord(event_id="replay-event-btc", title="BTC replay"),
+            EventRecord(event_id="replay-event-eth", title="ETH replay"),
+            EventRecord(event_id="replay-event-sol", title="SOL replay"),
+        ],
+        [
+            MarketRecord(
+                market_id="replay-btc",
+                event_id="replay-event-btc",
+                question="BTC Up/Down",
+                slug="btc-updown-5m-1780202700",
+                outcome_labels=["Up", "Down"],
+                token_ids=["btc-up", "btc-down"],
+                active=False,
+                closed=True,
+                end_date=now - timedelta(minutes=10),
+                raw={"outcomes": '["Up", "Down"]', "outcomePrices": '["0", "1"]'},
+            ),
+            MarketRecord(
+                market_id="replay-eth",
+                event_id="replay-event-eth",
+                question="ETH Up/Down",
+                slug="eth-updown-5m-1780202700",
+                outcome_labels=["Up", "Down"],
+                token_ids=["eth-up", "eth-down"],
+                active=False,
+                closed=True,
+                end_date=now - timedelta(minutes=10),
+                raw={"outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]'},
+            ),
+            MarketRecord(
+                market_id="replay-sol",
+                event_id="replay-event-sol",
+                question="SOL Up/Down",
+                slug="sol-updown-5m-1780203000",
+                outcome_labels=["Up", "Down"],
+                token_ids=["sol-up", "sol-down"],
+                active=True,
+                closed=False,
+                end_date=now + timedelta(minutes=5),
+                raw={"outcomes": '["Up", "Down"]', "outcomePrices": '["0.52", "0.48"]'},
+            ),
+        ],
+    )
+
+    def make_near_close_signal(
+        opportunity_id: str,
+        *,
+        slug: str,
+        token_id: str,
+        outcome_label: str,
+        seconds_left: float,
+        entry_price: float,
+        spread: float,
+        start_distance: float,
+        depth: float,
+        timestamp: datetime,
+    ) -> Opportunity:
+        return Opportunity(
+            opportunity_id=opportunity_id,
+            strategy_type=StrategyType.LATE_RESOLUTION,
+            direction=SignalDirection.REVIEW,
+            title=slug,
+            summary=slug,
+            market_slugs=[slug],
+            market_ids=[slug],
+            token_ids=[token_id],
+            prices={"entry_price": entry_price},
+            gross_edge=1.0 - entry_price,
+            estimated_fees=0.0,
+            slippage_estimate=0.0,
+            net_edge=1.0 - entry_price,
+            max_safe_size=depth,
+            available_liquidity=depth,
+            confidence_score=0.8,
+            suggested_action="Buy near close",
+            timestamp=timestamp,
+            details={
+                "strategy_variant": "near_close_maker",
+                "near_close_variant": "crypto_updown",
+                "market_slug": slug,
+                "token_id": token_id,
+                "outcome_label": outcome_label,
+                "time_to_resolution_sec": seconds_left,
+                "entry_price": entry_price,
+                "spread": spread,
+                "crypto_start_distance": start_distance,
+                "bid_depth_at_best": depth,
+            },
+        )
+
+    repository.save_opportunities(
+        [
+            make_near_close_signal(
+                "replay-btc-win",
+                slug="btc-updown-5m-1780202700",
+                token_id="btc-down",
+                outcome_label="Down",
+                seconds_left=110,
+                entry_price=0.90,
+                spread=0.01,
+                start_distance=0.0006,
+                depth=80,
+                timestamp=now - timedelta(minutes=20),
+            ),
+            make_near_close_signal(
+                "replay-eth-loss",
+                slug="eth-updown-5m-1780202700",
+                token_id="eth-down",
+                outcome_label="Down",
+                seconds_left=70,
+                entry_price=0.80,
+                spread=0.03,
+                start_distance=0.0012,
+                depth=40,
+                timestamp=now - timedelta(minutes=19),
+            ),
+            make_near_close_signal(
+                "replay-eth-loss-duplicate",
+                slug="eth-updown-5m-1780202700",
+                token_id="eth-down",
+                outcome_label="Down",
+                seconds_left=75,
+                entry_price=0.81,
+                spread=0.03,
+                start_distance=0.0012,
+                depth=40,
+                timestamp=now - timedelta(minutes=18),
+            ),
+            make_near_close_signal(
+                "replay-sol-unresolved",
+                slug="sol-updown-5m-1780203000",
+                token_id="sol-up",
+                outcome_label="Up",
+                seconds_left=45,
+                entry_price=0.86,
+                spread=0.02,
+                start_distance=0.0004,
+                depth=20,
+                timestamp=now - timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    deduped = repository.near_close_signal_replay_report()
+    overall = next(row for row in deduped if row["group_type"] == "overall")
+    time_rows = {row["group"]: row for row in deduped if row["group_type"] == "time_bucket"}
+    asset_rows = {row["group"]: row for row in deduped if row["group_type"] == "asset"}
+
+    assert overall["sample_count"] == 3
+    assert overall["resolved_count"] == 2
+    assert overall["unresolved_count"] == 1
+    assert overall["win_rate"] == 0.5
+    assert round(float(overall["average_ev_per_share"]), 2) == -0.35
+    assert time_rows["120-90"]["win_rate"] == 1.0
+    assert round(float(time_rows["90-60"]["average_ev_per_share"]), 2) == -0.80
+    assert asset_rows["BTC"]["win_rate"] == 1.0
+    assert asset_rows["ETH"]["win_rate"] == 0.0
+
+    all_signals = repository.near_close_signal_replay_report(dedupe=False)
+    all_overall = next(row for row in all_signals if row["group_type"] == "overall")
+    assert all_overall["sample_count"] == 4
+
+
 def test_expire_open_orders_for_ended_timestamp_slug_without_market_row(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-slug-orders.db"))
     ended_slug = f"doge-updown-5m-{int(time.time()) - 60}"

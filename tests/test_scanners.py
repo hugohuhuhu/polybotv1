@@ -56,15 +56,17 @@ def test_settings_clamps_near_close_gtd_to_gemini_30m() -> None:
     assert Settings(NEAR_CLOSE_GTD_SECONDS=5400).near_close_gtd_seconds == 1800
 
 
-def test_settings_defaults_to_final_two_minute_entry_experiment() -> None:
+def test_settings_defaults_to_sixty_to_thirty_second_entry_experiment() -> None:
     settings = Settings()
 
-    assert settings.near_close_entry_window_seconds() == (30.0, 120.0)
+    assert settings.near_close_entry_window_seconds() == (30.0, 60.0)
     assert settings.near_close_final_seconds_allow_entry is True
     assert settings.near_close_log_entry_telemetry is True
     assert settings.near_close_entry_seconds_allowed(15.0) is False
     assert settings.near_close_entry_seconds_allowed(30.0) is True
-    assert settings.near_close_entry_seconds_allowed(121.0) is False
+    assert settings.near_close_entry_seconds_allowed(61.0) is False
+    assert settings.near_close_crypto_updown_min_entry_price == 0.86
+    assert settings.near_close_crypto_updown_max_entry_price == 0.90
 
 
 def test_settings_switches_light_mode_when_us_equity_market_is_closed() -> None:
@@ -1064,7 +1066,7 @@ def test_late_resolution_scanner_skips_crypto_updown_when_bid_is_too_high() -> N
     assert rejection_counts == {"bid_at_or_above_skip": 1}
 
 
-def test_late_resolution_scanner_caps_crypto_updown_entry_at_095_below_skip_bid() -> None:
+def test_late_resolution_scanner_caps_crypto_updown_entry_at_090_below_skip_bid() -> None:
     settings = Settings(
         CANDIDATE_MIN_NET_EDGE=-0.0035,
         NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
@@ -1109,9 +1111,9 @@ def test_late_resolution_scanner_caps_crypto_updown_entry_at_095_below_skip_bid(
     )
 
     assert len(opportunities) == 1
-    assert opportunities[0].prices["entry_bid"] == 0.95
+    assert opportunities[0].prices["entry_bid"] == 0.90
     assert opportunities[0].details["min_entry_price"] == 0.86
-    assert opportunities[0].details["max_entry_price"] == 0.95
+    assert opportunities[0].details["max_entry_price"] == 0.90
     assert opportunities[0].details["skip_bid_at_or_above"] == 0.96
 
 

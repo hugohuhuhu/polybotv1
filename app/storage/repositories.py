@@ -3186,6 +3186,275 @@ class ScannerRepository:
             )
         return report
 
+    @staticmethod
+    def _slug_asset(market_slug: str) -> str:
+        text = str(market_slug or "").strip().lower()
+        if "-updown-" in text:
+            return text.split("-updown-", 1)[0].upper()
+        return text.split("-", 1)[0].upper() if text else "UNKNOWN"
+
+    @staticmethod
+    def _range_bucket(value: float | None, ranges: tuple[tuple[str, float | None, float | None], ...]) -> str:
+        if value is None:
+            return "unknown"
+        for label, lower, upper in ranges:
+            lower_ok = lower is None or value >= lower
+            upper_ok = upper is None or value < upper
+            if lower_ok and upper_ok:
+                return label
+        return "other"
+
+    @classmethod
+    def _entry_price_bucket(cls, value: float | None) -> str:
+        return cls._range_bucket(
+            value,
+            (
+                ("<0.80", None, 0.80),
+                ("0.80-0.86", 0.80, 0.86),
+                ("0.86-0.90", 0.86, 0.90),
+                ("0.90-0.94", 0.90, 0.94),
+                ("0.94+", 0.94, None),
+            ),
+        )
+
+    @classmethod
+    def _spread_bucket(cls, value: float | None) -> str:
+        return cls._range_bucket(
+            value,
+            (
+                ("<0.01", None, 0.01),
+                ("0.01-0.02", 0.01, 0.02),
+                ("0.02-0.04", 0.02, 0.04),
+                ("0.04-0.06", 0.04, 0.06),
+                ("0.06+", 0.06, None),
+            ),
+        )
+
+    @classmethod
+    def _start_distance_bucket(cls, value: float | None) -> str:
+        return cls._range_bucket(
+            value,
+            (
+                ("<0.00025", None, 0.00025),
+                ("0.00025-0.00050", 0.00025, 0.00050),
+                ("0.00050-0.00100", 0.00050, 0.00100),
+                ("0.00100-0.00200", 0.00100, 0.00200),
+                ("0.00200+", 0.00200, None),
+            ),
+        )
+
+    @classmethod
+    def _depth_bucket(cls, value: float | None) -> str:
+        return cls._range_bucket(
+            value,
+            (
+                ("<18", None, 18.0),
+                ("18-50", 18.0, 50.0),
+                ("50-100", 50.0, 100.0),
+                ("100-250", 100.0, 250.0),
+                ("250+", 250.0, None),
+            ),
+        )
+
+    def near_close_signal_replay_report(self, *, dedupe: bool = True) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id, details_json, created_at
+            FROM opportunities
+            WHERE strategy_type = 'late_resolution'
+              AND details_json LIKE ?
+            ORDER BY created_at ASC, opportunity_id ASC
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN,),
+        )
+        signals: list[dict[str, Any]] = []
+        market_slugs: set[str] = set()
+        seen: set[tuple[str, str, str]] = set()
+        for row in rows:
+            details = self._load_json(row.get("details_json"), {})
+            if not isinstance(details, dict):
+                continue
+            market_slug = str(details.get("market_slug") or "").strip()
+            token_id = str(details.get("token_id") or "").strip()
+            if not market_slug or not token_id:
+                continue
+            variant = str(details.get("near_close_variant") or "")
+            if variant != "crypto_updown" and "updown" not in market_slug.lower():
+                continue
+            seconds_left = self._json_float(details, "time_to_resolution_sec")
+            if seconds_left is None:
+                minutes_left = self._json_float(details, "minutes_to_resolution")
+                seconds_left = minutes_left * 60.0 if minutes_left is not None else None
+            time_bucket = self._near_close_entry_bucket(seconds_left)
+            if time_bucket is None:
+                continue
+            dedupe_key = (market_slug, token_id, time_bucket)
+            if dedupe and dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            entry_price = self._json_float(details, "entry_price", "entry_bid", "best_bid")
+            if entry_price is None:
+                continue
+            signal = {
+                "opportunity_id": str(row["opportunity_id"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "market_slug": market_slug,
+                "token_id": token_id,
+                "asset": self._slug_asset(market_slug),
+                "outcome_label": str(details.get("outcome_label") or ""),
+                "time_bucket": time_bucket,
+                "entry_price": entry_price,
+                "spread": self._json_float(details, "spread"),
+                "start_distance": self._json_float(details, "crypto_start_distance"),
+                "depth": self._json_float(details, "bid_depth_at_best"),
+            }
+            signals.append(signal)
+            market_slugs.add(market_slug)
+
+        market_status: dict[str, dict[str, Any]] = {}
+        if market_slugs:
+            placeholders = ",".join("?" for _ in market_slugs)
+            market_rows = self.connection.fetchall(
+                f"""
+                SELECT slug, end_date, active, closed, raw_json, discovered_at
+                FROM markets
+                WHERE slug IN ({placeholders})
+                ORDER BY discovered_at ASC
+                """,
+                tuple(sorted(market_slugs)),
+            )
+            now_ts = self._now().timestamp()
+            for row in market_rows:
+                market_status[str(row["slug"])] = self._market_status(row, now_ts=now_ts)
+
+        group_order = (
+            "overall",
+            "time_bucket",
+            "asset",
+            "entry_price",
+            "start_distance",
+            "spread",
+            "depth",
+        )
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def add_group(group_type: str, group: str, signal: dict[str, Any], settlement_price: float | None) -> None:
+            key = (group_type, group)
+            item = groups.setdefault(
+                key,
+                {
+                    "group_type": group_type,
+                    "group": group,
+                    "sample_count": 0,
+                    "resolved_count": 0,
+                    "wins": 0,
+                    "entry_prices": [],
+                    "ev_per_share": [],
+                    "spreads": [],
+                    "start_distances": [],
+                    "depths": [],
+                },
+            )
+            item["sample_count"] += 1
+            item["entry_prices"].append(float(signal["entry_price"]))
+            if signal.get("spread") is not None:
+                item["spreads"].append(float(signal["spread"]))
+            if signal.get("start_distance") is not None:
+                item["start_distances"].append(float(signal["start_distance"]))
+            if signal.get("depth") is not None:
+                item["depths"].append(float(signal["depth"]))
+            if settlement_price is None:
+                return
+            item["resolved_count"] += 1
+            if settlement_price >= 0.999:
+                item["wins"] += 1
+            item["ev_per_share"].append(float(settlement_price) - float(signal["entry_price"]))
+
+        for signal in signals:
+            status = market_status.get(str(signal["market_slug"]) or "", {})
+            if bool(status.get("ended")):
+                settlement_price = self._settlement_price_for_outcome(
+                    str(signal.get("outcome_label") or ""),
+                    status.get("winning_outcome"),
+                )
+            else:
+                settlement_price = None
+            group_values = {
+                "overall": "all",
+                "time_bucket": str(signal["time_bucket"]),
+                "asset": str(signal["asset"]),
+                "entry_price": self._entry_price_bucket(signal.get("entry_price")),
+                "start_distance": self._start_distance_bucket(signal.get("start_distance")),
+                "spread": self._spread_bucket(signal.get("spread")),
+                "depth": self._depth_bucket(signal.get("depth")),
+            }
+            for group_type, group in group_values.items():
+                add_group(group_type, group, signal, settlement_price)
+
+        report: list[dict[str, Any]] = []
+        for key, item in groups.items():
+            entry_prices = [float(value) for value in item["entry_prices"]]
+            ev_values = [float(value) for value in item["ev_per_share"]]
+            spreads = [float(value) for value in item["spreads"]]
+            start_distances = [float(value) for value in item["start_distances"]]
+            depths = [float(value) for value in item["depths"]]
+            resolved_count = int(item["resolved_count"])
+            report.append(
+                {
+                    "group_type": item["group_type"],
+                    "group": item["group"],
+                    "sample_count": int(item["sample_count"]),
+                    "resolved_count": resolved_count,
+                    "unresolved_count": int(item["sample_count"]) - resolved_count,
+                    "win_rate": (int(item["wins"]) / resolved_count) if resolved_count else None,
+                    "average_entry_price": (sum(entry_prices) / len(entry_prices)) if entry_prices else None,
+                    "average_ev_per_share": (sum(ev_values) / len(ev_values)) if ev_values else None,
+                    "max_loss_per_share": min(ev_values) if ev_values else None,
+                    "average_spread": (sum(spreads) / len(spreads)) if spreads else None,
+                    "average_crypto_start_distance": (
+                        sum(start_distances) / len(start_distances) if start_distances else None
+                    ),
+                    "average_depth": (sum(depths) / len(depths)) if depths else None,
+                }
+            )
+        order_index = {name: index for index, name in enumerate(group_order)}
+        return sorted(
+            report,
+            key=lambda row: (
+                order_index.get(str(row["group_type"]), 999),
+                -int(row["resolved_count"]),
+                str(row["group"]),
+            ),
+        )
+
+    def near_close_signal_market_slugs(self, *, limit: int = 300) -> list[str]:
+        rows = self.connection.fetchall(
+            """
+            SELECT details_json
+            FROM opportunities
+            WHERE strategy_type = 'late_resolution'
+              AND details_json LIKE ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN, max(int(limit), 1)),
+        )
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            details = self._load_json(row.get("details_json"), {})
+            if not isinstance(details, dict):
+                continue
+            market_slug = str(details.get("market_slug") or "").strip()
+            if not market_slug or market_slug in seen:
+                continue
+            variant = str(details.get("near_close_variant") or "")
+            if variant != "crypto_updown" and "updown" not in market_slug.lower():
+                continue
+            seen.add(market_slug)
+            slugs.append(market_slug)
+        return slugs
+
     def settled_pnl_summary(self) -> dict[str, Any]:
         row = self.connection.fetchone(
             """

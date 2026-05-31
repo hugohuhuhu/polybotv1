@@ -193,7 +193,7 @@ Risk controls:
 The crypto Up/Down near-close maker scan keeps the existing spread, depth, midpoint, start-distance, risk, preflight, and kill-switch filters. This branch tightens the entry price band for crypto Up/Down markets:
 
 - Entry target must be at least `NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE` (`0.86` by default).
-- Entry target is capped by `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE` (`0.95` by default).
+- Entry target is capped by `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE` (`0.90` by default).
 - The legacy `NEAR_CLOSE_CRYPTO_UPDOWN_MAX_BID_PRICE` still applies, so the effective cap is the lower of the two.
 
 The local live launch scripts enable a time-funnel start-distance rule for crypto Up/Down entries. The farther the market is from close, the stronger the move away from the start price must be:
@@ -212,7 +212,7 @@ Relevant settings:
 - `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT` limits the live crypto Up/Down universe to BTC, ETH, SOL, and BNB.
 - `NEAR_CLOSE_SCAN_POOL_LIMIT=4` keeps the watch shortlist focused on one active Up/Down market per core symbol when possible.
 - `WATCH_SCAN_TIMEOUT_SEC=10` and `SCAN_INTERVAL_SEC=8` keep each watch scan on a 10-second budget with an 8-second normal refresh cadence.
-- `NEAR_CLOSE_ENTRY_MAX_SECONDS=120` and `NEAR_CLOSE_ENTRY_MIN_SECONDS=30` make near-close maker new entries a 120-to-30-second experiment across all near-close variants.
+- `NEAR_CLOSE_ENTRY_MAX_SECONDS=60` and `NEAR_CLOSE_ENTRY_MIN_SECONDS=30` make near-close maker new entries a 60-to-30-second experiment across all near-close variants.
 - `NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=true` keeps the final 30 seconds open when spread/depth/post-only/risk checks still pass.
 - `NEAR_CLOSE_LOG_ENTRY_TELEMETRY=true` stores entry-time seconds, bid/ask, spread, midpoint, depth, token, slug, and crypto start distance in opportunity/live-order JSON.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0` is retained only as legacy compatibility; it no longer blocks the final 90 seconds.
@@ -222,7 +222,7 @@ Relevant settings:
 - `NEAR_CLOSE_CRYPTO_UPDOWN_WRONG_RESOLUTION_COOLDOWN_BUCKETS=1` blocks the next UTC 5-minute bucket after a live crypto Up/Down entry settles against the bought outcome.
 - Resolution buckets are derived from the market slug's official end timestamp and aligned to UTC `:00/:05/:10/.../:55/:60` cutoffs; they are not derived from scan time, local clock time, or bot loop timing.
 
-`python -m app.main report` includes a live-only `Near-close Entry Bucket Performance (Live)` table for `120-90`, `90-60`, `60-30`, and `30-0` second buckets. It is intended for measurement, not proof of edge; kill switch, exposure caps, post-only, spread/depth checks, and emergency exits remain active.
+`python -m app.main report` includes a live-only `Near-close Entry Bucket Performance (Live)` table for `120-90`, `90-60`, `60-30`, and `30-0` second buckets. Current live entry is intentionally narrowed to the `60-30` bucket and crypto Up/Down entry prices from `0.86` to `0.90`; the wider buckets remain in the report for comparison. It is intended for measurement, not proof of edge; kill switch, exposure caps, post-only, spread/depth checks, and emergency exits remain active.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00005` remains the cancellation line for already-active maker orders in the local launch scripts.
 - `NEAR_CLOSE_OPEN_POSITION_MONITOR_SEC=2` makes watch check only open-position orderbooks during scan waits and delay windows.
 - `NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED=false` keeps panic exits to one immediate FAK taker attempt; no maker repost or second-chance order is attempted.

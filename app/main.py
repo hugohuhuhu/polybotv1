@@ -17,6 +17,7 @@ import httpx
 from app.alerts.console_alerts import ConsoleAlerts
 from app.alerts.telegram_alerts import TelegramAlerts
 from app.clients.clob_client import ClobClient
+from app.clients.gamma_client import GammaClient
 from app.clients.websocket_client import MarketWebSocketClient, OrderBookState
 from app.config import Settings, get_settings
 from app.models.runtime import TradingControls
@@ -525,10 +526,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket mispricing scanner")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("discover", "scan", "watch", "backfill", "report", "serve", "maintain-db", "backup-db"):
+    for command in (
+        "discover",
+        "scan",
+        "watch",
+        "backfill",
+        "report",
+        "research-near-close",
+        "serve",
+        "maintain-db",
+        "backup-db",
+    ):
         subparser = subparsers.add_parser(command, help=f"Run {command} command")
         if command in {"discover", "scan", "watch", "backfill"}:
             subparser.add_argument("--limit", type=int, default=None, help="Max events to process")
+        if command == "research-near-close":
+            subparser.add_argument(
+                "--all-signals",
+                action="store_true",
+                help="Do not dedupe repeated scans for the same market/token/time bucket",
+            )
+            subparser.add_argument(
+                "--no-refresh-settlements",
+                action="store_true",
+                help="Skip Gamma refresh for current settlement/outcomePrices before reporting",
+            )
         if command == "serve":
             subparser.add_argument("--reload", action="store_true", help="Enable local auto reload")
         if command == "maintain-db":
@@ -1546,6 +1568,131 @@ def cmd_report(settings: Settings) -> None:
         console.print(f"Alert to fill latency: {latency if latency is not None else 'N/A'} sec")
 
 
+async def _refresh_near_close_research_markets(
+    settings: Settings,
+    repository: ScannerRepository,
+    *,
+    console: Any,
+    limit: int = 300,
+) -> int:
+    slugs = repository.near_close_signal_market_slugs(limit=limit)
+    if not slugs:
+        return 0
+    gamma = GammaClient(
+        settings.gamma_base_url,
+        timeout=settings.gamma_timeout_sec,
+        retries=settings.gamma_retries,
+    )
+    refreshed = 0
+    try:
+        for slug in slugs:
+            event = None
+            try:
+                payload = await gamma._get("/markets", params={"slug": slug})
+            except Exception:
+                payload = None
+            market_payload: dict[str, Any] | None = None
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                market_payload = payload[0]
+            elif isinstance(payload, dict):
+                market_payload = payload
+            if not market_payload:
+                try:
+                    event_payload = await gamma._get("/events", params={"slug": slug})
+                except Exception:
+                    event_payload = None
+                if isinstance(event_payload, list) and event_payload and isinstance(event_payload[0], dict):
+                    event = gamma.normalise_event(event_payload[0])
+                    markets = event_payload[0].get("markets") or []
+                    for candidate in markets:
+                        if isinstance(candidate, dict) and str(candidate.get("slug") or "") == slug:
+                            market_payload = candidate
+                            break
+            if not market_payload:
+                continue
+            market = gamma.normalise_market(market_payload, event=event)
+            repository.save_markets([event] if event is not None else [], [market])
+            refreshed += 1
+    finally:
+        await gamma.close()
+    console.print(f"Refreshed {refreshed}/{len(slugs)} near-close market settlement snapshots from Gamma.")
+    return refreshed
+
+
+async def cmd_research_near_close(settings: Settings, args: argparse.Namespace) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    def fmt_value(value: object, *, precision: int = 4, percent: bool = False) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if percent:
+            return f"{numeric:.0%}"
+        return f"{numeric:.{precision}f}"
+
+    def print_table(title: str, rows: list[dict[str, object]]) -> None:
+        table = Table(title=title)
+        table.add_column("Group")
+        table.add_column("Signals", justify="right")
+        table.add_column("Resolved", justify="right")
+        table.add_column("Unresolved", justify="right")
+        table.add_column("Win Rate", justify="right")
+        table.add_column("Avg Entry", justify="right")
+        table.add_column("EV / Share", justify="right")
+        table.add_column("Max Loss / Share", justify="right")
+        table.add_column("Avg Spread", justify="right")
+        table.add_column("Avg Start Dist", justify="right")
+        table.add_column("Avg Depth", justify="right")
+        for row in rows:
+            table.add_row(
+                str(row["group"]),
+                str(row["sample_count"]),
+                str(row["resolved_count"]),
+                str(row["unresolved_count"]),
+                fmt_value(row["win_rate"], percent=True),
+                fmt_value(row["average_entry_price"]),
+                fmt_value(row["average_ev_per_share"]),
+                fmt_value(row["max_loss_per_share"]),
+                fmt_value(row["average_spread"]),
+                fmt_value(row["average_crypto_start_distance"], precision=6),
+                fmt_value(row["average_depth"], precision=2),
+            )
+        console.print(table)
+
+    with closing(connect_db(settings)) as connection:
+        repository = ScannerRepository(connection)
+        if not args.no_refresh_settlements:
+            await _refresh_near_close_research_markets(settings, repository, console=console)
+        rows = repository.near_close_signal_replay_report(dedupe=not args.all_signals)
+
+    console.print(
+        "[bold]Near-close Crypto Up/Down Signal Replay[/bold] "
+        f"({'all repeated scan signals' if args.all_signals else 'deduped by market/token/time bucket'})"
+    )
+    console.print(
+        "This is a research replay from stored opportunities and settled market outcomes; "
+        "it does not prove historical fillability or panic-exit execution."
+    )
+    for group_type, title in (
+        ("overall", "Overall"),
+        ("time_bucket", "By Time To Resolution"),
+        ("asset", "By Asset"),
+        ("entry_price", "By Entry Price"),
+        ("start_distance", "By Crypto Start Distance"),
+        ("spread", "By Spread"),
+        ("depth", "By Bid Depth At Best"),
+    ):
+        group_rows = [row for row in rows if row["group_type"] == group_type]
+        if group_rows:
+            print_table(title, group_rows)
+
+
 def cmd_maintain_db(settings: Settings, args: argparse.Namespace) -> None:
     from rich.console import Console
 
@@ -1592,6 +1739,8 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await cmd_backfill(settings, args)
     elif args.command == "report":
         cmd_report(settings)
+    elif args.command == "research-near-close":
+        await cmd_research_near_close(settings, args)
     elif args.command == "maintain-db":
         cmd_maintain_db(settings, args)
     elif args.command == "backup-db":

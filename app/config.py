@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
     near_close_live_max_minutes_to_end: float = Field(default=7.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
-    near_close_entry_max_seconds: float = Field(default=120.0, alias="NEAR_CLOSE_ENTRY_MAX_SECONDS")
+    near_close_entry_max_seconds: float = Field(default=60.0, alias="NEAR_CLOSE_ENTRY_MAX_SECONDS")
     near_close_entry_min_seconds: float = Field(default=30.0, alias="NEAR_CLOSE_ENTRY_MIN_SECONDS")
     near_close_final_seconds_allow_entry: bool = Field(
         default=True,
@@ -260,7 +260,7 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE",
     )
     near_close_crypto_updown_max_entry_price: float = Field(
-        default=0.95,
+        default=0.90,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE",
     )
     near_close_crypto_updown_skip_bid_at_or_above: float = Field(
