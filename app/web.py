@@ -305,7 +305,11 @@ def _apply_live_order_group_values(orders: list[dict[str, Any]], groups: list[di
         sell_size = float(group.get("sell_size") or 0.0)
         redeemed_size = float(group.get("redeemed_size") or 0.0)
         is_closed = str(group.get("position_status") or "") == "closed"
-        if sell_size <= 1e-9 and redeemed_size <= 1e-9 and not is_closed:
+        authoritative_open_value = str(group.get("current_price_source") or "") in {
+            "polymarket_data_api",
+            "settlement_outcome",
+        } or str(group.get("latest_status") or "").lower() == "redeemable"
+        if sell_size <= 1e-9 and redeemed_size <= 1e-9 and not is_closed and not authoritative_open_value:
             adjusted.append(item)
             continue
 

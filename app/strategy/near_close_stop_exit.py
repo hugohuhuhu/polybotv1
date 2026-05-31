@@ -317,26 +317,12 @@ async def execute_near_close_taker_exits(
             orderbook_telemetry = _book_telemetry(book)
             spread = _float_or_none(getattr(book, "spread", None))
             max_stop_spread = max(float(settings.near_close_stop_exit_max_spread), 0.0)
-            if spread is not None and max_stop_spread > 0 and spread > max_stop_spread:
-                _record_stop_exit_skip(
-                    repository=repository,
-                    exits=exits,
-                    opportunity_id=opportunity_id,
-                    status="stop_exit_skipped_spread_too_wide",
-                    message="Skipped panic FAK stop-exit because outcome token spread is too wide.",
-                    market_slug=market_slug,
-                    token_id=token_id,
-                    reference_price=reference_price,
-                    target_price=target_price,
-                    entry_price=entry_price,
-                    size=size,
-                    details={
-                        "stop_orderbook_source": book_source,
-                        "max_stop_exit_spread": max_stop_spread,
-                        **orderbook_telemetry,
-                    },
-                )
-                continue
+            orderbook_telemetry.update(
+                {
+                    "max_stop_exit_spread": max_stop_spread,
+                    "panic_exit_wide_spread": bool(spread is not None and max_stop_spread > 0 and spread > max_stop_spread),
+                }
+            )
 
             outcome_label = str(group.get("outcome_label") or "Outcome")
             entry_metadata = repository.near_close_entry_metadata_for_position(

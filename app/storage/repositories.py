@@ -770,6 +770,76 @@ class ScannerRepository:
         return end_dt.timestamp()
 
     @classmethod
+    def near_close_resolution_bucket_key(cls, market_slug: str) -> str | None:
+        end_ts = cls._parse_slug_end_timestamp(str(market_slug or ""))
+        if end_ts is None:
+            return None
+        end_int = int(end_ts)
+        bucket_end_ts = ((end_int + 299) // 300) * 300
+        return str(bucket_end_ts)
+
+    def near_close_crypto_updown_live_order_count_for_resolution_bucket(self, bucket_key: str) -> int:
+        if not bucket_key:
+            return 0
+        rows = self.connection.fetchall(
+            """
+            SELECT action, market_slug, status, response_json
+            FROM live_trades
+            WHERE response_json LIKE ?
+              AND UPPER(action) = 'BUY'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 500
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN,),
+        )
+        count = 0
+        ignored_statuses = {"FAILED", "RISK_REJECTED"}
+        for row in rows:
+            market_slug = str(row.get("market_slug") or "")
+            if "updown" not in market_slug.lower():
+                continue
+            if self.near_close_resolution_bucket_key(market_slug) != str(bucket_key):
+                continue
+            status = str(row.get("status") or "").upper()
+            if status in ignored_statuses:
+                continue
+            count += 1
+        return count
+
+    def near_close_crypto_updown_wrong_resolution_exists_before_bucket(
+        self,
+        bucket_key: str,
+        *,
+        lookback_buckets: int = 1,
+    ) -> bool:
+        try:
+            bucket_end_ts = int(bucket_key)
+        except (TypeError, ValueError):
+            return False
+        if lookback_buckets <= 0:
+            return False
+        previous_keys = {str(bucket_end_ts - 300 * offset) for offset in range(1, lookback_buckets + 1)}
+        rows = self.connection.fetchall(
+            """
+            SELECT market_slug, status, response_json
+            FROM live_trades
+            WHERE response_json LIKE ?
+              AND UPPER(action) = 'BUY'
+              AND UPPER(status) = 'SETTLED_LOST'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 500
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN,),
+        )
+        for row in rows:
+            market_slug = str(row.get("market_slug") or "")
+            if "updown" not in market_slug.lower():
+                continue
+            if self.near_close_resolution_bucket_key(market_slug) in previous_keys:
+                return True
+        return False
+
+    @classmethod
     def _is_market_ended(
         cls,
         slug: str,
@@ -799,7 +869,7 @@ class ScannerRepository:
                 closed=row.get("closed"),
                 now_ts=now_ts,
             ),
-            "winning_outcome": raw.get("near_close_crypto_winning_outcome"),
+            "winning_outcome": cls._market_winning_outcome_from_raw(raw),
         }
 
     @staticmethod
@@ -808,6 +878,33 @@ class ScannerRepository:
         if not winner:
             return None
         return 1.0 if str(outcome_label or "").strip().lower() == winner else 0.0
+
+    @classmethod
+    def _market_winning_outcome_from_raw(cls, raw: dict[str, Any]) -> Any:
+        direct = raw.get("near_close_crypto_winning_outcome")
+        if direct:
+            return direct
+        outcomes = cls._jsonish_list(raw.get("outcomes"))
+        prices = cls._jsonish_list(raw.get("outcomePrices"))
+        for outcome, price in zip(outcomes, prices):
+            try:
+                if float(price) >= 0.999:
+                    return outcome
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _jsonish_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return []
 
     def near_close_active_orders_for_market(
         self,
@@ -1751,6 +1848,24 @@ class ScannerRepository:
             candidates.append(candidate)
         return candidates
 
+    def redeem_candidate_trade_ids_for_token(self, token_id: str) -> list[int]:
+        cleaned = str(token_id or "").strip()
+        if not cleaned:
+            return []
+        rows = self.connection.fetchall(
+            """
+            SELECT id
+            FROM live_trades
+            WHERE token_id = ?
+              AND order_id IS NOT NULL
+              AND UPPER(action) = 'BUY'
+              AND UPPER(status) IN ('CONFIRMED', 'MATCHED', 'FILLED', 'MINED', 'CANCEL_UNCONFIRMED')
+            ORDER BY created_at DESC, id DESC
+            """,
+            (cleaned,),
+        )
+        return [int(row["id"]) for row in rows]
+
     def mark_live_trade_ids_status(self, trade_ids: Iterable[int], status: str) -> int:
         cleaned = [int(value) for value in trade_ids]
         if not cleaned:
@@ -2413,7 +2528,7 @@ class ScannerRepository:
             market_ended = bool(status_info.get("ended"))
             settlement_price = self._settlement_price_for_outcome(
                 str(row["outcome_label"] or ""),
-                status_info.get("winning_outcome") or response.get("crypto_winning_outcome"),
+                status_info.get("winning_outcome"),
             )
             if market_ended and status_bucket == "matched":
                 status_bucket = "settlement_pending"

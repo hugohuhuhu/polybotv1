@@ -105,6 +105,12 @@ def test_orderbook_snapshots_dedupe_by_token_and_minute(tmp_path) -> None:
     assert row["best_bid"] == 0.48
 
 
+def test_near_close_resolution_bucket_uses_utc_five_minute_cutoffs() -> None:
+    assert ScannerRepository.near_close_resolution_bucket_key("btc-updown-5m-1780202700") == "1780202700"
+    assert ScannerRepository.near_close_resolution_bucket_key("sol-updown-5m-1780202671") == "1780202700"
+    assert ScannerRepository.near_close_resolution_bucket_key("eth-updown-5m-1780202412") == "1780202700"
+
+
 def test_database_maintenance_keeps_daily_summary_and_prunes_raw_rows(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "maintenance.db"))
     now = datetime.now(timezone.utc)
@@ -1091,6 +1097,61 @@ def test_recent_live_orders_use_settlement_value_after_market_end(tmp_path) -> N
     assert round(group["total_pnl"], 2) == 0.15
 
 
+def test_recent_live_orders_use_outcome_prices_after_market_end(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "ended-outcome-prices-order.db"))
+    token_id = "sol-up"
+    slug = f"sol-updown-15m-{int(time.time()) - 60}"
+    repository.save_markets(
+        [EventRecord(event_id="event-ended-prices", title="Ended", active=True, closed=True)],
+        [
+            MarketRecord(
+                market_id="market-ended-prices",
+                event_id="event-ended-prices",
+                question="SOL ended?",
+                slug=slug,
+                outcome_labels=["Up", "Down"],
+                token_ids=[token_id, "sol-down"],
+                active=True,
+                closed=True,
+                end_date=datetime.now(timezone.utc) - timedelta(minutes=1),
+                raw={"outcomes": '["Up", "Down"]', "outcomePrices": '["0", "1"]'},
+            )
+        ],
+    )
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="ended-outcome-prices",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id=token_id,
+                    market_slug=slug,
+                    outcome_label="Up",
+                    target_price=0.91,
+                    requested_size=5.0,
+                    order_id="confirmed-ended-prices-1",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+
+    order = repository.recent_live_orders(limit=5)[0]
+
+    assert order["status"] == "settlement_pending"
+    assert order["market_ended"] is True
+    assert order["current_price"] == 0.0
+    assert order["current_price_source"] == "settlement_outcome"
+    assert order["current_value"] == 0.0
+    assert round(order["pnl"], 2) == -4.55
+
+
 def test_live_trade_groups_offset_settled_lost_entry_with_stop_exit_sell(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "settled-lost-stop-offset.db"))
     with repository.connection.transaction():
@@ -1155,7 +1216,7 @@ def test_live_trade_groups_offset_settled_lost_entry_with_stop_exit_sell(tmp_pat
     assert round(float(journal["open_size_total"]), 2) == 0.0
 
 
-def test_recent_live_orders_use_response_winner_and_market_link_after_market_end(tmp_path) -> None:
+def test_recent_live_orders_do_not_use_entry_prediction_as_settlement_winner(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-response-winner-order.db"))
     token_id = "eth-up"
     slug = f"eth-updown-15m-{int(time.time()) - 60}"
@@ -1190,9 +1251,9 @@ def test_recent_live_orders_use_response_winner_and_market_link_after_market_end
 
     assert order["status"] == "settlement_pending"
     assert order["market_url"] == f"https://polymarket.com/market/{slug}"
-    assert order["current_price"] == 1.0
-    assert order["current_value"] == 5.0
-    assert round(order["pnl"], 2) == 0.15
+    assert order["current_price"] is None
+    assert order["current_value"] is None
+    assert order["pnl"] is None
 
 
 def test_recent_live_orders_fall_back_to_book_value_for_unresolved_matched_order(tmp_path) -> None:

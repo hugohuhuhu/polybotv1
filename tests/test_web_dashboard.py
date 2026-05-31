@@ -479,12 +479,15 @@ def test_dashboard_portfolio_value_overrides_stale_settlement_outcome(tmp_path, 
 
     payload = client.get("/api/dashboard").json()
     group = payload["trade_groups"][0]
+    order = next(item for item in payload["live_orders"] if item["order_id"] == "0xstalesettlement")
 
     assert group["current_value"] == 4.38
     assert group["current_price"] == 0.876
     assert group["current_price_source"] == "polymarket_data_api"
     assert group["total_pnl"] == 0.03
     assert group["latest_status"] == "redeemable"
+    assert order["net_current_value"] == 4.38
+    assert order["net_pnl"] == 0.03
 
 
 def test_dashboard_does_not_duplicate_wallet_position_for_closed_local_trade(tmp_path, monkeypatch) -> None:

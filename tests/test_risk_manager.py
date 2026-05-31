@@ -46,6 +46,9 @@ def make_near_close_plan(
     minutes_to_resolution: float | None = None,
     time_to_resolution_sec: float | None = None,
     variant: str | None = None,
+    market_slug: str = "risk-market",
+    token_id: str = "yes",
+    outcome_label: str = "Yes",
 ) -> ExecutionPlan:
     metadata = {"strategy_variant": "near_close_maker"}
     if time_to_resolution_sec is not None:
@@ -60,9 +63,9 @@ def make_near_close_plan(
         legs=[
             ExecutionLeg(
                 action="BUY",
-                token_id="yes",
-                market_slug="risk-market",
-                outcome_label="Yes",
+                token_id=token_id,
+                market_slug=market_slug,
+                outcome_label=outcome_label,
                 target_price=price,
                 size=size,
                 order_type="GTD",
@@ -237,6 +240,167 @@ def test_risk_manager_allows_near_close_live_inside_final_30_seconds(tmp_path) -
 
     decision = manager.assess(
         make_near_close_plan(size=1.0, price=0.97, time_to_resolution_sec=15),
+        repository,
+        mode="live",
+    )
+
+    assert decision.allowed is True
+
+
+def test_risk_manager_blocks_second_crypto_updown_entry_in_same_utc_resolution_bucket(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-bucket.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="existing-near-close-bucket",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="btc-down",
+                    market_slug="btc-updown-5m-1780202700",
+                    outcome_label="Down",
+                    target_price=0.78,
+                    requested_size=5.0,
+                    order_id="bucket-order",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5.0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_RESOLUTION_BUCKET_MAX_LIVE_ORDERS=1,
+            NEAR_CLOSE_CRYPTO_UPDOWN_WRONG_RESOLUTION_COOLDOWN_BUCKETS=0,
+            MAX_NOTIONAL_PER_PLAN=100.0,
+            MAX_DAILY_LIVE_NOTIONAL=0.0,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(
+            size=5.0,
+            price=0.78,
+            variant="crypto_updown",
+            market_slug="sol-updown-5m-1780202700",
+            token_id="sol-down",
+            outcome_label="Down",
+        ),
+        repository,
+        mode="live",
+    )
+
+    assert decision.allowed is False
+    assert "UTC 5-minute resolution bucket" in decision.reason
+
+
+def test_risk_manager_blocks_next_crypto_updown_bucket_after_wrong_resolution(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-wrong-resolution.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="settled-lost-bucket",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="btc-up",
+                    market_slug="btc-updown-5m-1780202400",
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="wrong-resolution-order",
+                    status="SETTLED_LOST",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5.0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_RESOLUTION_BUCKET_MAX_LIVE_ORDERS=1,
+            NEAR_CLOSE_CRYPTO_UPDOWN_WRONG_RESOLUTION_COOLDOWN_BUCKETS=1,
+            MAX_NOTIONAL_PER_PLAN=100.0,
+            MAX_DAILY_LIVE_NOTIONAL=0.0,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(
+            size=5.0,
+            price=0.78,
+            variant="crypto_updown",
+            market_slug="sol-updown-5m-1780202700",
+            token_id="sol-down",
+            outcome_label="Down",
+        ),
+        repository,
+        mode="live",
+    )
+
+    assert decision.allowed is False
+    assert "outcome-based cooldown" in decision.reason
+
+
+def test_risk_manager_does_not_cool_down_after_winning_resolution(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-winning-resolution.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="redeemed-bucket",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="eth-up",
+                    market_slug="eth-updown-5m-1780202400",
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="winning-resolution-order",
+                    status="REDEEMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5.0,
+            NEAR_CLOSE_CRYPTO_UPDOWN_RESOLUTION_BUCKET_MAX_LIVE_ORDERS=1,
+            NEAR_CLOSE_CRYPTO_UPDOWN_WRONG_RESOLUTION_COOLDOWN_BUCKETS=1,
+            MAX_NOTIONAL_PER_PLAN=100.0,
+            MAX_DAILY_LIVE_NOTIONAL=0.0,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(
+            size=5.0,
+            price=0.78,
+            variant="crypto_updown",
+            market_slug="sol-updown-5m-1780202700",
+            token_id="sol-down",
+            outcome_label="Down",
+        ),
         repository,
         mode="live",
     )

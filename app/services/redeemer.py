@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
@@ -161,27 +162,192 @@ def _wallet_address(settings: Settings, private_key: str) -> str:
     return settings.polymarket_funder_address or Account.from_key(private_key).address
 
 
-def _fetch_latest_market(client: httpx.Client, settings: Settings, market_id: str, fallback: dict[str, Any]) -> dict[str, Any]:
-    if not market_id:
-        return fallback
-    response = client.get(f"{settings.gamma_base_url.rstrip('/')}/markets/{market_id}")
-    if response.status_code >= 400:
-        return fallback
+def _jsonish_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_gamma_market_from_event(payload: Any, market_slug: str) -> dict[str, Any] | None:
+    events = payload if isinstance(payload, list) else [payload]
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        markets = event.get("markets")
+        if not isinstance(markets, list):
+            continue
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            if market_slug and str(market.get("slug") or "") != market_slug:
+                continue
+            return market
+        if markets and isinstance(markets[0], dict):
+            return markets[0]
+    return None
+
+
+def _fetch_latest_market(
+    client: httpx.Client,
+    settings: Settings,
+    market_id: str,
+    fallback: dict[str, Any],
+    *,
+    market_slug: str = "",
+) -> dict[str, Any]:
+    base_url = settings.gamma_base_url.rstrip("/")
+    if market_id:
+        response = client.get(f"{base_url}/markets/{market_id}")
+        if response.status_code < 400:
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+    if market_slug:
+        response = client.get(f"{base_url}/events", params={"slug": market_slug})
+        if response.status_code < 400:
+            market = _extract_gamma_market_from_event(response.json(), market_slug)
+            if market is not None:
+                return market
+        response = client.get(f"{base_url}/markets", params={"slug": market_slug})
+        if response.status_code < 400:
+            payload = response.json()
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                return payload[0]
+            if isinstance(payload, dict):
+                return payload
+    return fallback
+
+
+def _fetch_redeemable_wallet_positions(client: httpx.Client, settings: Settings, wallet: str) -> list[dict[str, Any]]:
+    response = client.get(
+        f"{settings.polymarket_data_api_base_url.rstrip('/')}/positions",
+        params={"user": wallet, "limit": 500, "sizeThreshold": 0},
+    )
+    response.raise_for_status()
     payload = response.json()
-    return payload if isinstance(payload, dict) else fallback
+    if not isinstance(payload, list):
+        return []
+    positions: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        size = _float_or_none(item.get("size"))
+        if item.get("redeemable") is True and size is not None and size > 0:
+            positions.append(item)
+    return positions
+
+
+def _wallet_position_to_redeem_candidate(position: dict[str, Any], *, trade_ids: list[int] | None = None) -> dict[str, Any] | None:
+    token_id = str(position.get("asset") or position.get("assetId") or "").strip()
+    condition_id = str(position.get("conditionId") or "").strip()
+    slug = str(position.get("slug") or position.get("eventSlug") or "").strip()
+    outcome_label = str(position.get("outcome") or "").strip()
+    if not token_id or not condition_id or not slug:
+        return None
+    try:
+        outcome_index = int(position.get("outcomeIndex"))
+    except (TypeError, ValueError):
+        return None
+    opposite_asset = str(position.get("oppositeAsset") or "").strip()
+    opposite_outcome = str(position.get("oppositeOutcome") or "").strip()
+    token_ids = [token_id]
+    labels = [outcome_label]
+    if opposite_asset:
+        if outcome_index == 0:
+            token_ids.append(opposite_asset)
+        else:
+            token_ids.insert(0, opposite_asset)
+    if opposite_outcome:
+        if outcome_index == 0:
+            labels.append(opposite_outcome)
+        else:
+            labels.insert(0, opposite_outcome)
+    return {
+        "id": None,
+        "opportunity_id": f"wallet:{token_id}",
+        "action": "BUY",
+        "token_id": token_id,
+        "market_slug": slug,
+        "outcome_label": outcome_label,
+        "target_price": _float_or_none(position.get("avgPrice")) or 0.0,
+        "requested_size": _float_or_none(position.get("size")) or 0.0,
+        "order_id": f"wallet:{token_id}",
+        "status": "REDEEMABLE",
+        "response_json": json.dumps(position),
+        "created_at": str(position.get("updatedAt") or position.get("createdAt") or ""),
+        "market": {
+            "market_id": str(position.get("marketId") or ""),
+            "slug": slug,
+            "question": str(position.get("title") or slug),
+            "end_date": str(position.get("endDate") or ""),
+            "token_ids": token_ids,
+            "outcome_labels": labels,
+            "raw": {"conditionId": condition_id},
+        },
+        "outcome_index": outcome_index,
+        "trade_ids": list(trade_ids or []),
+        "wallet_position": position,
+    }
+
+
+def _merge_wallet_redeem_candidates(
+    candidates: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    repository: ScannerRepository,
+) -> list[dict[str, Any]]:
+    merged = list(candidates)
+    by_token = {str(candidate.get("token_id") or ""): candidate for candidate in merged}
+    for position in positions:
+        token_id = str(position.get("asset") or position.get("assetId") or "").strip()
+        if not token_id:
+            continue
+        trade_ids = repository.redeem_candidate_trade_ids_for_token(token_id)
+        candidate = _wallet_position_to_redeem_candidate(position, trade_ids=trade_ids)
+        if candidate is None:
+            continue
+        existing = by_token.get(token_id)
+        if existing is None:
+            by_token[token_id] = candidate
+            merged.append(candidate)
+            continue
+        existing["wallet_position"] = position
+        existing["trade_ids"] = sorted({*existing.get("trade_ids", []), *trade_ids})
+        market = dict(existing.get("market") or {})
+        raw = dict(market.get("raw") or {})
+        raw.setdefault("conditionId", position.get("conditionId"))
+        market["raw"] = raw
+        market.setdefault("slug", candidate["market"]["slug"])
+        existing["market"] = market
+    return merged
+
+
+def _outcome_index_for_token(payload: dict[str, Any], token_id: str, fallback: int) -> int:
+    token_ids = [str(value) for value in _jsonish_list(payload.get("clobTokenIds"))]
+    if token_id in token_ids:
+        return token_ids.index(token_id)
+    return fallback
 
 
 def _is_winning_market(payload: dict[str, Any], outcome_index: int) -> bool:
     if not bool(payload.get("closed")):
         return False
     raw_prices = payload.get("outcomePrices") or []
-    if isinstance(raw_prices, str):
-        import json
-
-        try:
-            raw_prices = json.loads(raw_prices)
-        except json.JSONDecodeError:
-            raw_prices = []
+    raw_prices = _jsonish_list(raw_prices)
     try:
         return float(raw_prices[outcome_index]) >= 0.999
     except (IndexError, TypeError, ValueError):
@@ -192,13 +358,7 @@ def _is_closed_losing_market(payload: dict[str, Any], outcome_index: int) -> boo
     if not bool(payload.get("closed")):
         return False
     raw_prices = payload.get("outcomePrices") or []
-    if isinstance(raw_prices, str):
-        import json
-
-        try:
-            raw_prices = json.loads(raw_prices)
-        except json.JSONDecodeError:
-            raw_prices = []
+    raw_prices = _jsonish_list(raw_prices)
     try:
         return float(raw_prices[outcome_index]) <= 0.001
     except (IndexError, TypeError, ValueError):
@@ -270,6 +430,19 @@ def run_auto_redeem_once(
     results: list[RedeemResult] = []
     candidates = repository.redeem_candidate_live_trades(limit=100)
     with httpx.Client(timeout=20.0) as client:
+        try:
+            wallet_positions = _fetch_redeemable_wallet_positions(client, settings, wallet)
+        except Exception as exc:
+            wallet_positions = []
+            repository.save_execution_event(
+                source="auto-redeem",
+                mode="live",
+                opportunity_id=None,
+                status="portfolio_scan_failed",
+                message=str(exc),
+                details={"stage": "fetch_redeemable_wallet_positions"},
+            )
+        candidates = _merge_wallet_redeem_candidates(candidates, wallet_positions, repository)
         chain_id = int(_rpc(client, settings.polygon_rpc_url, "eth_chainId", []), 16)
         if chain_id != settings.polymarket_chain_id:
             raise RuntimeError(f"RPC chain id is {chain_id}, expected {settings.polymarket_chain_id}")
@@ -279,43 +452,51 @@ def run_auto_redeem_once(
             if selected and token_id not in selected:
                 continue
             market = dict(candidate.get("market") or {})
-            payload = _fetch_latest_market(client, settings, str(market.get("market_id") or ""), dict(market.get("raw") or {}))
-            outcome_index = int(candidate["outcome_index"])
+            market_slug = str(market.get("slug") or candidate.get("market_slug") or "")
+            payload = _fetch_latest_market(
+                client,
+                settings,
+                str(market.get("market_id") or ""),
+                dict(market.get("raw") or {}),
+                market_slug=market_slug,
+            )
+            outcome_index = _outcome_index_for_token(payload, token_id, int(candidate["outcome_index"]))
             result = RedeemResult(
                 token_id=token_id,
-                market_slug=str(market.get("slug") or candidate.get("market_slug") or ""),
+                market_slug=market_slug,
                 outcome_label=str(candidate.get("outcome_label") or ""),
                 redeemed_size=0.0,
-                trade_ids=[int(value) for value in candidate.get("trade_ids", [candidate["id"]])],
+                trade_ids=[int(value) for value in candidate.get("trade_ids", [])],
             )
             if not _is_winning_market(payload, outcome_index):
                 if _is_closed_losing_market(payload, outcome_index):
-                    repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
-                    repository.save_execution_event(
-                        source="auto-redeem",
-                        mode="live",
-                        opportunity_id=str(candidate.get("opportunity_id") or ""),
-                        status="settled_lost",
-                        message="Conditional token expired worthless; no redeemable payout.",
-                        details={
-                            "market_slug": result.market_slug,
-                            "outcome_label": result.outcome_label,
-                            "token_id": token_id,
-                            "outcome_index": outcome_index,
-                            "outcome_prices": payload.get("outcomePrices"),
-                        },
-                    )
-                    repository.save_loss_autopsy(
-                        result.trade_ids,
-                        risk_settings=_loss_autopsy_risk_settings(settings),
-                        settlement_details={
-                            "market_slug": result.market_slug,
-                            "outcome_label": result.outcome_label,
-                            "token_id": token_id,
-                            "outcome_index": outcome_index,
-                            "outcome_prices": payload.get("outcomePrices"),
-                        },
-                    )
+                    if result.trade_ids:
+                        repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
+                        repository.save_execution_event(
+                            source="auto-redeem",
+                            mode="live",
+                            opportunity_id=str(candidate.get("opportunity_id") or ""),
+                            status="settled_lost",
+                            message="Conditional token expired worthless; no redeemable payout.",
+                            details={
+                                "market_slug": result.market_slug,
+                                "outcome_label": result.outcome_label,
+                                "token_id": token_id,
+                                "outcome_index": outcome_index,
+                                "outcome_prices": payload.get("outcomePrices"),
+                            },
+                        )
+                        repository.save_loss_autopsy(
+                            result.trade_ids,
+                            risk_settings=_loss_autopsy_risk_settings(settings),
+                            settlement_details={
+                                "market_slug": result.market_slug,
+                                "outcome_label": result.outcome_label,
+                                "token_id": token_id,
+                                "outcome_index": outcome_index,
+                                "outcome_prices": payload.get("outcomePrices"),
+                            },
+                        )
                     result.status = "settled_lost"
                     result.message = "Market is closed and this token settled at 0."
                 else:

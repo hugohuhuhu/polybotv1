@@ -131,7 +131,7 @@ def test_near_close_taker_exit_uses_fak_to_take_available_liquidity(tmp_path) ->
     assert trader.target_price == 0.5
 
 
-def test_near_close_taker_exit_skips_wide_spread_fak(tmp_path) -> None:
+def test_near_close_taker_exit_sends_panic_fak_even_when_spread_is_wide(tmp_path) -> None:
     class FakeTrader:
         def __init__(self) -> None:
             self.plan = None
@@ -166,7 +166,7 @@ def test_near_close_taker_exit_skips_wide_spread_fak(tmp_path) -> None:
                 5.0,
                 "0xopen",
                 "CONFIRMED",
-                json.dumps({"strategy_variant": "near_close_maker", "crypto_start_price": 650.0}),
+                json.dumps({"strategy_variant": "near_close_maker"}),
                 "2026-05-14T00:58:16+00:00",
             ),
         )
@@ -176,13 +176,21 @@ def test_near_close_taker_exit_skips_wide_spread_fak(tmp_path) -> None:
         _execute_near_close_taker_exits(
             repository=repository,
             live_trader=trader,
-            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_STOP_EXIT_MAX_SPREAD=0.08),
+            settings=Settings(
+                NEAR_CLOSE_TAKER_EXIT_PRICE=0.52,
+                NEAR_CLOSE_STOP_EXIT_MAX_SPREAD=0.08,
+                NEAR_CLOSE_CRYPTO_UPDOWN_STOP_REQUIRES_DIRECTION_BREAK=False,
+            ),
             watch_books={"token-bnb": make_book(bid=0.69, ask=0.96)},
         )
     )
 
-    assert trader.plan is None
-    assert exits[0]["status"] == "stop_exit_skipped_spread_too_wide"
+    assert trader.plan is not None
+    assert trader.plan.legs[0].order_type == "FAK"
+    assert trader.plan.legs[0].metadata["panic_exit_wide_spread"] is True
+    assert trader.plan.legs[0].metadata["max_stop_exit_spread"] == 0.08
+    assert exits[0]["status"] == "submitted"
+    assert exits[0]["panic_exit_wide_spread"] is True
     assert exits[0]["observed_spread"] == 0.27
 
 

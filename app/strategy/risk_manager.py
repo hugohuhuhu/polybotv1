@@ -212,6 +212,48 @@ class RiskManager:
         exposure = repository.near_close_live_exposure()
         first_leg = plan.legs[0] if plan.legs else None
         market_slug = first_leg.market_slug if first_leg else ""
+        is_crypto_updown = variant == "crypto_updown" or "updown" in str(market_slug or "").lower()
+        if is_crypto_updown:
+            bucket_key = repository.near_close_resolution_bucket_key(market_slug)
+            if bucket_key:
+                max_bucket_orders = max(
+                    int(self.settings.near_close_crypto_updown_resolution_bucket_max_live_orders),
+                    0,
+                )
+                if max_bucket_orders > 0:
+                    bucket_order_count = repository.near_close_crypto_updown_live_order_count_for_resolution_bucket(
+                        bucket_key
+                    )
+                    if bucket_order_count >= max_bucket_orders:
+                        return RiskDecision(
+                            allowed=False,
+                            reason=(
+                                "Near-close crypto Up/Down UTC 5-minute resolution bucket "
+                                f"{bucket_key} already has {bucket_order_count} live order(s); "
+                                f"max is {max_bucket_orders}."
+                            ),
+                            estimated_notional=estimated_notional,
+                            projected_daily_notional=estimated_notional,
+                            projected_daily_orders=leg_count,
+                        )
+                cooldown_buckets = max(
+                    int(self.settings.near_close_crypto_updown_wrong_resolution_cooldown_buckets),
+                    0,
+                )
+                if cooldown_buckets > 0 and repository.near_close_crypto_updown_wrong_resolution_exists_before_bucket(
+                    bucket_key,
+                    lookback_buckets=cooldown_buckets,
+                ):
+                    return RiskDecision(
+                        allowed=False,
+                        reason=(
+                            "Near-close crypto Up/Down previous UTC 5-minute resolution bucket "
+                            "settled against our entry; outcome-based cooldown blocks this bucket."
+                        ),
+                        estimated_notional=estimated_notional,
+                        projected_daily_notional=estimated_notional,
+                        projected_daily_orders=leg_count,
+                    )
         position_key = self._position_key(market_slug, first_leg.token_id, first_leg.outcome_label) if first_leg else ""
         position = exposure.get("by_position", {}).get(position_key, {})
         projected_position_size = float(position.get("total_size") or 0.0) + (

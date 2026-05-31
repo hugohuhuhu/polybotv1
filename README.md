@@ -218,6 +218,9 @@ Relevant settings:
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0` is retained only as legacy compatibility; it no longer blocks the final 90 seconds.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`
+- `NEAR_CLOSE_CRYPTO_UPDOWN_RESOLUTION_BUCKET_MAX_LIVE_ORDERS=1` allows at most one new live crypto Up/Down entry per official UTC 5-minute resolution bucket.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_WRONG_RESOLUTION_COOLDOWN_BUCKETS=1` blocks the next UTC 5-minute bucket after a live crypto Up/Down entry settles against the bought outcome.
+- Resolution buckets are derived from the market slug's official end timestamp and aligned to UTC `:00/:05/:10/.../:55/:60` cutoffs; they are not derived from scan time, local clock time, or bot loop timing.
 
 `python -m app.main report` includes a live-only `Near-close Entry Bucket Performance (Live)` table for `120-90`, `90-60`, `60-30`, and `30-0` second buckets. It is intended for measurement, not proof of edge; kill switch, exposure caps, post-only, spread/depth checks, and emergency exits remain active.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00005` remains the cancellation line for already-active maker orders in the local launch scripts.
