@@ -624,12 +624,12 @@ def test_late_resolution_scanner_blocks_crypto_updown_inside_last_90_seconds() -
     assert rejection_counts == {"too_close_to_end": 1}
 
 
-def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
+def test_weekend_mode_lightens_crypto_updown_size_and_relaxes_spread() -> None:
     settings = Settings(
         NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
         NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
         NEAR_CLOSE_WEEKEND_ORDER_SIZE_MULTIPLIER=0.5,
-        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
+        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=1.2,
         NEAR_CLOSE_WEEKEND_START_DISTANCE_MULTIPLIER=0.15,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK=0.78,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
@@ -663,7 +663,7 @@ def test_weekend_mode_lightens_crypto_updown_size_and_tightens_spread() -> None:
     assert opportunities[0].details["cancel_if"]["midpoint_below"] == 0.76
     assert opportunities[0].details["min_entry_price"] == 0.78
     assert round(opportunities[0].details["crypto_start_distance_required"], 6) == 0.00045
-    assert round(opportunities[0].details["effective_max_spread"], 6) == 0.04
+    assert round(opportunities[0].details["effective_max_spread"], 6) == 0.06
     assert round(settings.effective_near_close_start_distance(0.00085), 7) == 0.0001275
     assert settings.effective_near_close_start_distance(0.00085) > settings.near_close_crypto_updown_cancel_start_distance
 
@@ -765,11 +765,11 @@ def test_weekend_mode_accepts_relaxed_crypto_updown_price_heat() -> None:
     assert opportunities[0].details["cancel_if"]["midpoint_below"] == 0.76
 
 
-def test_weekend_mode_rejects_crypto_updown_spread_after_tightening() -> None:
+def test_weekend_mode_accepts_crypto_updown_spread_after_relaxing() -> None:
     settings = Settings(
         NEAR_CLOSE_WEEKEND_MODE_ENABLED=True,
         NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
-        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=0.8,
+        NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=1.2,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
@@ -786,14 +786,15 @@ def test_weekend_mode_rejects_crypto_updown_spread_after_tightening() -> None:
     opportunities = scanner.scan(
         [market],
         {
-            "dynamic_up": make_book("dynamic_up", bid=0.84, ask=0.885, size=80),
+            "dynamic_up": make_book("dynamic_up", bid=0.84, ask=0.895, size=80),
             "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
         },
         rejection_counts=rejection_counts,
     )
 
-    assert opportunities == []
-    assert rejection_counts == {"spread_above_max": 1}
+    assert len(opportunities) == 1
+    assert rejection_counts == {}
+    assert round(opportunities[0].details["effective_max_spread"], 6) == 0.06
 
 
 def _make_crypto_updown_market(*, minutes_left: float, start_distance: float) -> MarketRecord:

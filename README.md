@@ -209,7 +209,9 @@ The local live launch scripts enable a time-funnel start-distance rule for crypt
 Relevant settings:
 
 - `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
-- `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT` limits the live crypto Up/Down universe to BTC, ETH, and SOL.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT` limits the live crypto Up/Down universe to BTC, ETH, SOL, and BNB.
+- `NEAR_CLOSE_SCAN_POOL_LIMIT=4` keeps the watch shortlist focused on one active Up/Down market per core symbol when possible.
+- `WATCH_SCAN_TIMEOUT_SEC=10` and `SCAN_INTERVAL_SEC=21` keep each watch scan on a 10-second budget with a 21-second normal refresh cadence.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=90` blocks new crypto Up/Down entries inside the final 90 seconds.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=true` enables the ladder.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`

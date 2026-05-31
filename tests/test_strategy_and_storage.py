@@ -756,6 +756,83 @@ def test_expire_open_orders_for_ended_markets_marks_stale_orders_cancelled(tmp_p
     assert orders[0]["status"] == "cancelled"
 
 
+def test_submitted_stop_exit_matched_response_counts_in_live_pnl(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "matched-stop-exit.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "entry",
+                1,
+                "BUY",
+                "token-btc",
+                "btc-updown-15m-test",
+                "Up",
+                0.91,
+                5.0,
+                "0xentry",
+                "CONFIRMED",
+                json.dumps({"strategy_variant": "near_close_maker"}),
+                "2026-05-28T00:24:44+00:00",
+            ),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "stop-exit:btc-updown-15m-test:token-btc",
+                1,
+                "SELL",
+                "token-btc",
+                "btc-updown-15m-test",
+                "Up",
+                0.69,
+                5.0,
+                "0xstop",
+                "submitted",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_stop_exit",
+                        "status": "matched",
+                        "success": True,
+                        "takingAmount": "3.6",
+                        "makingAmount": "5",
+                        "transactionsHashes": ["0xtx"],
+                    }
+                ),
+                "2026-05-28T00:24:51+00:00",
+            ),
+        )
+
+    stop_order = next(order for order in repository.recent_live_orders(limit=5) if order["order_id"] == "0xstop")
+    assert stop_order["raw_status"] == "submitted"
+    assert stop_order["status"] == "matched"
+    assert round(float(stop_order["notional"]), 2) == 3.60
+
+    group = repository.live_trade_groups(limit=5)[0]
+    assert group["latest_status"] == "MATCHED"
+    assert group["open_size"] == 0
+    assert round(float(group["estimated_realized_pnl"]), 2) == -0.95
+
+    journal = repository.live_trade_journal_summary()
+    assert round(float(journal["estimated_realized_pnl_total"]), 2) == -0.95
+    assert journal["open_size_total"] == 0
+
+    repository.connection.execute("UPDATE live_trades SET status = 'REDEEMED' WHERE order_id = ?", ("0xentry",))
+    redeemed_group = repository.live_trade_groups(limit=5)[0]
+    assert redeemed_group["open_size"] == 0
+    assert round(float(redeemed_group["estimated_realized_pnl"]), 2) == -0.95
+
+
 def test_expire_open_orders_for_ended_timestamp_slug_without_market_row(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-slug-orders.db"))
     ended_slug = f"doge-updown-5m-{int(time.time()) - 60}"
@@ -1075,6 +1152,69 @@ def test_near_close_live_exposure_counts_open_confirmed_positions(tmp_path) -> N
     assert exposure["total"] == 4.85
     assert exposure["by_market"]["eth-updown"] == 4.85
     assert exposure["by_position"]["eth-updown:yes:Yes"]["open_size"] == 5.0
+
+
+def test_near_close_live_exposure_offsets_matched_stop_exit_sells(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "closed-near-close-stop-exit.db"))
+    token_id = "yes"
+    market_slug = "eth-updown"
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="open-near-close",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id=token_id,
+                    market_slug=market_slug,
+                    outcome_label="Yes",
+                    target_price=0.97,
+                    requested_size=5.0,
+                    order_id="confirmed-1",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="stop-exit-near-close",
+            status="submitted",
+            message="ok",
+            order_type="FAK",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="SELL",
+                    token_id=token_id,
+                    market_slug=market_slug,
+                    outcome_label="Yes",
+                    target_price=0.65,
+                    requested_size=5.0,
+                    order_id="stop-exit-1",
+                    status="submitted",
+                    response={
+                        "strategy_variant": "near_close_stop_exit",
+                        "status": "matched",
+                        "success": True,
+                        "transactionsHashes": ["0xabc"],
+                    },
+                )
+            ],
+        )
+    )
+
+    exposure = repository.near_close_live_exposure()
+
+    assert exposure["total"] == 0.0
+    assert exposure["by_market"] == {}
+    assert exposure["by_position"] == {}
 
 
 def test_near_close_live_exposure_ignores_strategy_cancelled_orders(tmp_path) -> None:

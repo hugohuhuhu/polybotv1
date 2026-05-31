@@ -18,7 +18,13 @@ class ScannerRepository:
 
     ORDERBOOK_WRITE_BATCH_SIZE = 10
     NEAR_CLOSE_VARIANT_PATTERN = '%"strategy_variant": "near_close_maker"%'
+    NEAR_CLOSE_EXIT_VARIANT_PATTERNS = (
+        '%"strategy_variant": "near_close_stop_exit"%',
+        '%"strategy_variant": "near_close_profit_take"%',
+    )
     LIVE_JOURNAL_STATUSES = ("CONFIRMED", "MATCHED", "FILLED", "MINED", "REDEEMED", "SETTLED_LOST")
+    LIVE_JOURNAL_QUERY_STATUSES = (*LIVE_JOURNAL_STATUSES, "SUBMITTED")
+    MATCHED_RESPONSE_STATUSES = {"CONFIRMED", "MATCHED", "FILLED", "MINED"}
     NEAR_CLOSE_INACTIVE_ORDER_STATUSES = (
         "CANCEL_REQUESTED",
         "CANCELLED",
@@ -884,6 +890,32 @@ class ScannerRepository:
         )
         return row is not None
 
+    def near_close_entry_metadata_for_position(
+        self,
+        *,
+        market_slug: str,
+        token_id: str,
+        outcome_label: str,
+    ) -> dict[str, Any]:
+        row = self.connection.fetchone(
+            """
+            SELECT response_json
+            FROM live_trades
+            WHERE market_slug = ?
+              AND token_id = ?
+              AND outcome_label = ?
+              AND UPPER(action) = 'BUY'
+              AND response_json LIKE ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (market_slug, token_id, outcome_label, self.NEAR_CLOSE_VARIANT_PATTERN),
+        )
+        if row is None:
+            return {}
+        response = self._load_json(row.get("response_json"), {})
+        return response if isinstance(response, dict) else {}
+
     def near_close_stop_exit_groups(self, limit: int = 50) -> list[dict[str, Any]]:
         groups = list(self.live_trade_groups(limit=limit))
         seen = {
@@ -1013,6 +1045,20 @@ class ScannerRepository:
     def save_clob_fills(self, fills: Iterable[dict[str, Any]], wallet_address: str | None = None) -> int:
         inserted = 0
         wallet = str(wallet_address or "").lower().strip()
+        market_lookup: dict[str, tuple[str, str]] | None = None
+
+        def resolve_market(token_id: str, fallback_label: str | None = None) -> tuple[str, str]:
+            nonlocal market_lookup
+            if market_lookup is None:
+                market_lookup = self._recent_market_lookup_by_token()
+            market_slug, outcome_label = market_lookup.get(
+                token_id,
+                (f"clob-market-{token_id[-8:]}", str(fallback_label or "Unknown")),
+            )
+            if outcome_label == "Unknown" and fallback_label:
+                outcome_label = fallback_label
+            return market_slug, outcome_label
+
         with self.connection.transaction():
             for fill in fills:
                 fill_id = str(fill.get("id") or "").strip()
@@ -1095,7 +1141,7 @@ class ScannerRepository:
                 if price <= 0 or size <= 0:
                     continue
 
-                market_slug, outcome_label = self._market_for_token(token_id, str(user_fill.get("outcome") or "Unknown"))
+                market_slug, outcome_label = resolve_market(token_id, str(user_fill.get("outcome") or "Unknown"))
                 match_time = fill.get("match_time") or fill.get("created_at")
                 transaction_hash = self._transaction_hash_from_payload(fill)
                 created_at = self._now().isoformat()
@@ -2214,6 +2260,26 @@ class ScannerRepository:
             return "finished"
         return normalized.lower() or "unknown"
 
+    @classmethod
+    def _response_indicates_matched(cls, response: Any) -> bool:
+        if not isinstance(response, dict):
+            return False
+        response_status = str(response.get("status") or "").upper()
+        if response_status in cls.MATCHED_RESPONSE_STATUSES:
+            return True
+        tx_hashes = response.get("transactionsHashes") or response.get("transactionHashes")
+        return bool(response.get("success") is True and isinstance(tx_hashes, list) and tx_hashes)
+
+    def _normalized_live_trade_status(self, row: dict[str, Any]) -> str:
+        status = str(row.get("status") or "").upper()
+        response = self._load_json(row.get("response_json"), {})
+        if status == "SUBMITTED" and self._response_indicates_matched(response):
+            return "MATCHED"
+        return status
+
+    def _include_live_journal_row(self, row: dict[str, Any]) -> bool:
+        return self._normalized_live_trade_status(row) in self.LIVE_JOURNAL_STATUSES
+
     def _effective_live_trade_price(self, row: dict[str, Any]) -> float:
         target_price = float(row.get("target_price") or 0.0)
         response = self._load_json(row.get("response_json"), {})
@@ -2242,6 +2308,15 @@ class ScannerRepository:
                 continue
             if price > 0:
                 return price
+        if action == "SELL":
+            try:
+                taking_amount = float(response.get("takingAmount") or 0.0)
+                making_amount = float(response.get("makingAmount") or 0.0)
+            except (TypeError, ValueError):
+                taking_amount = 0.0
+                making_amount = 0.0
+            if taking_amount > 0 and making_amount > 0:
+                return taking_amount / making_amount
         return target_price
 
     def recent_live_orders(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -2327,10 +2402,12 @@ class ScannerRepository:
         for row in rows:
             price = float(row["target_price"] or 0.0)
             size = float(row["requested_size"] or 0.0)
-            notional = price * size
-            status_bucket = self._live_order_status_bucket(str(row["status"] or ""))
+            effective_price = self._effective_live_trade_price(row)
+            notional = effective_price * size
             action = str(row["action"] or "").upper()
             response = self._load_json(row.get("response_json"), {})
+            normalized_status = self._normalized_live_trade_status(row)
+            status_bucket = self._live_order_status_bucket(normalized_status)
             market_slug = str(row["market_slug"] or "")
             status_info = market_status.get(market_slug, {})
             market_ended = bool(status_info.get("ended"))
@@ -2359,7 +2436,6 @@ class ScannerRepository:
 
             current_value = None
             pnl = None
-            normalized_status = str(row["status"] or "").upper()
             if action == "BUY":
                 if normalized_status == "REDEEMED":
                     current_price = 1.0
@@ -2411,7 +2487,7 @@ class ScannerRepository:
         *,
         since_iso: str | None = None,
     ) -> dict[str, Any]:
-        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_STATUSES)
+        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_QUERY_STATUSES)
         query = """
             SELECT token_id,
                    action,
@@ -2428,12 +2504,13 @@ class ScannerRepository:
               AND UPPER(status) IN ({status_placeholders})
         """
         query = query.format(status_placeholders=status_placeholders)
-        params: list[Any] = list(self.LIVE_JOURNAL_STATUSES)
+        params: list[Any] = list(self.LIVE_JOURNAL_QUERY_STATUSES)
         if since_iso is not None:
             query += " AND created_at >= ?"
             params.append(since_iso)
         query += " ORDER BY created_at ASC, id ASC"
         rows = self.connection.fetchall(query, params)
+        rows = [row for row in rows if self._include_live_journal_row(row)]
 
         open_lots: dict[str, list[dict[str, Any]]] = {}
         realized_pnl = 0.0
@@ -2448,15 +2525,14 @@ class ScannerRepository:
                 continue
 
             key = f'{row["token_id"]}:{row["market_slug"]}:{row["outcome_label"]}'
-            status = str(row["status"]).upper()
+            status = self._normalized_live_trade_status(row)
             if action == "BUY" and status == "REDEEMED":
-                realized_pnl += (1.0 - price) * size
-                matched_size += size
-                matched_trade_count += 1
+                lots = open_lots.setdefault(key, [])
+                lots.append({"size": size, "price": price, "settlement_price": 1.0})
                 continue
             if action == "BUY" and status == "SETTLED_LOST":
                 lots = open_lots.setdefault(key, [])
-                lots.append({"size": size, "price": price, "settled_lost": True})
+                lots.append({"size": size, "price": price, "settlement_price": 0.0})
                 continue
 
             lots = open_lots.setdefault(key, [])
@@ -2487,8 +2563,8 @@ class ScannerRepository:
                 remaining_size = float(lot["size"])
                 if remaining_size <= 1e-9:
                     continue
-                if bool(lot.get("settled_lost")):
-                    realized_pnl -= float(lot["price"]) * remaining_size
+                if "settlement_price" in lot:
+                    realized_pnl += (float(lot["settlement_price"]) - float(lot["price"])) * remaining_size
                     matched_size += remaining_size
                     matched_trade_count += 1
                     continue
@@ -2517,7 +2593,7 @@ class ScannerRepository:
         }
 
     def live_trade_groups(self, limit: int = 8) -> list[dict[str, Any]]:
-        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_STATUSES)
+        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_QUERY_STATUSES)
         rows = self.connection.fetchall(
             f"""
             SELECT token_id,
@@ -2536,8 +2612,9 @@ class ScannerRepository:
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
-            (*self.LIVE_JOURNAL_STATUSES, max(limit * 8, limit)),
+            (*self.LIVE_JOURNAL_QUERY_STATUSES, max(limit * 8, limit)),
         )
+        rows = [row for row in rows if self._include_live_journal_row(row)]
 
         market_slugs = sorted({str(row["market_slug"]) for row in rows if str(row.get("market_slug") or "")})
         market_status: dict[str, dict[str, Any]] = {}
@@ -2570,6 +2647,7 @@ class ScannerRepository:
 
         groups: dict[str, dict[str, Any]] = {}
         for row in rows:
+            normalized_status = self._normalized_live_trade_status(row)
             key = f'{row["market_slug"]}:{row["token_id"]}:{row["outcome_label"]}'
             group = groups.setdefault(
                 key,
@@ -2578,7 +2656,7 @@ class ScannerRepository:
                     "outcome_label": row["outcome_label"],
                     "token_id": row["token_id"],
                     "latest_at": row["created_at"],
-                    "latest_status": row["status"],
+                    "latest_status": normalized_status,
                     "buy_size": 0.0,
                     "sell_size": 0.0,
                     "redeemed_size": 0.0,
@@ -2591,15 +2669,15 @@ class ScannerRepository:
             row_time = str(row["created_at"] or "")
             if row_time > str(group["latest_at"] or ""):
                 group["latest_at"] = row["created_at"]
-                group["latest_status"] = row["status"]
+                group["latest_status"] = normalized_status
             price = self._effective_live_trade_price(row)
             size = float(row["requested_size"] or 0.0)
             action = str(row["action"]).upper()
-            status = str(row["status"]).upper()
+            status = normalized_status
             group["trades"].append(
                 {
                     "action": action,
-                    "status": row["status"],
+                    "status": status,
                     "price": price,
                     "size": size,
                     "notional": price * size,
@@ -2630,13 +2708,11 @@ class ScannerRepository:
                     continue
                 if action == "BUY" and status == "REDEEMED":
                     entry_notional += price * size
-                    exit_notional += size
-                    realized_pnl += (1.0 - price) * size
-                    redeemed_size += size
+                    open_lots.append({"size": size, "price": price, "settlement_price": 1.0})
                     continue
                 if action == "BUY" and status == "SETTLED_LOST":
                     entry_notional += price * size
-                    open_lots.append({"size": size, "price": price, "settled_lost": True})
+                    open_lots.append({"size": size, "price": price, "settlement_price": 0.0})
                     continue
                 if action == "BUY":
                     entry_notional += price * size
@@ -2657,8 +2733,12 @@ class ScannerRepository:
             remaining_lots: list[dict[str, Any]] = []
             for lot in open_lots:
                 remaining_size = float(lot["size"])
-                if bool(lot.get("settled_lost")):
-                    realized_pnl -= float(lot["price"]) * remaining_size
+                if "settlement_price" in lot:
+                    settlement_price = float(lot["settlement_price"])
+                    exit_notional += settlement_price * remaining_size
+                    realized_pnl += (settlement_price - float(lot["price"])) * remaining_size
+                    if settlement_price > 0:
+                        redeemed_size += remaining_size
                     continue
                 remaining_lots.append(lot)
             open_lots = remaining_lots
@@ -3001,7 +3081,8 @@ class ScannerRepository:
         return int(row["signal_count"]) if row else 0
 
     def near_close_live_exposure(self) -> dict[str, Any]:
-        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_STATUSES)
+        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_QUERY_STATUSES)
+        variant_filters = " OR ".join("response_json LIKE ?" for _ in self.NEAR_CLOSE_EXIT_VARIANT_PATTERNS)
         rows = self.connection.fetchall(
             f"""
             SELECT token_id,
@@ -3014,19 +3095,20 @@ class ScannerRepository:
                    response_json,
                    created_at
             FROM live_trades
-            WHERE response_json LIKE '%"strategy_variant": "near_close_maker"%'
+            WHERE (response_json LIKE ? OR {variant_filters})
               AND UPPER(status) IN ({status_placeholders})
             ORDER BY created_at ASC, id ASC
             """,
-            self.LIVE_JOURNAL_STATUSES,
+            (self.NEAR_CLOSE_VARIANT_PATTERN, *self.NEAR_CLOSE_EXIT_VARIANT_PATTERNS, *self.LIVE_JOURNAL_QUERY_STATUSES),
         )
+        rows = [row for row in rows if self._include_live_journal_row(row)]
         by_market: dict[str, float] = {}
         by_position: dict[str, dict[str, Any]] = {}
         open_lots: dict[str, list[dict[str, Any]]] = {}
         total = 0.0
         for row in rows:
             action = str(row["action"] or "").upper()
-            status = str(row["status"] or "").upper()
+            status = self._normalized_live_trade_status(row)
             price = self._effective_live_trade_price(row)
             size = float(row["requested_size"] or 0.0)
             if price <= 0 or size <= 0:

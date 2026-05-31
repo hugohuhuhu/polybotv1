@@ -450,6 +450,7 @@ def _ensure_indexes(session: DatabaseSession) -> None:
         "CREATE INDEX IF NOT EXISTS idx_live_trades_created_at ON live_trades (created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_paper_trades_created_at ON paper_trades (created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_markets_dashboard ON markets (active, closed, liquidity DESC, discovered_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_markets_discovered_at ON markets (discovered_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_watch_heartbeats_created_at ON watch_heartbeats (created_at DESC, id DESC)",
     ]
     with session.transaction():

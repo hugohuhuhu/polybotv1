@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from app.config import Settings
 from app.models.core import BookLevel, MarketRecord, OrderBookSnapshot
-from app.orchestration import run_scanners, shortlist_markets, shortlist_near_close_markets
+from app.orchestration import execute_monitor_cycle, run_scanners, shortlist_markets, shortlist_near_close_markets
 
 
 def make_market(
@@ -333,6 +334,7 @@ def test_near_close_pool_crypto_updown_only_filters_first() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
     )
     now = datetime.now(timezone.utc)
@@ -399,7 +401,63 @@ def test_near_close_pool_crypto_updown_only_filters_first() -> None:
     assert [market.slug for market in shortlisted] == ["ethereum-updown"]
     assert diagnostics["near_close_scan_crypto_updown_only"] is True
     assert diagnostics["crypto_updown_discovered_count"] == 1
-    assert diagnostics["crypto_updown_allowed_symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert diagnostics["crypto_updown_allowed_symbols"] == ["BNBUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert diagnostics["crypto_updown_selected_symbols"] == ["ETHUSDT"]
+
+
+def test_near_close_pool_crypto_updown_only_keeps_one_market_per_core_symbol() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=4,
+        NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
+        NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
+        NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+    )
+    now = datetime.now(timezone.utc)
+
+    def updown_market(market_id: str, asset: str, symbol_slug: str, minutes_left: int) -> MarketRecord:
+        return make_market(
+            market_id,
+            event_id="crypto",
+            slug=f"{symbol_slug}-updown-{minutes_left}",
+            question=f"{asset} Up or Down - May 2, 5:55AM-6:00AM ET",
+            yes_price=0.68,
+            liquidity=9000,
+        ).model_copy(
+            update={
+                "event_title": f"{asset} Up or Down - May 2, 5:55AM-6:00AM ET",
+                "outcome_labels": ["Up", "Down"],
+                "token_ids": [f"{market_id}-up", f"{market_id}-down"],
+                "end_date": now + timedelta(minutes=minutes_left),
+                "resolution_source": f"https://data.chain.link/streams/{symbol_slug}-usd",
+                "raw": {
+                    "eventStartTime": (now - timedelta(minutes=7)).isoformat(),
+                    "near_close_crypto_variant": "updown_proxy",
+                    "near_close_crypto_spot_price": 101.0,
+                    "near_close_crypto_start_price": 100.0,
+                    "near_close_crypto_start_distance": 0.01,
+                    "near_close_crypto_winning_outcome": "Up",
+                },
+            }
+        )
+
+    markets = [
+        updown_market("btc-farther", "Bitcoin", "btc", 14),
+        updown_market("btc-duplicate", "Bitcoin", "btc", 13),
+        updown_market("eth", "Ethereum", "eth", 12),
+        updown_market("sol", "Solana", "sol", 11),
+        updown_market("bnb", "BNB", "bnb", 10),
+    ]
+
+    shortlisted, diagnostics = shortlist_near_close_markets(markets, settings=settings)
+
+    assert [market.slug for market in shortlisted] == [
+        "btc-updown-14",
+        "eth-updown-12",
+        "sol-updown-11",
+        "bnb-updown-10",
+    ]
+    assert diagnostics["crypto_updown_selected_symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
 
 def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
@@ -407,6 +465,7 @@ def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
     )
     now = datetime.now(timezone.utc)
@@ -446,6 +505,7 @@ def test_near_close_pool_crypto_updown_only_allows_sol() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
     )
     now = datetime.now(timezone.utc)
@@ -578,3 +638,60 @@ def test_run_scanners_defaults_to_near_close_only() -> None:
 
     assert len(opportunities) == 1
     assert opportunities[0].details["strategy_variant"] == "near_close_maker"
+
+
+def test_monitor_cycle_preserves_near_close_funnel(monkeypatch) -> None:
+    market = make_market(
+        "near",
+        event_id="near",
+        slug="near-close-market",
+        question="Will alpha happen?",
+        yes_price=0.52,
+        liquidity=5000,
+    ).model_copy(update={"end_date": datetime.now(timezone.utc) + timedelta(minutes=4)})
+    now = datetime.now(timezone.utc)
+    books = {
+        "near-yes": OrderBookSnapshot(
+            token_id="near-yes",
+            bids=[BookLevel(price=0.47, size=50)],
+            asks=[BookLevel(price=0.52, size=50)],
+            updated_at=now,
+        ),
+        "near-no": OrderBookSnapshot(
+            token_id="near-no",
+            bids=[BookLevel(price=0.46, size=50)],
+            asks=[BookLevel(price=0.51, size=50)],
+            updated_at=now,
+        ),
+    }
+
+    async def fake_fetch_books(_settings, _markets):
+        return books
+
+    def fake_run_scanners(_settings, _markets, _books, _previous_midpoints, *, diagnostics):
+        diagnostics["scan_rejection_counts"] = {"market_not_allowed": 1}
+        return []
+
+    monkeypatch.setattr("app.orchestration.fetch_books", fake_fetch_books)
+    monkeypatch.setattr("app.orchestration.run_scanners", fake_run_scanners)
+
+    previous_funnel = [
+        {"label": "探索到的市場", "count": 8, "description": "Discovery universe"},
+        {"label": "進入監看 shortlist", "count": 1, "description": "Selected watch pool"},
+        {"label": "orderbook ready", "count": 0, "description": "Both tokens readable"},
+        {"label": "符合條件機會", "count": 0, "description": "Tradable opportunities"},
+    ]
+
+    result = asyncio.run(
+        execute_monitor_cycle(
+            Settings(),
+            [market],
+            shortlist_diagnostics={"near_close_funnel": previous_funnel},
+        )
+    )
+
+    updated_funnel = result.shortlist_diagnostics["near_close_funnel"]
+    assert updated_funnel[0]["count"] == 8
+    assert updated_funnel[-2]["count"] == 1
+    assert updated_funnel[-1]["count"] == 0
+    assert result.shortlist_diagnostics["scan_rejection_counts"] == {"market_not_allowed": 1}

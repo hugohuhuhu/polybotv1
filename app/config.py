@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     strategy_related_market_enabled: bool = Field(default=False, alias="STRATEGY_RELATED_MARKET_ENABLED")
     strategy_stale_price_enabled: bool = Field(default=False, alias="STRATEGY_STALE_PRICE_ENABLED")
     discovery_event_limit: int = Field(default=100, alias="DISCOVERY_EVENT_LIMIT")
-    watch_market_limit: int = Field(default=20, alias="WATCH_MARKET_LIMIT")
+    watch_market_limit: int = Field(default=4, alias="WATCH_MARKET_LIMIT")
     watch_bucket_general_limit: int = Field(default=8, alias="WATCH_BUCKET_GENERAL_LIMIT")
     watch_bucket_event_limit: int = Field(default=4, alias="WATCH_BUCKET_EVENT_LIMIT")
     watch_bucket_recent_limit: int = Field(default=4, alias="WATCH_BUCKET_RECENT_LIMIT")
@@ -64,8 +64,8 @@ class Settings(BaseSettings):
     watch_long_tail_exception_spread: float = Field(default=0.02, alias="WATCH_LONG_TAIL_EXCEPTION_SPREAD")
     watch_long_tail_exception_liquidity: float = Field(default=5000.0, alias="WATCH_LONG_TAIL_EXCEPTION_LIQUIDITY")
     watch_positive_edge_lookback_hours: int = Field(default=24, alias="WATCH_POSITIVE_EDGE_LOOKBACK_HOURS")
-    scan_interval_sec: int = Field(default=30, alias="SCAN_INTERVAL_SEC")
-    watch_scan_timeout_sec: float = Field(default=60.0, alias="WATCH_SCAN_TIMEOUT_SEC")
+    scan_interval_sec: int = Field(default=21, alias="SCAN_INTERVAL_SEC")
+    watch_scan_timeout_sec: float = Field(default=10.0, alias="WATCH_SCAN_TIMEOUT_SEC")
     watch_timeout_retry_sec: float = Field(default=21.0, alias="WATCH_TIMEOUT_RETRY_SEC")
     watch_live_fill_sync_enabled: bool = Field(default=True, alias="WATCH_LIVE_FILL_SYNC_ENABLED")
     discovery_refresh_sec: int = Field(default=900, alias="DISCOVERY_REFRESH_SEC")
@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     near_close_scan_pool_enabled: bool = Field(default=True, alias="NEAR_CLOSE_SCAN_POOL_ENABLED")
     near_close_scan_crypto_updown_only: bool = Field(default=False, alias="NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY")
     near_close_scan_event_limit: int = Field(default=750, alias="NEAR_CLOSE_SCAN_EVENT_LIMIT")
-    near_close_scan_pool_limit: int = Field(default=30, alias="NEAR_CLOSE_SCAN_POOL_LIMIT")
+    near_close_scan_pool_limit: int = Field(default=4, alias="NEAR_CLOSE_SCAN_POOL_LIMIT")
     near_close_scan_lookahead_minutes: float = Field(default=75.0, alias="NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES")
     near_close_open_position_monitor_sec: float = Field(default=2.0, alias="NEAR_CLOSE_OPEN_POSITION_MONITOR_SEC")
     near_close_min_paper_signals_for_live: int = Field(default=0, alias="NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE")
@@ -130,7 +130,7 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_WEEKEND_EXPOSURE_MULTIPLIER",
     )
     near_close_weekend_spread_multiplier: float = Field(
-        default=0.8,
+        default=1.2,
         alias="NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER",
     )
     near_close_weekend_start_distance_multiplier: float = Field(
@@ -156,11 +156,20 @@ class Settings(BaseSettings):
     near_close_short_drop: float = Field(default=0.008, alias="NEAR_CLOSE_SHORT_DROP")
     near_close_long_drop: float = Field(default=0.012, alias="NEAR_CLOSE_LONG_DROP")
     near_close_soft_stop_offset: float = Field(default=0.005, alias="NEAR_CLOSE_SOFT_STOP_OFFSET")
-    near_close_hard_stop_offset: float = Field(default=0.025, alias="NEAR_CLOSE_HARD_STOP_OFFSET")
+    near_close_hard_stop_offset: float = Field(default=0.2, alias="NEAR_CLOSE_HARD_STOP_OFFSET")
     near_close_hard_stop_bid: float = Field(default=0.945, alias="NEAR_CLOSE_HARD_STOP_BID")
     near_close_taker_exit_price: float = Field(default=0.52, alias="NEAR_CLOSE_TAKER_EXIT_PRICE")
     near_close_emergency_slippage: float = Field(default=0.01, alias="NEAR_CLOSE_EMERGENCY_SLIPPAGE")
     near_close_emergency_max_loss: float = Field(default=0.05, alias="NEAR_CLOSE_EMERGENCY_MAX_LOSS")
+    near_close_stop_exit_max_spread: float = Field(default=0.08, alias="NEAR_CLOSE_STOP_EXIT_MAX_SPREAD")
+    near_close_crypto_updown_stop_requires_direction_break: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_REQUIRES_DIRECTION_BREAK",
+    )
+    near_close_crypto_updown_stop_direction_break_buffer: float = Field(
+        default=0.00075,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_DIRECTION_BREAK_BUFFER",
+    )
     near_close_assume_submitted_filled_stop_exit: bool = Field(
         default=True,
         alias="NEAR_CLOSE_ASSUME_SUBMITTED_FILLED_STOP_EXIT",
@@ -193,7 +202,7 @@ class Settings(BaseSettings):
     near_close_crypto_updown_enabled: bool = Field(default=True, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED")
     near_close_crypto_updown_order_size: float = Field(default=5.0, alias="NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE")
     near_close_crypto_updown_symbols: str = Field(
-        default="BTCUSDT,ETHUSDT,SOLUSDT",
+        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS",
     )
     near_close_crypto_updown_min_minutes_to_end: float = Field(

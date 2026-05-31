@@ -120,6 +120,25 @@ const TEXT = {
     "\u76ee\u524d\u4ecd\u4f7f\u7528 SQLite\u3002runtime controls \u8207\u4ea4\u6613\u7d00\u9304\u53ef\u904b\u4f5c\uff0c\u4f46\u9577\u6642\u9593\u9ad8\u983b\u5beb\u5165\u4e0b\u7a69\u5b9a\u6027\u4ecd\u8f03\u5f31\u3002",
 };
 
+const SCAN_REJECTION_LABELS = {
+  market_not_allowed: "市場層條件未通過",
+  missing_minutes_to_resolution: "缺少剩餘時間",
+  missing_orderbook: "缺 orderbook",
+  crypto_updown_disabled: "Crypto Up/Down 未啟用",
+  missing_start_distance: "缺 start distance",
+  start_distance_below_min: "start distance 太低",
+  missing_orderbook_prices: "缺 bid/ask/midpoint",
+  best_ask_below_min: "ask 低於門檻",
+  midpoint_below_min: "midpoint 低於門檻",
+  spread_above_max: "spread 太寬",
+  bid_at_or_above_skip: "bid 已達取消觀察線",
+  tick_size_too_large: "tick size 太大",
+  entry_price_out_of_range: "進場價不在區間",
+  would_cross_post_only: "會 crossing，不適合 post-only",
+  bid_depth_below_min: "depth 不足",
+  net_edge_below_min: "淨邊際不足",
+};
+
 let latestTradingState = {
   live_trading_enabled: false,
   auto_execute_enabled: false,
@@ -653,13 +672,69 @@ function renderSummary(summary) {
     .join("");
 }
 
+function scanRejectionItems(summary) {
+  const rawCounts = summary?.scan_rejection_counts || {};
+  if (!rawCounts || typeof rawCounts !== "object" || Array.isArray(rawCounts)) {
+    return [];
+  }
+  return Object.entries(rawCounts)
+    .map(([reason, count]) => ({
+      reason,
+      label: SCAN_REJECTION_LABELS[reason] || reason.replaceAll("_", " "),
+      value: Number(count || 0),
+    }))
+    .filter((item) => item.value > 0)
+    .sort((left, right) => right.value - left.value || left.reason.localeCompare(right.reason))
+    .slice(0, 8);
+}
+
+function renderCriteriaStage({ label, description, count, marker, isZero = false, index = null }) {
+  const stageLabel = index === null ? label : `${index + 1}. ${label}`;
+  return `
+    <article class="criteria-stage ${isZero ? "is-zero" : ""}">
+      <div>
+        <span>${escapeHtml(stageLabel || "-")}</span>
+        <p>${escapeHtml(description || "")}</p>
+      </div>
+      <div class="criteria-count">
+        <strong>${formatNumber(count)}</strong>
+        <small>${escapeHtml(marker || "")}</small>
+      </div>
+    </article>
+  `;
+}
+
 function renderCriteriaFunnel(summary) {
   if (!criteriaFunnel) {
     return;
   }
 
   const funnel = Array.isArray(summary?.near_close_funnel) ? summary.near_close_funnel : [];
+  const rejectionItems = scanRejectionItems(summary);
   if (!funnel.length) {
+    if (rejectionItems.length) {
+      const checkedCount = Number(summary?.latest_monitored_markets || summary?.latest_book_count || 0);
+      const totalRejected = rejectionItems.reduce((total, item) => total + item.value, 0);
+      criteriaFunnel.innerHTML = [
+        renderCriteriaStage({
+          label: "本輪策略檢查",
+          description: "最新 watch cycle 沒有完整 discovery funnel；先列出本輪策略擋下原因。",
+          count: checkedCount || totalRejected,
+          marker: "起點",
+          isZero: !checkedCount && !totalRejected,
+        }),
+        ...rejectionItems.map((item) =>
+          renderCriteriaStage({
+            label: `擋下原因：${item.label}`,
+            description: item.reason,
+            count: item.value,
+            marker: `擋下 ${formatNumber(item.value)}`,
+            isZero: false,
+          }),
+        ),
+      ].join("");
+      return;
+    }
     criteriaFunnel.innerHTML = `
       <article class="criteria-stage">
         <div>
@@ -675,26 +750,30 @@ function renderCriteriaFunnel(summary) {
     return;
   }
 
-  criteriaFunnel.innerHTML = funnel
-    .map((stage, index) => {
+  const funnelRows = funnel.map((stage, index) => {
       const count = Number(stage?.count || 0);
       const previous = index > 0 ? Number(funnel[index - 1]?.count || 0) : count;
       const dropped = Math.max(previous - count, 0);
-      const dropLabel = index === 0 ? "璧烽粸" : `娣樻卑 ${formatNumber(dropped)}`;
-      return `
-        <article class="criteria-stage ${count === 0 ? "is-zero" : ""}">
-          <div>
-            <span>${escapeHtml(`${index + 1}. ${stage?.label || "-"}`)}</span>
-            <p>${escapeHtml(stage?.description || "")}</p>
-          </div>
-          <div class="criteria-count">
-            <strong>${formatNumber(count)}</strong>
-            <small>${escapeHtml(dropLabel)}</small>
-          </div>
-        </article>
-      `;
-    })
-    .join("");
+      const dropLabel = index === 0 ? "起點" : `淘汰 ${formatNumber(dropped)}`;
+      return renderCriteriaStage({
+        label: stage?.label || "-",
+        description: stage?.description || "",
+        count,
+        marker: dropLabel,
+        isZero: count === 0,
+        index,
+      });
+    });
+  const rejectionRows = rejectionItems.map((item) =>
+    renderCriteriaStage({
+      label: `擋下原因：${item.label}`,
+      description: item.reason,
+      count: item.value,
+      marker: `擋下 ${formatNumber(item.value)}`,
+      isZero: false,
+    }),
+  );
+  criteriaFunnel.innerHTML = [...funnelRows, ...rejectionRows].join("");
 }
 
 function renderStrategies(strategies) {

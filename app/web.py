@@ -47,11 +47,10 @@ WATCH_SUPERVISOR_PID_FILE = RUNTIME_LOG_DIR / "watch-supervisor.pid"
 WATCH_SCRIPT_PATH = BASE_DIR.parent / "scripts" / "watch-supervisor.ps1"
 DASHBOARD_COMPONENT_TIMEOUT_SEC = 2.5
 DASHBOARD_DB_TIMEOUT_SEC = 4.0
-EMBEDDED_WATCH_SCAN_TIMEOUT_SEC = 60.0
 EMBEDDED_WATCH_LIVE_TIMEOUT_SEC = 25.0
 EMBEDDED_WATCH_CYCLE_TIMEOUT_SEC = 60.0
 LIVE_FILL_SYNC_INTERVAL_SEC = 5.0
-LIVE_FILL_ACTIVITY_LIMIT = 500
+LIVE_FILL_ACTIVITY_LIMIT = 50
 NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC = 3.0
 NEAR_CLOSE_STOP_EXIT_TIMEOUT_SEC = 12.0
 OPEN_POSITION_BOOK_REFRESH_INTERVAL_SEC = 120.0
@@ -617,12 +616,29 @@ def _trading_parameters_payload(
                 "items": [
                     {"label": "深跌觸發", "value": settings.near_close_taker_exit_price},
                     {"label": "進場價跌幅觸發", "value": settings.near_close_hard_stop_offset},
+                    {"label": "FAK 最大 spread", "value": settings.near_close_stop_exit_max_spread},
+                    {
+                        "label": "Crypto 方向確認",
+                        "value": "開" if settings.near_close_crypto_updown_stop_requires_direction_break else "關",
+                    },
+                    {"label": "方向破壞 buffer", "value": settings.near_close_crypto_updown_stop_direction_break_buffer},
                     {"label": "SELL FAK 滑價", "value": settings.near_close_emergency_slippage},
                     {"label": "背景檢查間隔", "value": NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC, "unit": "秒"},
                 ],
             },
         ],
     }
+
+
+def _effective_market_mode_payload(settings: Settings, watch: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings_payload = settings.market_mode_payload()
+    watch = watch or {}
+    latest_heartbeat = watch.get("latest_heartbeat") or {}
+    heartbeat_details = latest_heartbeat.get("details") or {}
+    heartbeat_payload = heartbeat_details.get("market_mode")
+    if watch.get("running") and isinstance(heartbeat_payload, dict):
+        return {**settings_payload, **heartbeat_payload, "display_source": "watch_heartbeat"}
+    return settings_payload
 
 
 def _read_pid(pid_file: Path) -> int | None:
@@ -779,8 +795,9 @@ def build_watch_status(
     latest_scan_at = summary.get("latest_scan_at")
     latest_scan_dt = _parse_utc_timestamp(latest_scan_at)
     now = datetime.now(timezone.utc)
+    max_watch_delay_sec = max(settings.scan_interval_sec, settings.watch_timeout_retry_sec)
     max_scan_lag_sec = max(
-        settings.watch_scan_timeout_sec + settings.watch_timeout_retry_sec + 30,
+        settings.watch_scan_timeout_sec + max_watch_delay_sec + 30,
         settings.dashboard_refresh_sec * 2,
         90,
     )
@@ -818,7 +835,8 @@ def build_watch_status(
         message = heartbeat_message or "watch 正在掃描。"
     elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "delay":
         state = "running"
-        message = heartbeat_message or f"watch 掃描完成，正在 delay {settings.watch_timeout_retry_sec:.0f} 秒。"
+        current_delay_sec = float(heartbeat_details.get("delay_sec") or settings.scan_interval_sec)
+        message = heartbeat_message or f"watch 掃描完成，正在 delay {current_delay_sec:.0f} 秒。"
     elif watch_running and (heartbeat_fresh or liveness_fresh) and phase == "timeout":
         state = "running"
         message = heartbeat_message or "watch 上一輪掃描超時，正在等待下一輪。"
@@ -844,7 +862,8 @@ def build_watch_status(
         "watch_running": watch_running,
         "scan_interval_sec": settings.scan_interval_sec,
         "watch_scan_timeout_sec": settings.watch_scan_timeout_sec,
-        "watch_delay_sec": settings.watch_timeout_retry_sec,
+        "watch_delay_sec": settings.scan_interval_sec,
+        "watch_retry_delay_sec": settings.watch_timeout_retry_sec,
         "dashboard_refresh_sec": settings.dashboard_refresh_sec,
         "supervisor_pid": supervisor_pid,
         "watch_pid": watch_pid,
@@ -878,6 +897,7 @@ async def build_dashboard_payload(
     watch_heartbeats = repository.recent_watch_heartbeats(limit=6)
     risk_summary = repository.trading_risk_summary()
     watch_status = build_watch_status(settings, summary, watch_heartbeats[0] if watch_heartbeats else None)
+    market_mode_payload = _effective_market_mode_payload(settings, watch_status)
     opportunities = repository.latest_opportunities(
         limit=settings.dashboard_page_size,
         strategy_variant=strategy_variant,
@@ -900,7 +920,7 @@ async def build_dashboard_payload(
         "pnl": repository.settled_pnl_summary(),
         "trade_journal": _trade_journal_payload(repository, settings, wallet or {}),
         "refresh_sec": settings.dashboard_refresh_sec,
-        "trading": {**controls.as_payload(), "market_mode": settings.market_mode_payload()},
+        "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
         "risk": {
             **risk_summary,
             "kill_switch": controls.kill_switch_enabled,
@@ -910,7 +930,7 @@ async def build_dashboard_payload(
             "max_daily_paper_notional": settings.max_daily_paper_notional,
             "max_daily_paper_trades": settings.max_daily_paper_trades,
             "near_close": _near_close_dashboard_payload(repository, settings),
-            "market_mode": settings.market_mode_payload(),
+            "market_mode": market_mode_payload,
         },
         "wallet": wallet if wallet is not None else await load_wallet_status(settings),
         "preflight": preflight,
@@ -968,6 +988,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.live_fill_sync_at = 0.0
     app.state.live_fill_sync_error = None
     app.state.live_fill_sync_task = None
+    app.state.live_fill_sync_lock = threading.Lock()
     app.state.live_trader = PolymarketLiveTradingAdapter(current_settings)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -1080,33 +1101,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return repo.save_trading_controls(controls)
 
     def sync_live_fills_to_db() -> int:
-        fills: list[dict[str, Any]] = []
-        activities: list[dict[str, Any]] = []
-        if (current_settings.polymarket_private_key or "").strip():
-            live_trader: PolymarketLiveTradingAdapter | None = getattr(app.state, "live_trader", None)
-            if live_trader is not None:
-                live_trader.settings = current_settings
-                client = live_trader._get_authenticated_client()
-            else:
-                client = create_authenticated_clob_v2_client(current_settings)
-            clob_fills = client.get_trades()
-            if isinstance(clob_fills, list):
-                fills = [fill for fill in clob_fills if isinstance(fill, dict)]
-        funder_address = str(current_settings.polymarket_funder_address or "").strip()
-        if funder_address:
-            with httpx.Client(timeout=5.0) as client:
-                response = client.get(
-                    f"{current_settings.polymarket_data_api_base_url.rstrip('/')}/activity",
-                    params={"user": funder_address, "limit": LIVE_FILL_ACTIVITY_LIMIT},
-                )
-                response.raise_for_status()
-                payload = response.json()
-            if isinstance(payload, list):
-                activities = [item for item in payload if isinstance(item, dict)]
-        with repository_scope() as repo:
-            inserted = repo.save_clob_fills(fills, wallet_address=funder_address)
-            inserted += repo.save_polymarket_activity_trades(activities, wallet_address=funder_address)
-            return inserted
+        sync_lock = app.state.live_fill_sync_lock
+        if not sync_lock.acquire(blocking=False):
+            return 0
+        try:
+            fills: list[dict[str, Any]] = []
+            activities: list[dict[str, Any]] = []
+            if (current_settings.polymarket_private_key or "").strip():
+                live_trader: PolymarketLiveTradingAdapter | None = getattr(app.state, "live_trader", None)
+                if live_trader is not None:
+                    live_trader.settings = current_settings
+                    client = live_trader._get_authenticated_client()
+                else:
+                    client = create_authenticated_clob_v2_client(current_settings)
+                clob_fills = client.get_trades()
+                if isinstance(clob_fills, list):
+                    fills = [fill for fill in clob_fills if isinstance(fill, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+            funder_address = str(current_settings.polymarket_funder_address or "").strip()
+            if funder_address:
+                with httpx.Client(timeout=5.0) as client:
+                    response = client.get(
+                        f"{current_settings.polymarket_data_api_base_url.rstrip('/')}/activity",
+                        params={"user": funder_address, "limit": LIVE_FILL_ACTIVITY_LIMIT},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                if isinstance(payload, list):
+                    activities = [item for item in payload if isinstance(item, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+            with repository_scope() as repo:
+                inserted = repo.save_clob_fills(fills, wallet_address=funder_address)
+                inserted += repo.save_polymarket_activity_trades(activities, wallet_address=funder_address)
+                return inserted
+        finally:
+            sync_lock.release()
 
     async def maybe_sync_live_fills(*, wait_for_result: bool = True) -> int:
         loop_time = asyncio.get_running_loop().time()
@@ -1260,7 +1287,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "watch_running": running_task or external_status["watch_running"],
             "scan_interval_sec": current_settings.scan_interval_sec,
             "watch_scan_timeout_sec": current_settings.watch_scan_timeout_sec,
-            "watch_delay_sec": current_settings.watch_timeout_retry_sec,
+            "watch_delay_sec": current_settings.scan_interval_sec,
+            "watch_retry_delay_sec": current_settings.watch_timeout_retry_sec,
             "dashboard_refresh_sec": current_settings.dashboard_refresh_sec,
             "supervisor_pid": external_status["supervisor_pid"],
             "watch_pid": external_status["watch_pid"],
@@ -1290,8 +1318,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     details={
                         "phase": "scanning",
                         "scan_started_at": scan_started_at.isoformat(),
-                        "timeout_sec": EMBEDDED_WATCH_SCAN_TIMEOUT_SEC,
-                        "delay_sec": current_settings.watch_timeout_retry_sec,
+                        "timeout_sec": current_settings.watch_scan_timeout_sec,
+                        "delay_sec": current_settings.scan_interval_sec,
                     },
                 )
                 result = asyncio.run(
@@ -1301,7 +1329,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             limit=current_settings.watch_market_limit,
                             repository=repo,
                         ),
-                        timeout=EMBEDDED_WATCH_SCAN_TIMEOUT_SEC,
+                        timeout=current_settings.watch_scan_timeout_sec,
                     )
                 )
                 persist_scan_cycle(repo, result, current_settings)
@@ -1314,7 +1342,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "phase": "completed",
                         "scan_started_at": scan_started_at.isoformat(),
                         "scan_completed_at": getattr(result, "executed_at", datetime.now(timezone.utc)).isoformat(),
-                        "delay_sec": current_settings.watch_timeout_retry_sec,
+                        "delay_sec": current_settings.scan_interval_sec,
                         "monitored_markets": len(getattr(result, "shortlisted_markets", []) or []),
                         "book_count": len(getattr(result, "books", {}) or {}),
                         "opportunity_count": len(getattr(result, "opportunities", []) or []),
@@ -1358,7 +1386,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "phase": "completed",
                         "scan_started_at": scan_started_at.isoformat(),
                         "scan_completed_at": getattr(result, "executed_at", datetime.now(timezone.utc)).isoformat(),
-                        "delay_sec": current_settings.watch_timeout_retry_sec,
+                        "delay_sec": current_settings.scan_interval_sec,
                         "monitored_markets": len(getattr(result, "shortlisted_markets", []) or []),
                         "book_count": len(getattr(result, "books", {}) or {}),
                         "opportunity_count": len(getattr(result, "opportunities", []) or []),
@@ -1508,6 +1536,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.watch_last_error = None
         try:
             while not stop_event.is_set():
+                next_delay_sec = current_settings.scan_interval_sec
                 try:
                     executed_at = await asyncio.wait_for(
                         asyncio.to_thread(run_watch_cycle_once),
@@ -1516,8 +1545,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.watch_latest_scan_at = executed_at.isoformat()
                     app.state.watch_last_error = None
                 except TimeoutError:
+                    next_delay_sec = current_settings.watch_timeout_retry_sec
                     app.state.watch_last_error = (
-                        f"watch 單輪掃描超過 {EMBEDDED_WATCH_CYCLE_TIMEOUT_SEC:.0f}s，已跳過並 delay {current_settings.watch_timeout_retry_sec:.0f} 秒。"
+                        f"watch 單輪掃描超過 {current_settings.watch_scan_timeout_sec:.0f}s，已跳過並 delay {current_settings.watch_timeout_retry_sec:.0f} 秒。"
                     )
                     try:
                         with repository_scope() as repo:
@@ -1527,13 +1557,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 message=app.state.watch_last_error,
                                 details={
                                     "phase": "timeout",
-                                    "timeout_sec": EMBEDDED_WATCH_CYCLE_TIMEOUT_SEC,
+                                    "timeout_sec": current_settings.watch_scan_timeout_sec,
                                     "delay_sec": current_settings.watch_timeout_retry_sec,
                                 },
                             )
                     except Exception:
                         pass
                 except Exception as exc:
+                    next_delay_sec = current_settings.watch_timeout_retry_sec
                     app.state.watch_last_error = f"watch 掃描失敗：{exc}"
                     try:
                         with repository_scope() as repo:
@@ -1547,7 +1578,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 try:
                     await asyncio.wait_for(
                         stop_event.wait(),
-                        timeout=current_settings.watch_timeout_retry_sec,
+                        timeout=next_delay_sec,
                     )
                 except TimeoutError:
                     pass
@@ -1768,6 +1799,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             watch_heartbeats = repo.recent_watch_heartbeats(limit=6)
             risk_summary = repo.trading_risk_summary()
             watch_status = watch_status_payload(summary, watch_heartbeats[0] if watch_heartbeats else None)
+            market_mode_payload = _effective_market_mode_payload(current_settings, watch_status)
             opportunities = repo.latest_opportunities(
                 limit=current_settings.dashboard_page_size,
                 strategy_variant=strategy_variant,
@@ -1790,7 +1822,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "pnl": repo.settled_pnl_summary(),
                 "trade_journal": _trade_journal_payload(repo, current_settings, wallet),
                 "refresh_sec": current_settings.dashboard_refresh_sec,
-                "trading": {**controls.as_payload(), "market_mode": current_settings.market_mode_payload()},
+                "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
                 "risk": {
                     **risk_summary,
                     "kill_switch": controls.kill_switch_enabled,
@@ -1800,7 +1832,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "max_daily_paper_notional": current_settings.max_daily_paper_notional,
                     "max_daily_paper_trades": current_settings.max_daily_paper_trades,
                     "near_close": _near_close_dashboard_payload(repo, current_settings),
-                    "market_mode": current_settings.market_mode_payload(),
+                    "market_mode": market_mode_payload,
                 },
                 "wallet": wallet,
                 "preflight": preflight,
@@ -2298,7 +2330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 limit=limit or current_settings.dashboard_scan_limit,
                                 repository=scan_repo,
                             ),
-                            timeout=EMBEDDED_WATCH_SCAN_TIMEOUT_SEC,
+                            timeout=current_settings.watch_scan_timeout_sec,
                         )
                     )
 

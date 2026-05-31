@@ -131,6 +131,280 @@ def test_near_close_taker_exit_uses_fak_to_take_available_liquidity(tmp_path) ->
     assert trader.target_price == 0.5
 
 
+def test_near_close_taker_exit_skips_wide_spread_fak(tmp_path) -> None:
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.plan = None
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    repository = ScannerRepository(connect_db(tmp_path / "stop-wide-spread.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "wide-spread-stop",
+                1,
+                "BUY",
+                "token-bnb",
+                "bnb-updown-15m-test",
+                "Down",
+                0.89,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                json.dumps({"strategy_variant": "near_close_maker", "crypto_start_price": 650.0}),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_STOP_EXIT_MAX_SPREAD=0.08),
+            watch_books={"token-bnb": make_book(bid=0.69, ask=0.96)},
+        )
+    )
+
+    assert trader.plan is None
+    assert exits[0]["status"] == "stop_exit_skipped_spread_too_wide"
+    assert exits[0]["observed_spread"] == 0.27
+
+
+def test_near_close_taker_exit_skips_when_crypto_direction_still_valid(tmp_path, monkeypatch) -> None:
+    class FakePriceClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def get_prices(self, symbols):
+            return {"BTCUSDT": 99.0}
+
+        async def close(self) -> None:
+            return None
+
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.plan = None
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    repository = ScannerRepository(connect_db(tmp_path / "stop-direction-valid.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "direction-valid-stop",
+                1,
+                "BUY",
+                "token-btc",
+                "btc-updown-15m-test",
+                "Down",
+                0.92,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_maker",
+                        "crypto_start_price": 100.0,
+                        "crypto_winning_outcome": "Down",
+                    }
+                ),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
+            watch_books={"token-btc": make_book(bid=0.71, ask=0.72)},
+        )
+    )
+
+    assert trader.plan is None
+    assert exits[0]["status"] == "stop_exit_skipped_crypto_direction_intact"
+    assert exits[0]["crypto_stop_spot_price"] == 99.0
+    assert exits[0]["crypto_direction_broken"] is False
+
+
+def test_near_close_taker_exit_skips_down_proxy_tie_at_start(tmp_path, monkeypatch) -> None:
+    class FakePriceClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def get_prices(self, symbols):
+            return {"SOLUSDT": 100.0}
+
+        async def close(self) -> None:
+            return None
+
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.plan = None
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    repository = ScannerRepository(connect_db(tmp_path / "stop-direction-proxy-tie.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "direction-proxy-tie-stop",
+                1,
+                "BUY",
+                "token-sol",
+                "sol-updown-15m-test",
+                "Down",
+                0.94,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_maker",
+                        "crypto_start_price": 100.0,
+                        "crypto_winning_outcome": "Down",
+                    }
+                ),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
+            watch_books={"token-sol": make_book(bid=0.37, ask=0.38)},
+        )
+    )
+
+    assert trader.plan is None
+    assert exits[0]["status"] == "stop_exit_skipped_crypto_direction_intact"
+    assert exits[0]["crypto_stop_spot_price"] == 100.0
+    assert exits[0]["crypto_direction_break_buffer"] == 0.00075
+    assert exits[0]["crypto_direction_broken"] is False
+
+
+def test_near_close_taker_exit_allows_when_crypto_direction_breaks(tmp_path, monkeypatch) -> None:
+    class FakePriceClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def get_prices(self, symbols):
+            return {"BTCUSDT": 100.5}
+
+        async def close(self) -> None:
+            return None
+
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.plan = None
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    repository = ScannerRepository(connect_db(tmp_path / "stop-direction-broken.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "direction-broken-stop",
+                1,
+                "BUY",
+                "token-btc",
+                "btc-updown-15m-test",
+                "Down",
+                0.92,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_maker",
+                        "crypto_start_price": 100.0,
+                        "crypto_winning_outcome": "Down",
+                    }
+                ),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
+            watch_books={"token-btc": make_book(bid=0.71, ask=0.72)},
+        )
+    )
+
+    assert trader.plan is not None
+    assert trader.plan.legs[0].order_type == "FAK"
+    assert trader.plan.legs[0].metadata["crypto_direction_broken"] is True
+
+
 def test_near_close_taker_exit_records_observed_bid_and_execution_telemetry(tmp_path) -> None:
     class FakeTrader:
         async def execute(self, plan):
@@ -252,13 +526,13 @@ def test_near_close_taker_exit_includes_matched_cancel_unconfirmed_order(tmp_pat
     trader = FakeTrader()
 
     asyncio.run(
-        _execute_near_close_taker_exits(
-            repository=repository,
-            live_trader=trader,
-            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52),
-            watch_books={"token-down": make_book(bid=0.49, ask=0.78)},
+            _execute_near_close_taker_exits(
+                repository=repository,
+                live_trader=trader,
+                settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52),
+                watch_books={"token-down": make_book(bid=0.49, ask=0.50)},
+            )
         )
-    )
 
     assert trader.plan is not None
     assert trader.plan.legs[0].action == "SELL"

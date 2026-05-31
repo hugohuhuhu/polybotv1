@@ -6,7 +6,7 @@ import contextlib
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from time import sleep, time
@@ -117,6 +117,27 @@ def _touch_watch_liveness() -> None:
         WATCH_LIVENESS_FILE.write_text(datetime.now(timezone.utc).isoformat(), encoding="ascii")
 
 
+def _watch_heartbeat_details(settings: Settings, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    heartbeat_details = dict(details or {})
+    heartbeat_details.setdefault("market_mode", settings.market_mode_payload())
+    return heartbeat_details
+
+
+def _monitored_markets_expired(monitored_markets: list[Any] | None, *, now: datetime | None = None) -> bool:
+    if not monitored_markets:
+        return False
+    checked_at = now or datetime.now(timezone.utc)
+    end_dates: list[datetime] = []
+    for market in monitored_markets:
+        end_date = getattr(market, "end_date", None)
+        if not isinstance(end_date, datetime):
+            return False
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        end_dates.append(end_date.astimezone(timezone.utc))
+    return bool(end_dates) and all(end_date <= checked_at for end_date in end_dates)
+
+
 def _save_watch_heartbeat(
     settings: Settings,
     *,
@@ -125,6 +146,7 @@ def _save_watch_heartbeat(
     latest_scan_at: datetime | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
+    heartbeat_details = _watch_heartbeat_details(settings, details)
     for attempt in range(3):
         try:
             with closing(connect_db(settings)) as connection:
@@ -133,7 +155,7 @@ def _save_watch_heartbeat(
                     state=state,
                     latest_scan_at=latest_scan_at,
                     message=message,
-                    details=details,
+                    details=heartbeat_details,
                 )
             return
         except Exception as exc:
@@ -146,13 +168,16 @@ def _save_watch_heartbeat(
 async def _watch_delay(
     settings: Settings,
     *,
+    delay_sec: float | None = None,
     message: str = "watch delay before next scan",
     details: dict[str, Any] | None = None,
     monitor_callback: Any | None = None,
 ) -> None:
+    actual_delay_sec = max(float(settings.scan_interval_sec if delay_sec is None else delay_sec), 0.0)
     delay_started_at = datetime.now(timezone.utc)
-    delay_until_ts = time() + settings.watch_timeout_retry_sec
-    delay_until = datetime.fromtimestamp(delay_until_ts, tz=timezone.utc)
+    delay_until = delay_started_at + timedelta(seconds=actual_delay_sec)
+    loop = asyncio.get_running_loop()
+    delay_deadline = loop.time() + actual_delay_sec
     _save_watch_heartbeat(
         settings,
         state="delay",
@@ -162,14 +187,14 @@ async def _watch_delay(
             "phase": "delay",
             "delay_started_at": delay_started_at.isoformat(),
             "delay_until": delay_until.isoformat(),
-            "delay_sec": settings.watch_timeout_retry_sec,
+            "delay_sec": actual_delay_sec,
             "scan_timeout_sec": settings.watch_scan_timeout_sec,
             **(details or {}),
         },
     )
     while True:
         _touch_watch_liveness()
-        remaining = delay_until_ts - time()
+        remaining = delay_deadline - loop.time()
         if remaining <= 0:
             return
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
@@ -719,6 +744,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         loop_started_at: float,
         previous_midpoints: dict[str, float] | None = None,
         monitored_markets: list[Any] | None = None,
+        shortlist_diagnostics: dict[str, object] | None = None,
     ) -> Any:
         async def run_scan() -> Any:
             with closing(connect_db(settings)) as connection:
@@ -728,6 +754,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         settings,
                         monitored_markets,
                         previous_midpoints=previous_midpoints,
+                        shortlist_diagnostics=shortlist_diagnostics,
                     )
                 return await execute_scan_cycle(
                     settings,
@@ -787,7 +814,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 "phase": "scanning",
                 "scan_started_at": scan_started_at.isoformat(),
                 "timeout_sec": settings.watch_scan_timeout_sec,
-                "delay_sec": settings.watch_timeout_retry_sec,
+                "delay_sec": settings.scan_interval_sec,
             },
         )
         try:
@@ -802,16 +829,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         state="running",
                         latest_scan_at=initial.executed_at,
                         message="watch initial scan completed",
-                        details={
+                        details=_watch_heartbeat_details(settings, {
                             "phase": "completed",
                             "scan_started_at": scan_started_at.isoformat(),
                             "scan_completed_at": initial.executed_at.isoformat(),
-                            "delay_sec": settings.watch_timeout_retry_sec,
+                            "delay_sec": settings.scan_interval_sec,
                             "scan_timeout_sec": settings.watch_scan_timeout_sec,
                             "monitored_markets": len(initial.shortlisted_markets),
                             "book_count": len(initial.books),
                             "opportunity_count": len(initial.opportunities),
-                        },
+                        }),
                     )
                     persist_monitor_cycle(
                         repository,
@@ -870,15 +897,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             f"watch initial scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
                             f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
                         ),
-                        details={
+                        details=_watch_heartbeat_details(settings, {
                             "phase": "timeout",
                             "scan_started_at": scan_started_at.isoformat(),
                             "timeout_sec": settings.watch_scan_timeout_sec,
                             "delay_sec": settings.watch_timeout_retry_sec,
-                        },
+                        }),
                     )
             await _watch_delay(
                 settings,
+                delay_sec=settings.watch_timeout_retry_sec,
                 message="watch initial scan timed out; delaying before the next scan",
                 details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
             )
@@ -890,15 +918,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         source="watch",
                         state="error",
                         message="watch initial scan failed; delaying before the next scan.",
-                        details={
+                        details=_watch_heartbeat_details(settings, {
                             "phase": "error",
                             "scan_started_at": scan_started_at.isoformat(),
                             "error": str(exc),
                             "delay_sec": settings.watch_timeout_retry_sec,
-                        },
+                        }),
                     )
             await _watch_delay(
                 settings,
+                delay_sec=settings.watch_timeout_retry_sec,
                 message="watch initial scan failed; delaying before the next scan",
                 details={"previous_phase": "error", "scan_started_at": scan_started_at.isoformat()},
             )
@@ -909,12 +938,14 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
     try:
         previous_midpoints = collect_previous_midpoints(book_state.books)
         monitored_markets = list(initial.shortlisted_markets)
+        monitored_shortlist_diagnostics = dict(initial.shortlist_diagnostics)
         while True:
-            await _watch_delay(settings)
+            await _watch_delay(settings, delay_sec=settings.scan_interval_sec)
             _touch_watch_liveness()
             scan_started_at = datetime.now(timezone.utc)
             loop_started_at = asyncio.get_running_loop().time()
             loop_time = loop_started_at
+            refresh_monitored_markets = _monitored_markets_expired(monitored_markets)
             _save_watch_heartbeat(
                 settings,
                 state="scanning",
@@ -923,7 +954,8 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                     "phase": "scanning",
                     "scan_started_at": scan_started_at.isoformat(),
                     "timeout_sec": settings.watch_scan_timeout_sec,
-                    "delay_sec": settings.watch_timeout_retry_sec,
+                    "delay_sec": settings.scan_interval_sec,
+                    "refresh_discovery": refresh_monitored_markets,
                 },
             )
             with closing(connect_db(settings)) as connection:
@@ -932,7 +964,12 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                     cycle = await run_scan_cycle_with_budget(
                         loop_started_at=loop_started_at,
                         previous_midpoints=previous_midpoints,
-                        monitored_markets=monitored_markets or None,
+                        monitored_markets=None if refresh_monitored_markets else monitored_markets or None,
+                        shortlist_diagnostics=(
+                            None
+                            if refresh_monitored_markets
+                            else monitored_shortlist_diagnostics if monitored_markets else None
+                        ),
                     )
                 except TimeoutError:
                     with contextlib.suppress(Exception):
@@ -943,15 +980,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                                 f"watch scan exceeded {settings.watch_scan_timeout_sec:.0f}s; "
                                 f"abandoned and delaying {settings.watch_timeout_retry_sec:.0f}s before the next scan."
                             ),
-                            details={
+                            details=_watch_heartbeat_details(settings, {
                                 "phase": "timeout",
                                 "scan_started_at": scan_started_at.isoformat(),
                                 "timeout_sec": settings.watch_scan_timeout_sec,
                                 "delay_sec": settings.watch_timeout_retry_sec,
-                            },
+                            }),
                         )
                     await _watch_delay(
                         settings,
+                        delay_sec=settings.watch_timeout_retry_sec,
                         message="watch scan timed out; delaying before the next scan",
                         details={"previous_phase": "timeout", "scan_started_at": scan_started_at.isoformat()},
                     )
@@ -963,15 +1001,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             source="watch",
                             state="error",
                             message="watch scan failed; delaying before the next scan.",
-                            details={
+                            details=_watch_heartbeat_details(settings, {
                                 "phase": "error",
                                 "scan_started_at": scan_started_at.isoformat(),
                                 "error": str(exc),
                                 "delay_sec": settings.watch_timeout_retry_sec,
-                            },
+                            }),
                         )
                     await _watch_delay(
                         settings,
+                        delay_sec=settings.watch_timeout_retry_sec,
                         message="watch scan failed; delaying before the next scan",
                         details={"previous_phase": "error", "scan_started_at": scan_started_at.isoformat()},
                     )
@@ -993,17 +1032,17 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         state="running",
                         latest_scan_at=scan_started_at,
                         message="watch scan completed",
-                        details={
+                        details=_watch_heartbeat_details(settings, {
                             "phase": "completed",
                             "scan_started_at": scan_started_at.isoformat(),
                             "scan_completed_at": cycle.executed_at.isoformat(),
-                            "delay_sec": settings.watch_timeout_retry_sec,
+                            "delay_sec": settings.scan_interval_sec,
                             "scan_timeout_sec": settings.watch_scan_timeout_sec,
-                            "refresh_discovery": True,
+                            "refresh_discovery": refresh_monitored_markets,
                             "monitored_markets": len(cycle.shortlisted_markets),
                             "book_count": len(cycle.books),
                             "opportunity_count": len(cycle.opportunities),
-                        },
+                        }),
                     )
                 except Exception as exc:
                     if not _is_sqlite_lock_error(exc):
@@ -1014,7 +1053,12 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 book_state.books = {}
                 for snapshot in cycle.books.values():
                     book_state.upsert_snapshot(snapshot)
-                monitored_markets = list(cycle.shortlisted_markets)
+                if cycle.books:
+                    monitored_markets = list(cycle.shortlisted_markets)
+                    monitored_shortlist_diagnostics = dict(cycle.shortlist_diagnostics)
+                else:
+                    monitored_markets = []
+                    monitored_shortlist_diagnostics = {}
 
                 controls = repository.get_trading_controls(default_controls)
                 runtime_settings = controls.apply(settings)

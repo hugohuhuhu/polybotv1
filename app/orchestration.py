@@ -170,6 +170,13 @@ def _is_allowed_crypto_updown_market(settings: Settings, market: MarketRecord) -
     return not allowed_symbols or updown[0].upper() in allowed_symbols
 
 
+def _crypto_updown_symbol(market: MarketRecord) -> str | None:
+    updown = _parse_crypto_updown_market(market)
+    if updown is None:
+        return None
+    return updown[0].upper()
+
+
 async def enrich_crypto_near_close_markets(settings: Settings, markets: list[MarketRecord]) -> None:
     if not settings.near_close_crypto_enabled:
         return
@@ -382,6 +389,7 @@ def shortlist_near_close_markets(
     limit: int | None = None,
 ) -> tuple[list[MarketRecord], dict[str, object]]:
     now = datetime.now(timezone.utc)
+    selected_limit = limit or settings.near_close_scan_pool_limit
     candidate_markets = (
         [market for market in markets if _is_allowed_crypto_updown_market(settings, market)]
         if settings.near_close_scan_crypto_updown_only
@@ -392,7 +400,7 @@ def shortlist_near_close_markets(
         for market in candidate_markets
         if not _is_excluded_market(market) and _is_near_close_pool_candidate(settings, market, now)
     ]
-    selected = sorted(
+    sorted_candidates = sorted(
         candidates,
         key=lambda market: (
             0
@@ -402,7 +410,20 @@ def shortlist_near_close_markets(
             -float(market.liquidity or 0.0),
             -float(market.volume or 0.0),
         ),
-    )[: limit or settings.near_close_scan_pool_limit]
+    )
+    selected: list[MarketRecord] = []
+    if settings.near_close_scan_crypto_updown_only and settings.allowed_crypto_updown_symbols():
+        selected_symbols: set[str] = set()
+        for market in sorted_candidates:
+            symbol = _crypto_updown_symbol(market)
+            if symbol is None or symbol in selected_symbols:
+                continue
+            selected.append(market)
+            selected_symbols.add(symbol)
+            if len(selected) >= selected_limit:
+                break
+    else:
+        selected = sorted_candidates[:selected_limit]
 
     def shortlisted_entry(market: MarketRecord) -> dict[str, object]:
         decision = classify_near_close_market(market)
@@ -412,6 +433,7 @@ def shortlist_near_close_markets(
         return {
             "question": market.question,
             "slug": market.slug,
+            "crypto_symbol": _crypto_updown_symbol(market),
             "liquidity": market.liquidity,
             "watch_score": round(max(0.0, 1.0 - abs((_minutes_to_resolution(market, now) or 999) - 6.0) / 20.0), 4),
             "bucket": "near_close",
@@ -435,6 +457,9 @@ def shortlist_near_close_markets(
         "near_close_scan_crypto_updown_only": settings.near_close_scan_crypto_updown_only,
         "crypto_updown_discovered_count": len(candidate_markets) if settings.near_close_scan_crypto_updown_only else None,
         "crypto_updown_allowed_symbols": sorted(settings.allowed_crypto_updown_symbols()) or ["ALL"],
+        "crypto_updown_selected_symbols": [
+            symbol for symbol in (_crypto_updown_symbol(market) for market in selected) if symbol is not None
+        ],
         "near_close_candidates": len(candidates),
         "near_close_funnel": build_near_close_funnel(settings, candidate_markets, shortlisted=selected, now=now),
     }
