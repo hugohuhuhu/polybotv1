@@ -59,10 +59,11 @@ def test_settings_clamps_near_close_gtd_to_gemini_30m() -> None:
 def test_settings_defaults_to_final_two_minute_entry_experiment() -> None:
     settings = Settings()
 
-    assert settings.near_close_entry_window_seconds() == (0.0, 120.0)
+    assert settings.near_close_entry_window_seconds() == (30.0, 120.0)
     assert settings.near_close_final_seconds_allow_entry is True
     assert settings.near_close_log_entry_telemetry is True
-    assert settings.near_close_entry_seconds_allowed(15.0) is True
+    assert settings.near_close_entry_seconds_allowed(15.0) is False
+    assert settings.near_close_entry_seconds_allowed(30.0) is True
     assert settings.near_close_entry_seconds_allowed(121.0) is False
 
 
@@ -622,6 +623,7 @@ def test_late_resolution_scanner_allows_crypto_updown_inside_legacy_last_90_seco
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=0,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -655,6 +657,7 @@ def test_late_resolution_scanner_blocks_entries_before_two_minute_window() -> No
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=0,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -684,6 +687,7 @@ def test_late_resolution_scanner_allows_final_30_seconds_when_configured() -> No
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=0,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))

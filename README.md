@@ -211,8 +211,8 @@ Relevant settings:
 - `NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END=7` for the live launch scripts.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT` limits the live crypto Up/Down universe to BTC, ETH, SOL, and BNB.
 - `NEAR_CLOSE_SCAN_POOL_LIMIT=4` keeps the watch shortlist focused on one active Up/Down market per core symbol when possible.
-- `WATCH_SCAN_TIMEOUT_SEC=10` and `SCAN_INTERVAL_SEC=21` keep each watch scan on a 10-second budget with a 21-second normal refresh cadence.
-- `NEAR_CLOSE_ENTRY_MAX_SECONDS=120` and `NEAR_CLOSE_ENTRY_MIN_SECONDS=0` make near-close maker new entries a final-two-minute experiment across all near-close variants.
+- `WATCH_SCAN_TIMEOUT_SEC=10` and `SCAN_INTERVAL_SEC=8` keep each watch scan on a 10-second budget with an 8-second normal refresh cadence.
+- `NEAR_CLOSE_ENTRY_MAX_SECONDS=120` and `NEAR_CLOSE_ENTRY_MIN_SECONDS=30` make near-close maker new entries a 120-to-30-second experiment across all near-close variants.
 - `NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=true` keeps the final 30 seconds open when spread/depth/post-only/risk checks still pass.
 - `NEAR_CLOSE_LOG_ENTRY_TELEMETRY=true` stores entry-time seconds, bid/ask, spread, midpoint, depth, token, slug, and crypto start distance in opportunity/live-order JSON.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0` is retained only as legacy compatibility; it no longer blocks the final 90 seconds.
@@ -220,7 +220,7 @@ Relevant settings:
 - `NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER=7:0.0024,6:0.0018,5:0.00121,3.5:0.0010,1.5:0.00085,0.35:0.00085`
 
 `python -m app.main report` includes a live-only `Near-close Entry Bucket Performance (Live)` table for `120-90`, `90-60`, `60-30`, and `30-0` second buckets. It is intended for measurement, not proof of edge; kill switch, exposure caps, post-only, spread/depth checks, and emergency exits remain active.
-- `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00012` remains the cancellation line for already-active maker orders in the local launch scripts.
+- `NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00005` remains the cancellation line for already-active maker orders in the local launch scripts.
 - `NEAR_CLOSE_OPEN_POSITION_MONITOR_SEC=2` makes watch check only open-position orderbooks during scan waits and delay windows.
 - `NEAR_CLOSE_SECOND_CHANCE_EXIT_ENABLED=false` keeps panic exits to one immediate FAK taker attempt; no maker repost or second-chance order is attempted.
 

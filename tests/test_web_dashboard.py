@@ -196,7 +196,7 @@ def test_dashboard_routes_render_and_serve_data(tmp_path, monkeypatch) -> None:
     assert payload["watch_heartbeats"][0]["state"] == "delay"
     assert payload["watch"]["phase"] == "delay"
     assert payload["watch"]["watch_scan_timeout_sec"] == 10.0
-    assert payload["watch"]["watch_delay_sec"] == 21.0
+    assert payload["watch"]["watch_delay_sec"] == 8.0
     rejection_group = next(
         group for group in payload["trading_parameters"]["groups"] if group["title"] == "Crypto Up/Down 被擋原因"
     )

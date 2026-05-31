@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     watch_long_tail_exception_spread: float = Field(default=0.02, alias="WATCH_LONG_TAIL_EXCEPTION_SPREAD")
     watch_long_tail_exception_liquidity: float = Field(default=5000.0, alias="WATCH_LONG_TAIL_EXCEPTION_LIQUIDITY")
     watch_positive_edge_lookback_hours: int = Field(default=24, alias="WATCH_POSITIVE_EDGE_LOOKBACK_HOURS")
-    scan_interval_sec: int = Field(default=21, alias="SCAN_INTERVAL_SEC")
+    scan_interval_sec: int = Field(default=8, alias="SCAN_INTERVAL_SEC")
     watch_scan_timeout_sec: float = Field(default=10.0, alias="WATCH_SCAN_TIMEOUT_SEC")
     watch_timeout_retry_sec: float = Field(default=21.0, alias="WATCH_TIMEOUT_RETRY_SEC")
     watch_live_fill_sync_enabled: bool = Field(default=True, alias="WATCH_LIVE_FILL_SYNC_ENABLED")
@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
     near_close_live_max_minutes_to_end: float = Field(default=7.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
     near_close_entry_max_seconds: float = Field(default=120.0, alias="NEAR_CLOSE_ENTRY_MAX_SECONDS")
-    near_close_entry_min_seconds: float = Field(default=0.0, alias="NEAR_CLOSE_ENTRY_MIN_SECONDS")
+    near_close_entry_min_seconds: float = Field(default=30.0, alias="NEAR_CLOSE_ENTRY_MIN_SECONDS")
     near_close_final_seconds_allow_entry: bool = Field(
         default=True,
         alias="NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY",
@@ -237,7 +237,7 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_START_DISTANCE_LADDER",
     )
     near_close_crypto_updown_cancel_start_distance: float = Field(
-        default=0.00075,
+        default=0.00005,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE",
     )
     near_close_crypto_updown_min_best_ask: float = Field(default=0.84, alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK")
@@ -260,7 +260,7 @@ class Settings(BaseSettings):
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE",
     )
     near_close_crypto_updown_min_depth: float = Field(
-        default=10.0,
+        default=18.0,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH",
     )
     near_close_crypto_updown_midpoint_discount: float = Field(

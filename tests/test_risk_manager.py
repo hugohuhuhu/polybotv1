@@ -229,6 +229,7 @@ def test_risk_manager_allows_near_close_live_inside_final_30_seconds(tmp_path) -
             NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
             NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
             NEAR_CLOSE_ENTRY_MAX_SECONDS=120,
+            NEAR_CLOSE_ENTRY_MIN_SECONDS=0,
             NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=True,
             MAX_NOTIONAL_PER_PLAN=10,
         )
@@ -250,6 +251,7 @@ def test_risk_manager_blocks_final_30_seconds_when_disabled(tmp_path) -> None:
             NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
             NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
             NEAR_CLOSE_ENTRY_MAX_SECONDS=120,
+            NEAR_CLOSE_ENTRY_MIN_SECONDS=0,
             NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=False,
             MAX_NOTIONAL_PER_PLAN=10,
         )
