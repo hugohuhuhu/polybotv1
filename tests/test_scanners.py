@@ -56,6 +56,16 @@ def test_settings_clamps_near_close_gtd_to_gemini_30m() -> None:
     assert Settings(NEAR_CLOSE_GTD_SECONDS=5400).near_close_gtd_seconds == 1800
 
 
+def test_settings_defaults_to_final_two_minute_entry_experiment() -> None:
+    settings = Settings()
+
+    assert settings.near_close_entry_window_seconds() == (0.0, 120.0)
+    assert settings.near_close_final_seconds_allow_entry is True
+    assert settings.near_close_log_entry_telemetry is True
+    assert settings.near_close_entry_seconds_allowed(15.0) is True
+    assert settings.near_close_entry_seconds_allowed(121.0) is False
+
+
 def test_settings_switches_light_mode_when_us_equity_market_is_closed() -> None:
     settings = Settings(NEAR_CLOSE_WEEKEND_MODE_ENABLED=True, NEAR_CLOSE_US_MARKET_MODE_ENABLED=True)
     saturday = datetime(2026, 5, 23, 15, 0, tzinfo=timezone.utc)
@@ -225,6 +235,7 @@ def test_late_resolution_scanner_detects_high_probability_market() -> None:
         NEAR_CLOSE_MIN_MIDPOINT=0.982,
         NEAR_CLOSE_MAX_SPREAD=0.02,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=360,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -254,7 +265,7 @@ def test_late_resolution_scanner_detects_high_probability_market() -> None:
     assert opportunities[0].details["post_only"] is True
     assert opportunities[0].details["order_type"] == "GTD"
     assert opportunities[0].prices["entry_bid"] == 0.97
-    assert opportunities[0].details["tradable_live"] is False
+    assert opportunities[0].details["tradable_live"] is True
 
 
 def test_late_resolution_scanner_keeps_restricted_market_after_clob_smoke_test() -> None:
@@ -266,6 +277,7 @@ def test_late_resolution_scanner_keeps_restricted_market_after_clob_smoke_test()
         NEAR_CLOSE_MIN_MIDPOINT=0.982,
         NEAR_CLOSE_MAX_SPREAD=0.02,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=360,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -341,6 +353,7 @@ def test_late_resolution_scanner_accepts_official_data_but_not_live_games() -> N
         NEAR_CLOSE_MIN_DEPTH=20,
         NEAR_CLOSE_MAX_SPREAD=0.02,
         NEAR_CLOSE_MAX_MINUTES_TO_END=6,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=360,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -396,6 +409,7 @@ def test_late_resolution_scanner_uses_crypto_variant_thresholds_and_winner() -> 
         NEAR_CLOSE_CRYPTO_MIN_MIDPOINT=0.982,
         NEAR_CLOSE_CRYPTO_MAX_SPREAD=0.015,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=1200,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -447,6 +461,7 @@ def test_late_resolution_scanner_uses_crypto_updown_proxy_variant() -> None:
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=480,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -495,6 +510,7 @@ def test_late_resolution_scanner_rejects_crypto_updown_too_close_to_start() -> N
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=480,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -545,6 +561,7 @@ def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladde
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=0.35,
         NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=480,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -592,7 +609,7 @@ def test_late_resolution_scanner_uses_dynamic_crypto_updown_start_distance_ladde
         assert rejection_counts == {"start_distance_below_min": 1}
 
 
-def test_late_resolution_scanner_blocks_crypto_updown_inside_last_90_seconds() -> None:
+def test_late_resolution_scanner_allows_crypto_updown_inside_legacy_last_90_seconds() -> None:
     settings = Settings(
         NEAR_CLOSE_CRYPTO_ENABLED=True,
         NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
@@ -620,8 +637,73 @@ def test_late_resolution_scanner_blocks_crypto_updown_inside_last_90_seconds() -
         rejection_counts=rejection_counts,
     )
 
+    assert len(opportunities) == 1
+    assert rejection_counts == {}
+    assert opportunities[0].details["time_to_resolution_sec"] <= 120
+    assert opportunities[0].details["legacy_no_new_entry_last_seconds"] == 90
+    assert opportunities[0].details["tradable_live"] is True
+
+
+def test_late_resolution_scanner_blocks_entries_before_two_minute_window() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.0005,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=2.5, start_distance=0.01)
+    rejection_counts: dict[str, int] = {}
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+        },
+        rejection_counts=rejection_counts,
+    )
+
     assert opportunities == []
-    assert rejection_counts == {"too_close_to_end": 1}
+    assert rejection_counts == {"entry_before_window": 1}
+
+
+def test_late_resolution_scanner_allows_final_30_seconds_when_configured() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.0005,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=0.25, start_distance=0.01)
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.88, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.12, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].details["time_to_resolution_sec"] <= 30
+    assert opportunities[0].details["best_bid"] == 0.88
+    assert opportunities[0].details["best_ask"] == 0.90
+    assert round(opportunities[0].details["spread"], 6) == 0.02
+    assert opportunities[0].details["bid_depth_at_best"] == 80
+    assert opportunities[0].details["ask_depth_at_best"] == 80
 
 
 def test_weekend_mode_lightens_crypto_updown_size_and_relaxes_spread() -> None:
@@ -637,6 +719,7 @@ def test_weekend_mode_lightens_crypto_updown_size_and_relaxes_spread() -> None:
         NEAR_CLOSE_CRYPTO_UPDOWN_CANCEL_START_DISTANCE=0.00012,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
         NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -677,6 +760,7 @@ def test_weekend_mode_qualifies_crypto_updown_half_size_order() -> None:
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
         NEAR_CLOSE_CRYPTO_UPDOWN_ORDER_SIZE=5,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -739,6 +823,7 @@ def test_weekend_mode_accepts_relaxed_crypto_updown_price_heat() -> None:
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_MIDPOINT=0.76,
         NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.78,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -771,6 +856,7 @@ def test_weekend_mode_accepts_crypto_updown_spread_after_relaxing() -> None:
         NEAR_CLOSE_WEEKEND_MODE_FORCE=True,
         NEAR_CLOSE_WEEKEND_SPREAD_MULTIPLIER=1.2,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -833,6 +919,7 @@ def test_late_resolution_scanner_blocks_live_below_crypto_updown_cancel_distance
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=8,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=480,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
@@ -884,6 +971,7 @@ def test_late_resolution_scanner_prices_crypto_updown_with_gemini_30m_params() -
         NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE=1.0,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=10,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT=0.003,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
     market = MarketRecord(
@@ -925,6 +1013,7 @@ def test_late_resolution_scanner_prices_crypto_updown_with_gemini_30m_params() -
 def test_late_resolution_scanner_skips_crypto_updown_when_bid_is_too_high() -> None:
     settings = Settings(
         CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -974,6 +1063,7 @@ def test_late_resolution_scanner_skips_crypto_updown_when_bid_is_too_high() -> N
 def test_late_resolution_scanner_caps_crypto_updown_entry_at_095_below_skip_bid() -> None:
     settings = Settings(
         CANDIDATE_MIN_NET_EDGE=-0.0035,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MINUTES_TO_END=1.5,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_MINUTES_TO_END=45,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.003,
@@ -1075,6 +1165,7 @@ def test_late_resolution_scanner_accepts_small_crypto_updown_distance_and_depth(
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.04,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
     market = MarketRecord(
@@ -1122,6 +1213,7 @@ def test_late_resolution_scanner_falls_back_to_best_bid_when_tick_would_cross() 
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.75,
         NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.60,
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.04,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
     )
     scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
     market = _make_crypto_updown_market(minutes_left=4, start_distance=0.01)
@@ -1153,6 +1245,7 @@ def test_run_scanners_keeps_small_crypto_updown_order_size() -> None:
         NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.08,
         NEAR_CLOSE_CRYPTO_UPDOWN_SKIP_BID_AT_OR_ABOVE=1.0,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=2700,
         CANDIDATE_MIN_NET_EDGE=-0.0035,
     )
     market = MarketRecord(

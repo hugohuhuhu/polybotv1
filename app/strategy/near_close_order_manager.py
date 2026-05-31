@@ -42,22 +42,21 @@ class NearCloseOrderManager:
         reasons: list[str] = []
         midpoint = book.midpoint
         if variant == "crypto_updown":
-            min_minutes = self.settings.effective_crypto_updown_min_minutes_to_end()
             min_best_ask = self.settings.near_close_crypto_updown_min_best_ask
             min_midpoint = self.settings.near_close_crypto_updown_min_midpoint
             max_spread = self.settings.near_close_crypto_updown_max_spread
         elif variant == "crypto":
-            min_minutes = self.settings.near_close_crypto_min_minutes_to_end
             min_best_ask = self.settings.near_close_crypto_min_best_ask
             min_midpoint = self.settings.near_close_crypto_min_midpoint
             max_spread = self.settings.near_close_crypto_max_spread
         else:
-            min_minutes = self.settings.near_close_min_minutes_to_end
             min_best_ask = self.settings.near_close_min_best_ask
             min_midpoint = self.settings.near_close_min_midpoint
             max_spread = self.settings.near_close_max_spread
-        if minutes_to_end is not None and minutes_to_end < min_minutes:
-            reasons.append("too_close_to_end")
+        if minutes_to_end is not None:
+            window_reason = self.settings.near_close_entry_window_rejection(float(minutes_to_end) * 60.0)
+            if window_reason is not None:
+                reasons.append(window_reason)
         if book.best_ask is None or book.best_ask < min_best_ask:
             reasons.append("best_ask_below_floor")
         if midpoint is None or midpoint < min_midpoint:

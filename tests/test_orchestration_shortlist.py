@@ -193,6 +193,7 @@ def test_near_close_pool_only_keeps_upcoming_clear_binary_markets() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=2,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=20,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=1200,
     )
     now = datetime.now(timezone.utc)
     clear = make_market(
@@ -225,6 +226,7 @@ def test_near_close_pool_accepts_official_data_and_rejects_live_games() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     official_data = make_market(
@@ -264,6 +266,7 @@ def test_near_close_pool_accepts_crypto_far_from_strike() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     crypto = make_market(
@@ -298,6 +301,7 @@ def test_near_close_pool_accepts_crypto_updown_proxy_far_from_start() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     crypto = make_market(
@@ -336,6 +340,7 @@ def test_near_close_pool_crypto_updown_only_filters_first() -> None:
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
         NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     official = make_market(
@@ -412,6 +417,7 @@ def test_near_close_pool_crypto_updown_only_keeps_one_market_per_core_symbol() -
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
         NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
 
@@ -467,6 +473,7 @@ def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
         NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     doge = make_market(
@@ -507,6 +514,7 @@ def test_near_close_pool_crypto_updown_only_allows_sol() -> None:
         NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
         NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT",
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     sol = make_market(
@@ -545,6 +553,7 @@ def test_near_close_pool_excludes_xrp_related_markets() -> None:
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     xrp_market = make_market(
@@ -581,6 +590,7 @@ def test_near_close_pool_keeps_restricted_markets_as_tradeable_risk_label() -> N
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,
         NEAR_CLOSE_SCAN_LOOKAHEAD_MINUTES=75,
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=4500,
     )
     now = datetime.now(timezone.utc)
     restricted_market = make_market(
@@ -610,6 +620,7 @@ def test_run_scanners_defaults_to_near_close_only() -> None:
         NEAR_CLOSE_MIN_MINUTES_TO_END=3,
         NEAR_CLOSE_MAX_MINUTES_TO_END=6,
         NEAR_CLOSE_MIN_DEPTH=20,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=360,
     )
     market = make_market(
         "near",

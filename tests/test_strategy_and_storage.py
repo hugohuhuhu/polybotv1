@@ -833,6 +833,126 @@ def test_submitted_stop_exit_matched_response_counts_in_live_pnl(tmp_path) -> No
     assert round(float(redeemed_group["estimated_realized_pnl"]), 2) == -0.95
 
 
+def test_near_close_entry_bucket_report_groups_live_trade_performance(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "entry-bucket-report.db"))
+
+    def insert_live_trade(
+        *,
+        action: str,
+        token_id: str,
+        market_slug: str,
+        price: float,
+        size: float,
+        status: str,
+        response: dict[str, object],
+        created_at: str,
+    ) -> None:
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{market_slug}-{action}-{created_at}",
+                1,
+                action,
+                token_id,
+                market_slug,
+                "Up",
+                price,
+                size,
+                f"0x{market_slug}{action}",
+                status,
+                json.dumps(response),
+                created_at,
+            ),
+        )
+
+    base_entry = {
+        "strategy_variant": "near_close_maker",
+        "best_bid": 0.89,
+        "best_ask": 0.91,
+        "spread": 0.02,
+        "midpoint": 0.90,
+        "bid_depth_at_best": 25,
+        "ask_depth_at_best": 30,
+        "crypto_start_distance": 0.003,
+    }
+    insert_live_trade(
+        action="BUY",
+        token_id="token-120",
+        market_slug="bucket-120",
+        price=0.90,
+        size=10,
+        status="CONFIRMED",
+        response={**base_entry, "time_to_resolution_sec": 110, "entry_price": 0.90},
+        created_at="2026-05-30T00:00:01+00:00",
+    )
+    insert_live_trade(
+        action="SELL",
+        token_id="token-120",
+        market_slug="bucket-120",
+        price=0.95,
+        size=10,
+        status="submitted",
+        response={
+            "strategy_variant": "near_close_stop_exit",
+            "status": "matched",
+            "success": True,
+            "transactionsHashes": ["0xtx"],
+        },
+        created_at="2026-05-30T00:00:02+00:00",
+    )
+    insert_live_trade(
+        action="BUY",
+        token_id="token-90",
+        market_slug="bucket-90",
+        price=0.92,
+        size=5,
+        status="REDEEMED",
+        response={**base_entry, "time_to_resolution_sec": 75, "entry_price": 0.92, "spread": 0.03},
+        created_at="2026-05-30T00:00:03+00:00",
+    )
+    insert_live_trade(
+        action="BUY",
+        token_id="token-60",
+        market_slug="bucket-60",
+        price=0.88,
+        size=5,
+        status="SETTLED_LOST",
+        response={**base_entry, "time_to_resolution_sec": 45, "entry_price": 0.88, "crypto_start_distance": 0.004},
+        created_at="2026-05-30T00:00:04+00:00",
+    )
+    insert_live_trade(
+        action="BUY",
+        token_id="token-30",
+        market_slug="bucket-30",
+        price=0.91,
+        size=5,
+        status="CONFIRMED",
+        response={**base_entry, "time_to_resolution_sec": 15, "entry_price": 0.91},
+        created_at="2026-05-30T00:00:05+00:00",
+    )
+
+    report = {row["bucket"]: row for row in repository.near_close_entry_bucket_report()}
+
+    assert report["120-90"]["trade_count"] == 1
+    assert report["120-90"]["realized_trade_count"] == 1
+    assert report["120-90"]["win_rate"] == 1.0
+    assert round(float(report["120-90"]["average_realized_pnl"]), 2) == 0.50
+    assert report["90-60"]["trade_count"] == 1
+    assert round(float(report["90-60"]["average_realized_pnl"]), 2) == 0.40
+    assert report["60-30"]["trade_count"] == 1
+    assert round(float(report["60-30"]["max_loss"]), 2) == -4.40
+    assert report["30-0"]["trade_count"] == 1
+    assert report["30-0"]["realized_trade_count"] == 0
+    assert report["30-0"]["average_realized_pnl"] is None
+    assert round(float(report["90-60"]["average_spread"]), 2) == 0.03
+    assert round(float(report["60-30"]["average_crypto_start_distance"]), 3) == 0.004
+
+
 def test_expire_open_orders_for_ended_timestamp_slug_without_market_row(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-slug-orders.db"))
     ended_slug = f"doge-updown-5m-{int(time.time()) - 60}"

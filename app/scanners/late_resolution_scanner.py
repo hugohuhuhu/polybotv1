@@ -81,7 +81,7 @@ class LateResolutionScanner:
         decision = classify_near_close_market(market)
         if not decision.allowed:
             return False
-        min_minutes, max_minutes = self._time_window(decision.variant)
+        _min_minutes, max_minutes = self._time_window(decision.variant)
         if minutes_left > max_minutes:
             return False
         if not market.resolution_source:
@@ -107,9 +107,10 @@ class LateResolutionScanner:
         def reject(reason: str) -> None:
             self._record_crypto_updown_rejection(market, outcome_label, reason, rejection_counts)
 
-        min_minutes, _max_minutes = self._time_window(decision.variant)
-        if minutes_left < min_minutes:
-            reject("too_close_to_end")
+        seconds_left = minutes_left * 60.0
+        entry_window_rejection = self.settings.near_close_entry_window_rejection(seconds_left)
+        if entry_window_rejection is not None:
+            reject(entry_window_rejection)
             return None
 
         crypto_start_distance: float | None = None
@@ -211,6 +212,7 @@ class LateResolutionScanner:
         if bid_depth < min_depth:
             reject("bid_depth_below_min")
             return None
+        ask_depth = book.depth_for_side("ask", best_ask)
 
         gross_edge = 1.0 - entry_bid
         risk_penalty = self.settings.estimated_cost_per_leg + 0.005
@@ -243,6 +245,16 @@ class LateResolutionScanner:
         details = {
             "strategy_variant": "near_close_maker",
             "outcome_label": outcome_label,
+            "time_to_resolution_sec": round(seconds_left, 3),
+            "entry_price": entry_bid,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "midpoint": midpoint,
+            "bid_depth_at_best": bid_depth,
+            "ask_depth_at_best": ask_depth,
+            "market_slug": market.slug,
+            "token_id": book.token_id,
             "entry_bid": entry_bid,
             "entry_ask": best_ask,
             "entry_formula": entry_formula,
@@ -255,7 +267,10 @@ class LateResolutionScanner:
             "current_midpoint": midpoint,
             "target_exit_price": 1.0,
             "minutes_to_resolution": round(minutes_left, 1),
-            "no_new_entry_last_seconds": self.settings.near_close_crypto_updown_no_new_entry_last_seconds
+            "entry_window_min_seconds": self.settings.near_close_entry_window_seconds()[0],
+            "entry_window_max_seconds": self.settings.near_close_entry_window_seconds()[1],
+            "final_seconds_allow_entry": self.settings.near_close_final_seconds_allow_entry,
+            "legacy_no_new_entry_last_seconds": self.settings.near_close_crypto_updown_no_new_entry_last_seconds
             if decision.variant == "crypto_updown"
             else None,
             "redeem_net_edge": round(gross_edge, 6),
@@ -285,7 +300,7 @@ class LateResolutionScanner:
             "tradable_live": bool(
                 self.settings.near_close_maker_live_enabled
                 and live_distance_allowed
-                and minutes_left <= self.settings.near_close_live_max_minutes_to_end
+                and self.settings.near_close_entry_seconds_allowed(seconds_left)
             ),
             "requires_exit_order": False,
             "post_only": True,
@@ -299,7 +314,9 @@ class LateResolutionScanner:
             "hard_stop_bid": self.settings.near_close_hard_stop_bid,
             "emergency_worst_price": round(emergency_worst_price, 6),
             "cancel_if": {
-                "minutes_to_end_below": self._time_window(decision.variant)[0],
+                "entry_window_min_seconds": self.settings.near_close_entry_window_seconds()[0],
+                "entry_window_max_seconds": self.settings.near_close_entry_window_seconds()[1],
+                "final_seconds_allow_entry": self.settings.near_close_final_seconds_allow_entry,
                 "best_ask_below": min_best_ask,
                 "midpoint_below": min_midpoint,
                 "spread_above": max_spread,

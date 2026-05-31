@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     near_close_min_minutes_to_end: float = Field(default=3.0, alias="NEAR_CLOSE_MIN_MINUTES_TO_END")
     near_close_max_minutes_to_end: float = Field(default=15.0, alias="NEAR_CLOSE_MAX_MINUTES_TO_END")
     near_close_live_max_minutes_to_end: float = Field(default=7.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
+    near_close_entry_max_seconds: float = Field(default=120.0, alias="NEAR_CLOSE_ENTRY_MAX_SECONDS")
+    near_close_entry_min_seconds: float = Field(default=0.0, alias="NEAR_CLOSE_ENTRY_MIN_SECONDS")
+    near_close_final_seconds_allow_entry: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY",
+    )
+    near_close_log_entry_telemetry: bool = Field(default=True, alias="NEAR_CLOSE_LOG_ENTRY_TELEMETRY")
     near_close_max_bid_price: float = Field(default=0.97, alias="NEAR_CLOSE_MAX_BID_PRICE")
     near_close_min_best_ask: float = Field(default=0.98, alias="NEAR_CLOSE_MIN_BEST_ASK")
     near_close_min_midpoint: float = Field(default=0.975, alias="NEAR_CLOSE_MIN_MIDPOINT")
@@ -512,8 +519,40 @@ class Settings(BaseSettings):
         return values
 
     def effective_crypto_updown_min_minutes_to_end(self) -> float:
-        no_new_entry_minutes = max(float(self.near_close_crypto_updown_no_new_entry_last_seconds), 0.0) / 60.0
-        return max(float(self.near_close_crypto_updown_min_minutes_to_end), no_new_entry_minutes)
+        return max(float(self.near_close_crypto_updown_min_minutes_to_end), 0.0)
+
+    def near_close_entry_window_seconds(self) -> tuple[float, float]:
+        minimum = max(float(self.near_close_entry_min_seconds), 0.0)
+        maximum = max(float(self.near_close_entry_max_seconds), minimum)
+        return minimum, maximum
+
+    def near_close_entry_window_minutes(self) -> tuple[float, float]:
+        minimum, maximum = self.near_close_entry_window_seconds()
+        return minimum / 60.0, maximum / 60.0
+
+    def near_close_entry_window_rejection(self, seconds_to_resolution: float | None) -> str | None:
+        if seconds_to_resolution is None:
+            return "missing_time_to_resolution"
+        try:
+            seconds_left = float(seconds_to_resolution)
+        except (TypeError, ValueError):
+            return "missing_time_to_resolution"
+        minimum, maximum = self.near_close_entry_window_seconds()
+        if seconds_left < minimum:
+            return "entry_after_window"
+        if seconds_left > maximum:
+            return "entry_before_window"
+        if not self.near_close_final_seconds_allow_entry and seconds_left <= 30.0:
+            return "final_seconds_entry_disabled"
+        return None
+
+    def near_close_entry_seconds_allowed(self, seconds_to_resolution: float | None) -> bool:
+        return self.near_close_entry_window_rejection(seconds_to_resolution) is None
+
+    def near_close_entry_minutes_allowed(self, minutes_to_resolution: float | None) -> bool:
+        if minutes_to_resolution is None:
+            return False
+        return self.near_close_entry_seconds_allowed(float(minutes_to_resolution) * 60.0)
 
     def effective_near_close_start_distance(self, value: float) -> float:
         return self._weekend_scaled(value, self.near_close_weekend_start_distance_multiplier)

@@ -1504,6 +1504,42 @@ def cmd_report(settings: Settings) -> None:
         )
         console.print(risk_table)
 
+        entry_bucket_table = Table(title="Near-close Entry Bucket Performance (Live)")
+        entry_bucket_table.add_column("Bucket")
+        entry_bucket_table.add_column("Trades", justify="right")
+        entry_bucket_table.add_column("Realized", justify="right")
+        entry_bucket_table.add_column("Win Rate", justify="right")
+        entry_bucket_table.add_column("Avg Entry", justify="right")
+        entry_bucket_table.add_column("Avg PnL", justify="right")
+        entry_bucket_table.add_column("Max Loss", justify="right")
+        entry_bucket_table.add_column("Avg Spread", justify="right")
+        entry_bucket_table.add_column("Avg Start Dist", justify="right")
+
+        def fmt_value(value: object, *, precision: int = 4, percent: bool = False) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return "N/A"
+            if percent:
+                return f"{numeric:.0%}"
+            return f"{numeric:.{precision}f}"
+
+        for row in repository.near_close_entry_bucket_report():
+            entry_bucket_table.add_row(
+                str(row["bucket"]),
+                str(row["trade_count"]),
+                str(row["realized_trade_count"]),
+                fmt_value(row["win_rate"], percent=True),
+                fmt_value(row["average_entry_price"]),
+                fmt_value(row["average_realized_pnl"]),
+                fmt_value(row["max_loss"]),
+                fmt_value(row["average_spread"]),
+                fmt_value(row["average_crypto_start_distance"], precision=6),
+            )
+        console.print(entry_bucket_table)
+
         avg_pnl = repository.average_realized_pnl()
         latency = repository.alert_to_fill_latency()
         console.print(f"Average paper PnL: {avg_pnl if avg_pnl is not None else 'N/A'}")

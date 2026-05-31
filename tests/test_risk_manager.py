@@ -44,9 +44,12 @@ def make_near_close_plan(
     size: float = 5.0,
     price: float = 0.97,
     minutes_to_resolution: float | None = None,
+    time_to_resolution_sec: float | None = None,
     variant: str | None = None,
 ) -> ExecutionPlan:
     metadata = {"strategy_variant": "near_close_maker"}
+    if time_to_resolution_sec is not None:
+        metadata["time_to_resolution_sec"] = time_to_resolution_sec
     if minutes_to_resolution is not None:
         metadata["minutes_to_resolution"] = minutes_to_resolution
     if variant is not None:
@@ -204,15 +207,62 @@ def test_risk_manager_blocks_near_close_live_before_two_minute_window(tmp_path) 
         Settings(
             NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
             NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
-            NEAR_CLOSE_MAX_MINUTES_TO_END=2.0,
+            NEAR_CLOSE_ENTRY_MAX_SECONDS=120,
             MAX_NOTIONAL_PER_PLAN=10,
         )
     )
 
-    decision = manager.assess(make_near_close_plan(size=1.0, price=0.97, minutes_to_resolution=10.5), repository, mode="live")
+    decision = manager.assess(
+        make_near_close_plan(size=1.0, price=0.97, time_to_resolution_sec=121),
+        repository,
+        mode="live",
+    )
 
     assert decision.allowed is False
-    assert "minutes to resolution" in decision.reason
+    assert "seconds to resolution" in decision.reason
+
+
+def test_risk_manager_allows_near_close_live_inside_final_30_seconds(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-final-30.db"))
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_ENTRY_MAX_SECONDS=120,
+            NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=True,
+            MAX_NOTIONAL_PER_PLAN=10,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(size=1.0, price=0.97, time_to_resolution_sec=15),
+        repository,
+        mode="live",
+    )
+
+    assert decision.allowed is True
+
+
+def test_risk_manager_blocks_final_30_seconds_when_disabled(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "risk-near-close-final-30-disabled.db"))
+    manager = RiskManager(
+        Settings(
+            NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+            NEAR_CLOSE_MIN_PAPER_SIGNALS_FOR_LIVE=0,
+            NEAR_CLOSE_ENTRY_MAX_SECONDS=120,
+            NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=False,
+            MAX_NOTIONAL_PER_PLAN=10,
+        )
+    )
+
+    decision = manager.assess(
+        make_near_close_plan(size=1.0, price=0.97, time_to_resolution_sec=15),
+        repository,
+        mode="live",
+    )
+
+    assert decision.allowed is False
+    assert "final_seconds_entry_disabled" in decision.reason
 
 
 def test_risk_manager_blocks_near_close_above_same_position_size(tmp_path) -> None:

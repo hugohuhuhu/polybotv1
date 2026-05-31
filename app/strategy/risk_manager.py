@@ -168,19 +168,30 @@ class RiskManager:
                 projected_daily_notional=estimated_notional,
                 projected_daily_orders=leg_count,
             )
-        max_minutes = self._near_close_live_max_minutes(plan)
+        raw_seconds = plan.metadata.get("time_to_resolution_sec")
         raw_minutes = plan.metadata.get("minutes_to_resolution")
-        if raw_minutes is not None:
+        if raw_seconds is not None:
             try:
-                minutes_to_resolution = float(raw_minutes)
+                seconds_to_resolution = float(raw_seconds)
             except (TypeError, ValueError):
-                minutes_to_resolution = None
-            if minutes_to_resolution is None or minutes_to_resolution > max_minutes:
+                seconds_to_resolution = None
+        elif raw_minutes is not None:
+            try:
+                seconds_to_resolution = float(raw_minutes) * 60.0
+            except (TypeError, ValueError):
+                seconds_to_resolution = None
+        else:
+            seconds_to_resolution = None
+        if raw_seconds is not None or raw_minutes is not None:
+            window_reason = self.settings.near_close_entry_window_rejection(seconds_to_resolution)
+            if window_reason is not None:
+                min_seconds, max_seconds = self.settings.near_close_entry_window_seconds()
                 return RiskDecision(
                     allowed=False,
                     reason=(
-                        f"Near-close maker live entry requires <= {max_minutes:.1f} minutes to resolution; "
-                        f"currently {raw_minutes}."
+                        f"Near-close maker live entry requires {min_seconds:.0f}-{max_seconds:.0f} seconds "
+                        f"to resolution; currently {seconds_to_resolution if seconds_to_resolution is not None else raw_seconds or raw_minutes}. "
+                        f"Reason: {window_reason}."
                     ),
                     estimated_notional=estimated_notional,
                     projected_daily_notional=estimated_notional,

@@ -31,7 +31,7 @@ def test_near_close_manager_cancels_when_order_would_cross_or_is_too_late() -> N
         entry_price=0.986,
     )
 
-    assert "too_close_to_end" in reasons
+    assert "entry_before_window" in reasons
     assert "would_cross_post_only" in reasons
 
 
@@ -53,7 +53,7 @@ def test_near_close_manager_uses_crypto_cancel_thresholds() -> None:
         crypto_strike_distance=0.01,
     )
 
-    assert "too_close_to_end" in reasons
+    assert "entry_before_window" in reasons
     assert "crypto_strike_too_close" in reasons
 
 

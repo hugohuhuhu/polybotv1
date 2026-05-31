@@ -2899,6 +2899,178 @@ class ScannerRepository:
             "note": "Live 損益依 CLOB confirmed fills 估算，仍需定期與錢包餘額對帳。",
         }
 
+    @staticmethod
+    def _near_close_entry_bucket(seconds_to_resolution: float | None) -> str | None:
+        if seconds_to_resolution is None:
+            return None
+        if 90.0 < seconds_to_resolution <= 120.0:
+            return "120-90"
+        if 60.0 < seconds_to_resolution <= 90.0:
+            return "90-60"
+        if 30.0 < seconds_to_resolution <= 60.0:
+            return "60-30"
+        if 0.0 <= seconds_to_resolution <= 30.0:
+            return "30-0"
+        return None
+
+    @staticmethod
+    def _json_float(payload: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            try:
+                return float(payload.get(key))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def near_close_entry_bucket_report(self) -> list[dict[str, Any]]:
+        bucket_names = ("120-90", "90-60", "60-30", "30-0")
+        buckets: dict[str, dict[str, Any]] = {
+            name: {
+                "bucket": name,
+                "trade_count": 0,
+                "realized_trade_count": 0,
+                "entry_prices": [],
+                "realized_pnls": [],
+                "spreads": [],
+                "crypto_start_distances": [],
+            }
+            for name in bucket_names
+        }
+        status_placeholders = ",".join("?" for _ in self.LIVE_JOURNAL_QUERY_STATUSES)
+        variant_filters = " OR ".join("response_json LIKE ?" for _ in self.NEAR_CLOSE_EXIT_VARIANT_PATTERNS)
+        rows = self.connection.fetchall(
+            f"""
+            SELECT token_id,
+                   action,
+                   market_slug,
+                   outcome_label,
+                   target_price,
+                   requested_size,
+                   order_id,
+                   status,
+                   response_json,
+                   created_at
+            FROM live_trades
+            WHERE order_id IS NOT NULL
+              AND (response_json LIKE ? OR {variant_filters})
+              AND UPPER(status) IN ({status_placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            (self.NEAR_CLOSE_VARIANT_PATTERN, *self.NEAR_CLOSE_EXIT_VARIANT_PATTERNS, *self.LIVE_JOURNAL_QUERY_STATUSES),
+        )
+        rows = [row for row in rows if self._include_live_journal_row(row)]
+        open_lots: dict[str, list[dict[str, Any]]] = {}
+
+        def add_realized(bucket_name: str, pnl: float) -> None:
+            bucket = buckets[bucket_name]
+            bucket["realized_pnls"].append(pnl)
+            bucket["realized_trade_count"] += 1
+
+        def finalize_closed_lot(lot: dict[str, Any]) -> None:
+            add_realized(str(lot["bucket"]), float(lot.get("realized_pnl") or 0.0))
+
+        for row in rows:
+            action = str(row["action"] or "").upper()
+            status = self._normalized_live_trade_status(row)
+            size = float(row["requested_size"] or 0.0)
+            price = self._effective_live_trade_price(row)
+            if size <= 0 or price <= 0:
+                continue
+            response = self._load_json(row.get("response_json"), {})
+            if not isinstance(response, dict):
+                response = {}
+            key = self._position_key(str(row["market_slug"] or ""), row["token_id"], row["outcome_label"])
+            lots = open_lots.setdefault(key, [])
+
+            if action == "BUY" and response.get("strategy_variant") == "near_close_maker":
+                seconds_left = self._json_float(response, "time_to_resolution_sec")
+                if seconds_left is None:
+                    minutes_left = self._json_float(response, "minutes_to_resolution")
+                    seconds_left = minutes_left * 60.0 if minutes_left is not None else None
+                bucket_name = self._near_close_entry_bucket(seconds_left)
+                if bucket_name is None:
+                    continue
+                entry_price = self._json_float(response, "entry_price", "entry_bid") or price
+                bucket = buckets[bucket_name]
+                bucket["trade_count"] += 1
+                bucket["entry_prices"].append(entry_price)
+                spread = self._json_float(response, "spread")
+                if spread is not None:
+                    bucket["spreads"].append(spread)
+                start_distance = self._json_float(response, "crypto_start_distance")
+                if start_distance is not None:
+                    bucket["crypto_start_distances"].append(start_distance)
+                settlement_price = None
+                if status == "REDEEMED":
+                    settlement_price = 1.0
+                elif status == "SETTLED_LOST":
+                    settlement_price = 0.0
+                lots.append(
+                    {
+                        "bucket": bucket_name,
+                        "size": size,
+                        "price": entry_price,
+                        "realized_pnl": 0.0,
+                        "settlement_price": settlement_price,
+                    }
+                )
+                continue
+
+            if action != "SELL":
+                continue
+            remaining = size
+            while remaining > 1e-9 and lots:
+                lot = lots[0]
+                matched = min(remaining, float(lot["size"]))
+                lot["realized_pnl"] = float(lot.get("realized_pnl") or 0.0) + (price - float(lot["price"])) * matched
+                lot["size"] = float(lot["size"]) - matched
+                remaining -= matched
+                if float(lot["size"]) <= 1e-9:
+                    finalize_closed_lot(lot)
+                    lots.pop(0)
+
+        for lots in open_lots.values():
+            for lot in list(lots):
+                settlement_price = lot.get("settlement_price")
+                if settlement_price is None:
+                    continue
+                remaining_size = float(lot["size"])
+                if remaining_size <= 1e-9:
+                    continue
+                lot["realized_pnl"] = float(lot.get("realized_pnl") or 0.0) + (
+                    float(settlement_price) - float(lot["price"])
+                ) * remaining_size
+                lot["size"] = 0.0
+                finalize_closed_lot(lot)
+
+        report: list[dict[str, Any]] = []
+        for name in bucket_names:
+            bucket = buckets[name]
+            entry_prices = [float(value) for value in bucket["entry_prices"]]
+            realized_pnls = [float(value) for value in bucket["realized_pnls"]]
+            spreads = [float(value) for value in bucket["spreads"]]
+            start_distances = [float(value) for value in bucket["crypto_start_distances"]]
+            wins = sum(1 for pnl in realized_pnls if pnl > 0)
+            realized_count = int(bucket["realized_trade_count"])
+            report.append(
+                {
+                    "bucket": name,
+                    "trade_count": int(bucket["trade_count"]),
+                    "realized_trade_count": realized_count,
+                    "win_rate": (wins / realized_count) if realized_count else None,
+                    "average_entry_price": (sum(entry_prices) / len(entry_prices)) if entry_prices else None,
+                    "average_realized_pnl": (sum(realized_pnls) / len(realized_pnls)) if realized_pnls else None,
+                    "max_loss": min(realized_pnls) if realized_pnls else None,
+                    "average_spread": (sum(spreads) / len(spreads)) if spreads else None,
+                    "average_crypto_start_distance": (
+                        sum(start_distances) / len(start_distances) if start_distances else None
+                    ),
+                }
+            )
+        return report
+
     def settled_pnl_summary(self) -> dict[str, Any]:
         row = self.connection.fetchone(
             """

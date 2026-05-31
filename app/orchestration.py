@@ -188,6 +188,7 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
     updown_max_minutes = min(
         settings.near_close_scan_lookahead_minutes,
         settings.near_close_crypto_updown_max_minutes_to_end,
+        settings.near_close_entry_max_seconds / 60.0,
     )
     for market in markets:
         parsed = _parse_crypto_strike_market(market)
@@ -207,7 +208,8 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
             minutes_left = _minutes_to_resolution(market, now)
             in_updown_window = (
                 minutes_left is not None
-                and settings.effective_crypto_updown_min_minutes_to_end() <= minutes_left <= updown_max_minutes
+                and settings.near_close_entry_minutes_allowed(minutes_left)
+                and minutes_left <= updown_max_minutes
             )
             if in_updown_window and start_time <= now:
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
@@ -266,9 +268,9 @@ def _is_near_close_pool_candidate(settings: Settings, market: MarketRecord, now:
     decision = classify_near_close_market(market)
     if not decision.allowed:
         return False
-    min_minutes, max_minutes = _near_close_time_window(settings, decision.variant)
-    if minutes_left < min_minutes:
+    if not settings.near_close_entry_minutes_allowed(minutes_left):
         return False
+    _min_minutes, max_minutes = _near_close_time_window(settings, decision.variant)
     if minutes_left > min(settings.near_close_scan_lookahead_minutes, max_minutes):
         return False
     if not market.resolution_source:
@@ -277,14 +279,15 @@ def _is_near_close_pool_candidate(settings: Settings, market: MarketRecord, now:
 
 
 def _near_close_time_window(settings: Settings, variant: str) -> tuple[float, float]:
+    entry_min, entry_max = settings.near_close_entry_window_minutes()
     if variant == "crypto_updown":
         return (
-            settings.effective_crypto_updown_min_minutes_to_end(),
-            settings.near_close_crypto_updown_max_minutes_to_end,
+            entry_min,
+            min(entry_max, settings.near_close_crypto_updown_max_minutes_to_end),
         )
     if variant == "crypto":
-        return settings.near_close_crypto_min_minutes_to_end, settings.near_close_crypto_max_minutes_to_end
-    return settings.near_close_min_minutes_to_end, settings.near_close_max_minutes_to_end
+        return entry_min, min(entry_max, settings.near_close_crypto_max_minutes_to_end)
+    return entry_min, min(entry_max, settings.near_close_max_minutes_to_end)
 
 
 def build_near_close_funnel(
@@ -315,7 +318,11 @@ def build_near_close_funnel(
         minutes_left = _minutes_to_resolution(market, current)
         decision = classify_near_close_market(market)
         min_minutes, max_minutes = _near_close_time_window(settings, decision.variant)
-        if minutes_left is not None and min_minutes <= minutes_left <= min(settings.near_close_scan_lookahead_minutes, max_minutes):
+        if (
+            minutes_left is not None
+            and min_minutes <= minutes_left <= min(settings.near_close_scan_lookahead_minutes, max_minutes)
+            and settings.near_close_entry_minutes_allowed(minutes_left)
+        ):
             in_window.append(market)
 
     shortlisted_markets = shortlisted if shortlisted is not None else in_window[: settings.near_close_scan_pool_limit]
@@ -359,9 +366,10 @@ def build_near_close_funnel(
             "label": "\u843d\u5728\u6642\u9593\u7a97",
             "count": len(in_window),
             "description": (
-                f"\u5b98\u65b9\u76e4 {settings.near_close_max_minutes_to_end:g}-{settings.near_close_min_minutes_to_end:g} \u5206\u9418\uff1b"
-                f"crypto \u56fa\u5b9a\u9580\u6abb {settings.near_close_crypto_max_minutes_to_end:g}-{settings.near_close_crypto_min_minutes_to_end:g} \u5206\u9418\uff1b"
-                f"crypto Up/Down {settings.near_close_crypto_updown_max_minutes_to_end:g}-{settings.effective_crypto_updown_min_minutes_to_end():g} \u5206\u9418\u3002"
+                f"\u65b0\u9032\u5834\u7a97\u53e3 {settings.near_close_entry_min_seconds:g}-"
+                f"{settings.near_close_entry_max_seconds:g} \u79d2\uff1b"
+                f"\u6700\u5f8c 30 \u79d2\u9032\u5834\uff1a"
+                f"{'開放' if settings.near_close_final_seconds_allow_entry else '關閉'}\u3002"
             ),
         },
         {
