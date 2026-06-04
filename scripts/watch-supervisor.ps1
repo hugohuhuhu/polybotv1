@@ -189,6 +189,7 @@ try {
             $child = Start-Process -FilePath python `
                 -ArgumentList "-m", "app.main", "watch" `
                 -WorkingDirectory $repoRoot `
+                -WindowStyle Hidden `
                 -RedirectStandardOutput $stdoutLog `
                 -RedirectStandardError $stderrLog `
                 -PassThru

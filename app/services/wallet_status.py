@@ -54,6 +54,10 @@ async def fetch_polymarket_positions(client: httpx.AsyncClient, base_url: str, a
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [position for position in positions if position.get("redeemable") is True]
+
+
 async def load_wallet_status(settings: Settings) -> dict[str, Any]:
     """Return private-key-derived wallet address and read-only token balances."""
 
@@ -65,6 +69,8 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             "status": "missing_private_key",
             "message": "尚未輸入私鑰",
             "balances": _default_empty_balances("missing_private_key"),
+            "redeemable_positions": [],
+            "redeemable_count": 0,
         }
 
     if not private_key.startswith("0x"):
@@ -79,6 +85,8 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             "status": "invalid_private_key",
             "message": "私鑰格式無法解析",
             "balances": _default_empty_balances("invalid_private_key"),
+            "redeemable_positions": [],
+            "redeemable_count": 0,
         }
 
     rpc_url = settings.polygon_rpc_url.strip()
@@ -89,6 +97,8 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
             "status": "missing_rpc",
             "message": "已讀取錢包地址，但尚未設定 Polygon RPC",
             "balances": _default_empty_balances("missing_rpc"),
+            "redeemable_positions": [],
+            "redeemable_count": 0,
         }
 
     token_configs = [
@@ -150,6 +160,9 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
         "status": "ok",
         "source": "polymarket_data_api",
         "note": None,
+        "positions": [],
+        "redeemable_positions": [],
+        "redeemable_count": 0,
     }
     if isinstance(portfolio_value_result, Exception):
         portfolio["status"] = "api_error"
@@ -160,7 +173,11 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
         portfolio["positions"] = []
         portfolio["positions_status"] = "api_error"
     else:
-        portfolio["positions"] = portfolio_positions_result
+        positions = portfolio_positions_result
+        redeemable_positions = _redeemable_positions(positions)
+        portfolio["positions"] = positions
+        portfolio["redeemable_positions"] = redeemable_positions
+        portfolio["redeemable_count"] = len(redeemable_positions)
         portfolio["positions_status"] = "ok"
 
     if error_count == len(balance_results):
@@ -180,4 +197,6 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
         "message": message,
         "balances": balances,
         "portfolio": portfolio,
+        "redeemable_positions": portfolio.get("redeemable_positions", []),
+        "redeemable_count": portfolio.get("redeemable_count", 0),
     }

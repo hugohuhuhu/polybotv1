@@ -279,3 +279,33 @@ def test_profit_take_shadow_logs_without_order(tmp_path) -> None:
     assert executed == 0
     assert trader.called is False
     assert events[0]["status"] == "profit_take_shadow"
+
+
+def test_profit_take_skip_event_is_not_repeated_for_same_entry(tmp_path) -> None:
+    class FakeTrader:
+        async def execute(self, plan):  # pragma: no cover - should not be called
+            raise AssertionError("profit-take should not execute")
+
+    repository = ScannerRepository(connect_db(tmp_path / "profit-skip-once.db"))
+    insert_market(repository)
+    insert_entry(repository, order_id="entry-skip-once")
+
+    for _ in range(2):
+        executed = asyncio.run(
+            execute_post_fill_profit_takes(
+                repository=repository,
+                live_trader=FakeTrader(),
+                settings=Settings(ENABLE_LIVE_TRADING=True, NEAR_CLOSE_PROFIT_TAKE_LIVE_ENABLED=True),
+                controls=controls(),
+                watch_books={},
+            )
+        )
+        assert executed == 0
+
+    events = [
+        event
+        for event in repository.recent_execution_events(limit=5)
+        if event["status"] == "profit_take_skipped"
+    ]
+    assert len(events) == 1
+    assert events[0]["message"] == "missing_orderbook"

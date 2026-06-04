@@ -1566,6 +1566,71 @@ def test_near_close_live_exposure_offsets_matched_stop_exit_sells(tmp_path) -> N
     assert exposure["by_position"] == {}
 
 
+def test_near_close_live_exposure_offsets_cancelled_row_with_matched_response(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "cancelled-row-matched-stop-exit.db"))
+    token_id = "yes"
+    market_slug = "eth-updown"
+    created_at = datetime.now(timezone.utc)
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "open-near-close",
+                1,
+                "BUY",
+                token_id,
+                market_slug,
+                "Yes",
+                0.97,
+                5.0,
+                "confirmed-1",
+                "CONFIRMED",
+                json.dumps({"strategy_variant": "near_close_maker"}),
+                created_at.isoformat(),
+            ),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "stop-exit-near-close",
+                1,
+                "SELL",
+                token_id,
+                market_slug,
+                "Yes",
+                0.03,
+                5.0,
+                "stop-exit-1",
+                "cancelled",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_stop_exit",
+                        "status": "matched",
+                        "success": True,
+                        "transactionsHashes": ["0xabc"],
+                    }
+                ),
+                (created_at + timedelta(seconds=1)).isoformat(),
+            ),
+        )
+
+    exposure = repository.near_close_live_exposure()
+
+    assert exposure["total"] == 0.0
+    assert exposure["by_market"] == {}
+    assert exposure["by_position"] == {}
+
+
 def test_near_close_live_exposure_ignores_strategy_cancelled_orders(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "cancelled-near-close.db"))
     repository.save_live_execution(

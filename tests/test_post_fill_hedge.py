@@ -252,3 +252,33 @@ def test_shadow_mode_logs_decision_without_order(tmp_path) -> None:
     assert executed == 0
     assert trader.called is False
     assert events[0]["status"] == "hedge_shadow"
+
+
+def test_hedge_skip_event_is_not_repeated_for_same_entry(tmp_path) -> None:
+    class FakeTrader:
+        async def execute(self, plan):  # pragma: no cover - should not be called
+            raise AssertionError("hedge should not execute")
+
+    repository = ScannerRepository(connect_db(tmp_path / "hedge-skip-once.db"))
+    insert_market(repository)
+    insert_entry(repository, order_id="entry-skip-once")
+
+    for _ in range(2):
+        executed = asyncio.run(
+            execute_post_fill_hedges(
+                repository=repository,
+                live_trader=FakeTrader(),
+                settings=Settings(ENABLE_LIVE_TRADING=True, NEAR_CLOSE_POST_FILL_HEDGE_ENABLED=True),
+                controls=controls(),
+                watch_books={},
+            )
+        )
+        assert executed == 0
+
+    events = [
+        event
+        for event in repository.recent_execution_events(limit=5)
+        if event["status"] == "hedge_skipped"
+    ]
+    assert len(events) == 1
+    assert events[0]["message"] == "missing_opposite_orderbook"

@@ -43,7 +43,10 @@ def test_wallet_status_derives_address_and_balances(monkeypatch) -> None:
         return 24.995
 
     async def fake_positions(_client, _base_url, _wallet_address):
-        return [{"asset": "yes", "currentValue": 5.0, "cashPnl": 0.2}]
+        return [
+            {"asset": "yes", "currentValue": 5.0, "cashPnl": 0.2, "redeemable": True},
+            {"asset": "no", "currentValue": 2.0, "cashPnl": -0.1, "redeemable": False},
+        ]
 
     monkeypatch.setattr("app.services.wallet_status.fetch_erc20_balance", fake_fetch)
     monkeypatch.setattr("app.services.wallet_status.fetch_native_balance", fake_fetch_native)
@@ -62,6 +65,9 @@ def test_wallet_status_derives_address_and_balances(monkeypatch) -> None:
     assert status["portfolio"]["position_value"] == 24.995
     assert status["portfolio"]["source"] == "polymarket_data_api"
     assert status["portfolio"]["positions"][0]["cashPnl"] == 0.2
+    assert status["portfolio"]["redeemable_count"] == 1
+    assert status["redeemable_count"] == 1
+    assert status["redeemable_positions"] == [status["portfolio"]["positions"][0]]
 
 
 def test_portfolio_value_accepts_data_api_list_payload() -> None:

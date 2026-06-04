@@ -23,7 +23,19 @@ class ScannerRepository:
         '%"strategy_variant": "near_close_profit_take"%',
     )
     LIVE_JOURNAL_STATUSES = ("CONFIRMED", "MATCHED", "FILLED", "MINED", "REDEEMED", "SETTLED_LOST")
-    LIVE_JOURNAL_QUERY_STATUSES = (*LIVE_JOURNAL_STATUSES, "SUBMITTED")
+    LIVE_JOURNAL_RESPONSE_RECHECK_STATUSES = (
+        "CANCELLED",
+        "CANCEL_UNCONFIRMED",
+        "QUALIFICATION_CANCELLED",
+        "REPRICE_CANCELLED",
+        "PANIC_EXIT_CANCELLED_MAKER",
+        "STOP_EXIT_CANCELLED_PROFIT_TAKE",
+    )
+    LIVE_JOURNAL_QUERY_STATUSES = (
+        *LIVE_JOURNAL_STATUSES,
+        "SUBMITTED",
+        *LIVE_JOURNAL_RESPONSE_RECHECK_STATUSES,
+    )
     MATCHED_RESPONSE_STATUSES = {"CONFIRMED", "MATCHED", "FILLED", "MINED"}
     NEAR_CLOSE_INACTIVE_ORDER_STATUSES = (
         "CANCEL_REQUESTED",
@@ -2314,6 +2326,75 @@ class ScannerRepository:
                 ),
             )
 
+    @staticmethod
+    def _execution_event_identity(details: dict[str, Any] | None) -> tuple[str, str] | None:
+        if not isinstance(details, dict):
+            return None
+        for key in ("profit_take_for_order_id", "hedge_for_order_id"):
+            value = str(details.get(key) or "").strip()
+            if value:
+                return key, value
+        return None
+
+    def save_execution_event_once(
+        self,
+        *,
+        source: str,
+        mode: str,
+        opportunity_id: str | None,
+        status: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        claim_key: str | None = None,
+    ) -> bool:
+        identity = self._execution_event_identity(details)
+        if identity is None:
+            self.save_execution_event(
+                source=source,
+                mode=mode,
+                opportunity_id=opportunity_id,
+                status=status,
+                message=message,
+                details=details,
+                claim_key=claim_key,
+            )
+            return True
+        identity_key, identity_value = identity
+        with self.connection.transaction():
+            existing = self.connection.fetchone(
+                """
+                SELECT id
+                FROM execution_audit_log
+                WHERE source = ?
+                  AND mode = ?
+                  AND status = ?
+                  AND message = ?
+                  AND json_extract(details_json, ?) = ?
+                LIMIT 1
+                """,
+                (source, mode, status, message, f"$.{identity_key}", identity_value),
+            )
+            if existing is not None:
+                return False
+            self.connection.execute(
+                """
+                INSERT INTO execution_audit_log (
+                    claim_key, opportunity_id, source, mode, status, message, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    claim_key,
+                    opportunity_id,
+                    source,
+                    mode,
+                    status,
+                    message,
+                    json.dumps(details or {}),
+                    self._now().isoformat(),
+                ),
+            )
+        return True
+
     def recent_execution_events(self, limit: int = 10) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(
             """
@@ -2388,7 +2469,7 @@ class ScannerRepository:
     def _normalized_live_trade_status(self, row: dict[str, Any]) -> str:
         status = str(row.get("status") or "").upper()
         response = self._load_json(row.get("response_json"), {})
-        if status == "SUBMITTED" and self._response_indicates_matched(response):
+        if status not in {"REDEEMED", "SETTLED_LOST"} and self._response_indicates_matched(response):
             return "MATCHED"
         return status
 

@@ -468,42 +468,94 @@ def run_auto_redeem_once(
                 redeemed_size=0.0,
                 trade_ids=[int(value) for value in candidate.get("trade_ids", [])],
             )
+            condition_id = str(payload.get("conditionId") or market.get("raw", {}).get("conditionId") or "")
             if not _is_winning_market(payload, outcome_index):
                 if _is_closed_losing_market(payload, outcome_index):
+                    settlement_details = {
+                        "market_slug": result.market_slug,
+                        "outcome_label": result.outcome_label,
+                        "token_id": token_id,
+                        "outcome_index": outcome_index,
+                        "outcome_prices": payload.get("outcomePrices"),
+                    }
+                    message = "Conditional token expired worthless; no redeemable payout."
+                    if condition_id:
+                        balance_units = _call_uint(
+                            client,
+                            settings.polygon_rpc_url,
+                            settings.polymarket_ctf_address,
+                            _ctf_balance_data(wallet, token_id),
+                        )
+                        settlement_details["condition_id"] = condition_id
+                        settlement_details["ctf_units"] = balance_units
+                        if balance_units > 0:
+                            usdce_before = _call_uint(
+                                client,
+                                settings.polygon_rpc_url,
+                                settings.polygon_usdc_e_token_address,
+                                usdce_balance_data,
+                            )
+                            index_set = 1 << outcome_index
+                            redeem_data = _encode_call(
+                                "redeemPositions(address,bytes32,bytes32,uint256[])",
+                                [
+                                    ("address", settings.polygon_usdc_e_token_address),
+                                    ("bytes32", ZERO_COLLECTION_ID),
+                                    ("bytes32", condition_id),
+                                    ("uint256[]", [index_set]),
+                                ],
+                            )
+                            redeem_tx = _send_transaction(
+                                client,
+                                settings,
+                                private_key=private_key,
+                                from_address=wallet,
+                                to=settings.polymarket_ctf_address,
+                                data=redeem_data,
+                            )
+                            receipt = _wait_receipt(client, settings.polygon_rpc_url, redeem_tx)
+                            if int(receipt.get("status", "0x0"), 16) != 1:
+                                raise RuntimeError(f"zero-payout redeem failed: {redeem_tx}")
+                            usdce_after = _call_uint(
+                                client,
+                                settings.polygon_rpc_url,
+                                settings.polygon_usdc_e_token_address,
+                                usdce_balance_data,
+                            )
+                            settlement_details.update(
+                                {
+                                    "index_set": index_set,
+                                    "redeem_tx": redeem_tx,
+                                    "usdce_delta": _base_units_to_float(max(0, usdce_after - usdce_before)),
+                                    "zero_payout_redeem": True,
+                                }
+                            )
+                            result.redeem_tx = redeem_tx
+                            result.redeemed_size = _base_units_to_float(balance_units)
+                            message = "Redeemed zero-payout losing conditional token; shares were burned."
                     if result.trade_ids:
                         repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
-                        repository.save_execution_event(
-                            source="auto-redeem",
-                            mode="live",
-                            opportunity_id=str(candidate.get("opportunity_id") or ""),
-                            status="settled_lost",
-                            message="Conditional token expired worthless; no redeemable payout.",
-                            details={
-                                "market_slug": result.market_slug,
-                                "outcome_label": result.outcome_label,
-                                "token_id": token_id,
-                                "outcome_index": outcome_index,
-                                "outcome_prices": payload.get("outcomePrices"),
-                            },
-                        )
                         repository.save_loss_autopsy(
                             result.trade_ids,
                             risk_settings=_loss_autopsy_risk_settings(settings),
-                            settlement_details={
-                                "market_slug": result.market_slug,
-                                "outcome_label": result.outcome_label,
-                                "token_id": token_id,
-                                "outcome_index": outcome_index,
-                                "outcome_prices": payload.get("outcomePrices"),
-                            },
+                            settlement_details=settlement_details,
                         )
+                    repository.save_execution_event(
+                        source="auto-redeem",
+                        mode="live",
+                        opportunity_id=str(candidate.get("opportunity_id") or ""),
+                        status="settled_lost",
+                        message=message,
+                        details=settlement_details,
+                    )
                     result.status = "settled_lost"
                     result.message = "Market is closed and this token settled at 0."
+                    if result.redeem_tx:
+                        result.message += " Zero-payout redeem sent to clear wallet position."
                 else:
                     result.message = "Market is not closed with this outcome at 1.00 yet."
                 results.append(result)
                 continue
-            condition_id = str(payload.get("conditionId") or market.get("raw", {}).get("conditionId") or "")
             if not condition_id:
                 result.message = "Missing conditionId."
                 results.append(result)

@@ -261,7 +261,7 @@ async def execute_post_fill_profit_takes(
             )
             continue
         if not decision.should_place or decision.plan is None:
-            repository.save_execution_event(
+            repository.save_execution_event_once(
                 source=source,
                 mode="live",
                 opportunity_id=decision.plan.opportunity_id if decision.plan else None,
