@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from hashlib import md5
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -57,6 +58,121 @@ class ScannerRepository:
 
     def __init__(self, connection: DatabaseSession) -> None:
         self.connection = connection
+
+    @classmethod
+    def make_trade_autopsy_id(
+        cls,
+        *,
+        market_slug: str,
+        token_id: str,
+        outcome_label: str,
+        order_id: str | None = None,
+        opportunity_id: str | None = None,
+        created_at: str | None = None,
+    ) -> str:
+        raw_key = "|".join(
+            str(value or "")
+            for value in (
+                market_slug,
+                token_id,
+                outcome_label,
+                order_id,
+                opportunity_id,
+                created_at,
+            )
+        )
+        digest = md5(raw_key.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        return f"ta_{digest}"
+
+    def _entry_trade_autopsy_snapshot(
+        self,
+        *,
+        response: dict[str, Any],
+        leg: Any,
+        created_at: str,
+    ) -> dict[str, Any]:
+        market_slug = str(leg.market_slug or "")
+        token_id = str(leg.token_id or "")
+        outcome_label = str(leg.outcome_label or response.get("outcome_label") or "")
+        entry_price = self._json_float(response, "actual_fill_price", "entry_price", "entry_bid") or float(
+            getattr(leg, "target_price", 0.0) or 0.0
+        )
+        return {
+            "market_slug": market_slug,
+            "token_id": token_id,
+            "outcome": outcome_label,
+            "time_to_resolution_sec": self._json_float(response, "time_to_resolution_sec"),
+            "entry_price": entry_price,
+            "actual_fill_price": self._json_float(response, "actual_fill_price"),
+            "actual_matched_size": self._json_float(response, "actual_matched_size"),
+            "best_bid": self._json_float(response, "best_bid", "current_bid"),
+            "best_ask": self._json_float(response, "best_ask", "entry_ask"),
+            "spread": self._json_float(response, "spread"),
+            "midpoint": self._json_float(response, "midpoint", "current_midpoint"),
+            "bid_depth_at_best": self._json_float(response, "bid_depth_at_best"),
+            "ask_depth_at_best": self._json_float(response, "ask_depth_at_best"),
+            "crypto_start_distance": self._json_float(response, "crypto_start_distance"),
+            "selected_asset": str(response.get("selected_asset") or self._slug_asset(market_slug)),
+            "resolution_bucket_key": response.get("resolution_bucket_key")
+            or self.near_close_resolution_bucket_key(market_slug),
+            "created_at": created_at,
+        }
+
+    def _enrich_live_response_for_autopsy(
+        self,
+        *,
+        result: LiveExecutionResult,
+        leg: Any,
+        created_at: str,
+    ) -> dict[str, Any]:
+        response = dict(leg.response) if isinstance(leg.response, dict) else {}
+        strategy_variant = str(response.get("strategy_variant") or "")
+        if strategy_variant == "near_close_maker":
+            autopsy_id = str(response.get("trade_autopsy_id") or "").strip()
+            if not autopsy_id:
+                autopsy_id = self.make_trade_autopsy_id(
+                    market_slug=str(leg.market_slug or ""),
+                    token_id=str(leg.token_id or ""),
+                    outcome_label=str(leg.outcome_label or ""),
+                    order_id=str(leg.order_id or ""),
+                    opportunity_id=str(result.opportunity_id or ""),
+                    created_at=created_at,
+                )
+            response["trade_autopsy_id"] = autopsy_id
+            response.setdefault("trade_autopsy_role", "entry")
+            response.setdefault("selected_asset", self._slug_asset(str(leg.market_slug or "")))
+            response.setdefault("resolution_bucket_key", self.near_close_resolution_bucket_key(str(leg.market_slug or "")))
+            response.setdefault(
+                "entry_autopsy_snapshot",
+                self._entry_trade_autopsy_snapshot(response=response, leg=leg, created_at=created_at),
+            )
+        return response
+
+    def _trade_autopsy_entry_event_details(
+        self,
+        *,
+        result: LiveExecutionResult,
+        leg: Any,
+        response: dict[str, Any],
+        created_at: str,
+    ) -> dict[str, Any] | None:
+        autopsy_id = str(response.get("trade_autopsy_id") or "").strip()
+        if not autopsy_id or response.get("strategy_variant") != "near_close_maker":
+            return None
+        snapshot = response.get("entry_autopsy_snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = self._entry_trade_autopsy_snapshot(response=response, leg=leg, created_at=created_at)
+        return {
+            "trade_autopsy_id": autopsy_id,
+            "event_type": "entry_submitted",
+            "opportunity_id": result.opportunity_id,
+            "order_id": leg.order_id,
+            "order_type": result.order_type,
+            "status": leg.status,
+            "requested_size": leg.requested_size,
+            "target_price": leg.target_price,
+            **snapshot,
+        }
 
     @staticmethod
     def _now() -> datetime:
@@ -602,8 +718,23 @@ class ScannerRepository:
     def save_live_execution(self, result: LiveExecutionResult) -> None:
         if not result.leg_results:
             return
+        autopsy_events: list[dict[str, Any]] = []
+        created_at = to_isoformat(result.created_at)
         with self.connection.transaction():
             for leg in result.leg_results:
+                response = self._enrich_live_response_for_autopsy(
+                    result=result,
+                    leg=leg,
+                    created_at=created_at,
+                )
+                entry_event = self._trade_autopsy_entry_event_details(
+                    result=result,
+                    leg=leg,
+                    response=response,
+                    created_at=created_at,
+                )
+                if entry_event is not None:
+                    autopsy_events.append(entry_event)
                 self.connection.execute(
                     """
                     INSERT INTO live_trades (
@@ -622,10 +753,19 @@ class ScannerRepository:
                         leg.requested_size,
                         leg.order_id,
                         leg.status,
-                        json.dumps(leg.response),
-                        to_isoformat(result.created_at),
+                        json.dumps(response),
+                        created_at,
                     ),
                 )
+        for event in autopsy_events:
+            self.save_execution_event(
+                source="trade-autopsy",
+                mode="live",
+                opportunity_id=str(event.get("opportunity_id") or result.opportunity_id),
+                status="trade_autopsy_entry",
+                message="Live near-close entry autopsy snapshot recorded.",
+                details=event,
+            )
 
     def mark_live_orders_cancelled(
         self,
@@ -1338,9 +1478,11 @@ class ScannerRepository:
         existing = self._load_json(existing_response_json, {})
         if not isinstance(existing, dict):
             existing = {}
+        autopsy_fields = self._fill_trade_autopsy_fields(fill, source="clob_fill")
         return {
             **existing,
             **fill,
+            **autopsy_fields,
             "clob_fill": fill,
             "user_fill": user_fill,
         }
@@ -1349,11 +1491,36 @@ class ScannerRepository:
         existing = self._load_json(existing_response_json, {})
         if not isinstance(existing, dict):
             existing = {}
+        autopsy_fields = self._fill_trade_autopsy_fields(activity, source="activity_trade")
         return {
             **existing,
             **activity,
+            **autopsy_fields,
             "activity_trade": activity,
         }
+
+    def _fill_trade_autopsy_fields(self, payload: dict[str, Any], *, source: str) -> dict[str, Any]:
+        price = self._float_or_none(payload.get("price") or payload.get("average_price") or payload.get("avg_price"))
+        size = self._float_or_none(
+            payload.get("size")
+            or payload.get("matched_amount")
+            or payload.get("matchedAmount")
+            or payload.get("amount")
+        )
+        transaction_hash = self._transaction_hash_from_payload(payload)
+        fields: dict[str, Any] = {
+            "actual_fill_source": source,
+        }
+        if price is not None and price > 0:
+            fields["actual_fill_price"] = price
+        if size is not None and size > 0:
+            fields["actual_matched_size"] = size
+        if transaction_hash:
+            fields["actual_fill_tx"] = transaction_hash
+        timestamp = payload.get("timestamp") or payload.get("createdAt") or payload.get("created_at")
+        if timestamp:
+            fields["actual_fill_at"] = timestamp
+        return fields
 
     @staticmethod
     def _transaction_hash_from_payload(payload: dict[str, Any]) -> str:
@@ -1628,6 +1795,7 @@ class ScannerRepository:
         inserted = 0
         wallet = str(wallet_address or "").lower().strip()
         market_lookup: dict[str, tuple[str, str]] | None = None
+        autopsy_events: list[dict[str, Any]] = []
 
         def report_progress() -> None:
             if progress_callback is not None:
@@ -1646,6 +1814,38 @@ class ScannerRepository:
             if outcome_label == "Unknown" and fallback_label:
                 outcome_label = fallback_label
             return market_slug, outcome_label
+
+        def queue_fill_event(
+            *,
+            response: dict[str, Any],
+            activity: dict[str, Any],
+            opportunity_id: str,
+            market_slug: str,
+            outcome_label: str,
+            token_id: str,
+            order_id: str,
+            status: str,
+        ) -> None:
+            autopsy_id = str(response.get("trade_autopsy_id") or "").strip()
+            if not autopsy_id:
+                return
+            autopsy_events.append(
+                {
+                    "trade_autopsy_id": autopsy_id,
+                    "event_type": "entry_fill_synced" if str(response.get("strategy_variant")) == "near_close_maker" else "fill_synced",
+                    "opportunity_id": opportunity_id,
+                    "market_slug": market_slug or response.get("market_slug"),
+                    "token_id": token_id,
+                    "outcome": outcome_label or response.get("outcome_label"),
+                    "order_id": order_id,
+                    "status": status,
+                    "actual_fill_price": response.get("actual_fill_price"),
+                    "actual_matched_size": response.get("actual_matched_size"),
+                    "actual_fill_source": response.get("actual_fill_source"),
+                    "actual_fill_tx": response.get("actual_fill_tx"),
+                    "activity_trade": activity,
+                }
+            )
 
         with self.connection.transaction():
             for activity in activities:
@@ -1686,6 +1886,7 @@ class ScannerRepository:
                     existing_status = str(existing_tx["status"] or "").upper()
                     if existing_status in {"REDEEMED", "SETTLED_LOST", "MISATTRIBUTED_FILL_IGNORED"}:
                         continue
+                    merged_response = self._merge_activity_response(existing_tx.get("response_json"), activity)
                     self.connection.execute(
                         """
                         UPDATE live_trades
@@ -1696,10 +1897,20 @@ class ScannerRepository:
                         """,
                         (
                             "CONFIRMED",
-                            json.dumps(self._merge_activity_response(existing_tx.get("response_json"), activity)),
+                            json.dumps(merged_response),
                             created_at,
                             existing_tx["id"],
                         ),
+                    )
+                    queue_fill_event(
+                        response=merged_response,
+                        activity=activity,
+                        opportunity_id=str(existing_tx.get("opportunity_id") or ""),
+                        market_slug=str(merged_response.get("market_slug") or activity.get("slug") or ""),
+                        outcome_label=str(merged_response.get("outcome_label") or activity.get("outcome") or ""),
+                        token_id=token_id,
+                        order_id=str(merged_response.get("orderID") or merged_response.get("orderId") or ""),
+                        status="CONFIRMED",
                     )
                     inserted += 1
                     report_progress()
@@ -1729,6 +1940,7 @@ class ScannerRepository:
                         market_slug, outcome_label = activity_slug, activity_outcome
                     else:
                         market_slug, outcome_label = resolve_market(token_id, activity_outcome or "Unknown")
+                    merged_response = self._merge_activity_response(local_order.get("response_json"), activity)
                     self.connection.execute(
                         """
                         UPDATE live_trades
@@ -1745,10 +1957,20 @@ class ScannerRepository:
                             str(local_order["market_slug"] or market_slug),
                             str(local_order["outcome_label"] or outcome_label),
                             "CONFIRMED",
-                            json.dumps(self._merge_activity_response(local_order.get("response_json"), activity)),
+                            json.dumps(merged_response),
                             created_at,
                             local_order["id"],
                         ),
+                    )
+                    queue_fill_event(
+                        response=merged_response,
+                        activity=activity,
+                        opportunity_id=str(local_order.get("opportunity_id") or ""),
+                        market_slug=str(local_order["market_slug"] or market_slug),
+                        outcome_label=str(local_order["outcome_label"] or outcome_label),
+                        token_id=token_id,
+                        order_id=str(local_order.get("order_id") or ""),
+                        status="CONFIRMED",
                     )
                     inserted += 1
                     report_progress()
@@ -1782,6 +2004,15 @@ class ScannerRepository:
                 )
                 inserted += 1
                 report_progress()
+        for event in autopsy_events:
+            self.save_execution_event(
+                source="trade-autopsy",
+                mode="live",
+                opportunity_id=str(event.get("opportunity_id") or ""),
+                status="trade_autopsy_fill",
+                message="Live trade fill sync autopsy snapshot recorded.",
+                details=event,
+            )
         return inserted
 
     def redeem_candidate_live_trades(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -1937,6 +2168,24 @@ class ScannerRepository:
         response = self._load_json(basis_rows[0].get("response_json"), {})
         if not isinstance(response, dict):
             response = {}
+        trade_autopsy_id = str(response.get("trade_autopsy_id") or "").strip()
+        if not trade_autopsy_id:
+            trade_autopsy_id = self.make_trade_autopsy_id(
+                market_slug=market_slug,
+                token_id=token_id,
+                outcome_label=outcome_label,
+                order_id=str(basis_rows[0].get("order_id") or ""),
+                opportunity_id=opportunity_id,
+                created_at=created_at,
+            )
+        settlement = dict(settlement_details or {})
+        bought_outcome_won = settlement.get("did_bought_outcome_win")
+        if bought_outcome_won is None:
+            bought_outcome_won = False if str(settlement.get("settlement_price") or "") == "0" else None
+        realized_pnl = settlement.get("realized_pnl")
+        if realized_pnl is None and bought_outcome_won is not None and entry_price is not None:
+            settlement_price = 1.0 if bool(bought_outcome_won) else 0.0
+            realized_pnl = (settlement_price - entry_price) * total_size
 
         books = self._loss_autopsy_orderbook_timeline(token_id, created_at)
         related_events = self._loss_autopsy_related_events(
@@ -1980,9 +2229,11 @@ class ScannerRepository:
         return {
             "autopsy_version": 1,
             "autopsy_key": autopsy_key,
+            "trade_autopsy_id": trade_autopsy_id,
             "reason": "settled_lost",
             "trade_ids": cleaned,
             "entry": {
+                "trade_autopsy_id": trade_autopsy_id,
                 "opportunity_id": opportunity_id,
                 "market_slug": market_slug,
                 "outcome_label": outcome_label,
@@ -1995,13 +2246,20 @@ class ScannerRepository:
                 "minutes_to_resolution": response.get("minutes_to_resolution"),
                 "crypto_start_distance": response.get("crypto_start_distance"),
                 "crypto_winning_outcome_at_entry": response.get("crypto_winning_outcome"),
+                "selected_asset": response.get("selected_asset") or self._slug_asset(market_slug),
+                "resolution_bucket_key": response.get("resolution_bucket_key")
+                or self.near_close_resolution_bucket_key(market_slug),
                 "entry_bid": response.get("entry_bid"),
                 "entry_ask": response.get("entry_ask"),
                 "current_bid_at_entry": response.get("current_bid"),
                 "current_midpoint_at_entry": response.get("current_midpoint"),
             },
             "risk_settings": risk,
-            "settlement": settlement_details or {},
+            "settlement": {
+                **settlement,
+                "did_bought_outcome_win": bought_outcome_won,
+                "realized_pnl": realized_pnl,
+            },
             "book_timeline": books,
             "first_stop_cross": stop_cross,
             "stop_exit": {
@@ -2041,6 +2299,34 @@ class ScannerRepository:
         )
         return autopsy
 
+    def save_trade_settlement_autopsy(
+        self,
+        trade_ids: Iterable[int],
+        *,
+        risk_settings: dict[str, Any] | None = None,
+        settlement_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        autopsy = self.build_loss_autopsy(
+            trade_ids,
+            risk_settings=risk_settings,
+            settlement_details=settlement_details,
+        )
+        if not autopsy:
+            return None
+        autopsy["reason"] = str((settlement_details or {}).get("autopsy_reason") or "settled")
+        autopsy["autopsy_key"] = str(autopsy.get("autopsy_key") or "").replace("loss_autopsy:", "trade_settlement_autopsy:", 1)
+        if self._trade_autopsy_event_exists("trade_autopsy_settlement", str(autopsy.get("autopsy_key") or "")):
+            return autopsy
+        self.save_execution_event(
+            source="trade-autopsy",
+            mode="live",
+            opportunity_id=str(autopsy.get("entry", {}).get("opportunity_id") or ""),
+            status="trade_autopsy_settlement",
+            message="Settled position autopsy recorded.",
+            details=autopsy,
+        )
+        return autopsy
+
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
         if value is None:
@@ -2051,17 +2337,20 @@ class ScannerRepository:
             return None
 
     def _loss_autopsy_exists(self, autopsy_key: str) -> bool:
+        return self._trade_autopsy_event_exists("loss_autopsy", autopsy_key)
+
+    def _trade_autopsy_event_exists(self, status: str, autopsy_key: str) -> bool:
         if not autopsy_key:
             return False
         row = self.connection.fetchone(
             """
             SELECT 1
             FROM execution_audit_log
-            WHERE status = 'loss_autopsy'
+            WHERE status = ?
               AND details_json LIKE ?
             LIMIT 1
             """,
-            (f"%{autopsy_key}%",),
+            (status, f"%{autopsy_key}%"),
         )
         return row is not None
 
@@ -3094,6 +3383,154 @@ class ScannerRepository:
             "open_cost_basis": total["open_cost_basis"],
             "note": "Live 損益依 CLOB confirmed fills 估算，仍需定期與錢包餘額對帳。",
         }
+
+    @staticmethod
+    def _trade_autopsy_id_from_details(details: dict[str, Any]) -> str:
+        direct = str(details.get("trade_autopsy_id") or "").strip()
+        if direct:
+            return direct
+        entry = details.get("entry")
+        if isinstance(entry, dict):
+            entry_id = str(entry.get("trade_autopsy_id") or "").strip()
+            if entry_id:
+                return entry_id
+        return str(details.get("autopsy_key") or "").strip()
+
+    def trade_autopsy_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id, source, mode, status, message, details_json, created_at
+            FROM execution_audit_log
+            WHERE source = 'trade-autopsy'
+               OR status IN ('loss_autopsy', 'trade_autopsy_settlement')
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            details = self._load_json(row.get("details_json"), {})
+            if not isinstance(details, dict):
+                details = {}
+            events.append(
+                {
+                    **dict(row),
+                    "details": details,
+                    "trade_autopsy_id": self._trade_autopsy_id_from_details(details),
+                }
+            )
+        return events
+
+    def trade_autopsy_report(self, limit: int = 20) -> list[dict[str, Any]]:
+        events = list(reversed(self.trade_autopsy_events(limit=max(limit * 20, 200))))
+        groups: dict[str, dict[str, Any]] = {}
+
+        def group_for(event: dict[str, Any]) -> dict[str, Any] | None:
+            autopsy_id = str(event.get("trade_autopsy_id") or "").strip()
+            if not autopsy_id:
+                return None
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            entry = details.get("entry") if isinstance(details.get("entry"), dict) else {}
+            return groups.setdefault(
+                autopsy_id,
+                {
+                    "trade_autopsy_id": autopsy_id,
+                    "market_slug": details.get("market_slug") or entry.get("market_slug"),
+                    "token_id": details.get("token_id") or entry.get("token_id"),
+                    "outcome": details.get("outcome") or entry.get("outcome_label"),
+                    "selected_asset": details.get("selected_asset") or entry.get("selected_asset"),
+                    "resolution_bucket_key": details.get("resolution_bucket_key") or entry.get("resolution_bucket_key"),
+                    "entry_price": details.get("entry_price") or entry.get("entry_price"),
+                    "actual_fill_price": None,
+                    "actual_matched_size": None,
+                    "time_to_resolution_sec": details.get("time_to_resolution_sec"),
+                    "best_bid_at_entry": None,
+                    "best_ask_at_entry": None,
+                    "spread_at_entry": None,
+                    "crypto_start_distance": None,
+                    "stop_check_count": 0,
+                    "last_stop_reason": None,
+                    "last_direction_valid": None,
+                    "last_observed_bid": None,
+                    "exit_attempted": False,
+                    "exit_status": None,
+                    "exit_price": None,
+                    "exit_matched_size": None,
+                    "settled": False,
+                    "final_outcome": None,
+                    "did_bought_outcome_win": None,
+                    "realized_pnl": None,
+                    "redeem_amount": None,
+                    "settlement_source": None,
+                    "diagnosis": [],
+                    "event_count": 0,
+                    "latest_event_at": None,
+                    "latest_status": None,
+                },
+            )
+
+        for event in events:
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            item = group_for(event)
+            if item is None:
+                continue
+            entry = details.get("entry") if isinstance(details.get("entry"), dict) else {}
+            for key, source_key in (
+                ("market_slug", "market_slug"),
+                ("token_id", "token_id"),
+                ("selected_asset", "selected_asset"),
+                ("resolution_bucket_key", "resolution_bucket_key"),
+                ("entry_price", "entry_price"),
+            ):
+                if item.get(key) in {None, ""}:
+                    item[key] = details.get(source_key) or entry.get(source_key)
+            if item.get("outcome") in {None, ""}:
+                item["outcome"] = details.get("outcome") or entry.get("outcome_label")
+
+            item["event_count"] = int(item.get("event_count") or 0) + 1
+            item["latest_event_at"] = event.get("created_at")
+            item["latest_status"] = event.get("status")
+            event_type = str(details.get("event_type") or "")
+            status = str(event.get("status") or "")
+
+            if event_type == "entry_submitted":
+                item["entry_price"] = details.get("entry_price") or item.get("entry_price")
+                item["time_to_resolution_sec"] = details.get("time_to_resolution_sec")
+                item["best_bid_at_entry"] = details.get("best_bid")
+                item["best_ask_at_entry"] = details.get("best_ask")
+                item["spread_at_entry"] = details.get("spread")
+                item["crypto_start_distance"] = details.get("crypto_start_distance")
+            elif event_type in {"entry_fill_synced", "fill_synced"}:
+                item["actual_fill_price"] = details.get("actual_fill_price")
+                item["actual_matched_size"] = details.get("actual_matched_size")
+            elif event_type == "stop_check":
+                item["stop_check_count"] = int(item.get("stop_check_count") or 0) + 1
+                item["last_stop_reason"] = details.get("stop_reason")
+                item["last_direction_valid"] = details.get("direction_still_valid")
+                item["last_observed_bid"] = details.get("observed_best_bid")
+            elif event_type == "panic_exit_attempt" or "stop_exit" in status:
+                item["exit_attempted"] = True
+                item["exit_status"] = details.get("exit_status") or status
+                item["exit_price"] = details.get("attempted_exit_price") or details.get("target_price")
+                item["exit_matched_size"] = details.get("actual_matched_size")
+            if status in {"loss_autopsy", "trade_autopsy_settlement"}:
+                settlement = details.get("settlement") if isinstance(details.get("settlement"), dict) else {}
+                item["settled"] = True
+                item["final_outcome"] = settlement.get("final_outcome") or settlement.get("winning_outcome")
+                item["did_bought_outcome_win"] = settlement.get("did_bought_outcome_win")
+                item["realized_pnl"] = settlement.get("realized_pnl")
+                item["redeem_amount"] = settlement.get("redeem_amount") or settlement.get("redeemed_size")
+                item["settlement_source"] = settlement.get("settlement_source")
+                diagnosis = details.get("diagnosis")
+                if isinstance(diagnosis, list):
+                    item["diagnosis"] = diagnosis
+
+        return sorted(
+            groups.values(),
+            key=lambda row: str(row.get("latest_event_at") or ""),
+            reverse=True,
+        )[:limit]
 
     @staticmethod
     def _near_close_entry_bucket(seconds_to_resolution: float | None) -> str | None:

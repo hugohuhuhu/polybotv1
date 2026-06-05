@@ -923,6 +923,7 @@ async def build_dashboard_payload(
         "open_positions": repository.open_live_positions(limit=12),
         "pnl": repository.settled_pnl_summary(),
         "trade_journal": _trade_journal_payload(repository, settings, wallet or {}),
+        "trade_autopsy": repository.trade_autopsy_report(limit=8),
         "refresh_sec": settings.dashboard_refresh_sec,
         "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
         "risk": {

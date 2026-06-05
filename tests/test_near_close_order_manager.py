@@ -954,6 +954,52 @@ def test_near_close_taker_exit_does_not_attempt_second_chance_when_first_fak_has
     assert exits[0]["status"] == "failed"
 
 
+def test_near_close_stop_check_records_autopsy_when_not_triggered(tmp_path) -> None:
+    class FakeTrader:
+        async def execute(self, _plan):
+            raise AssertionError("stop exit should not execute")
+
+    repository = ScannerRepository(connect_db(tmp_path / "stop-check-autopsy.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="stop-check-entry",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="token-doge",
+                    market_slug="doge-updown-5m-test",
+                    outcome_label="Down",
+                    target_price=0.87,
+                    requested_size=5.0,
+                    order_id="0xstop-check",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker", "crypto_winning_outcome": "Down"},
+                )
+            ],
+        )
+    )
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=FakeTrader(),
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.025),
+            watch_books={"token-doge": make_book(bid=0.86, ask=0.88)},
+        )
+    )
+    events = repository.trade_autopsy_events(limit=10)
+    stop_event = next(event for event in events if event["status"] == "trade_autopsy_stop_check")
+
+    assert exits == []
+    assert stop_event["details"]["stop_reason"] == "stop_not_triggered"
+    assert stop_event["details"]["observed_best_bid"] == 0.86
+    assert stop_event["details"]["trade_autopsy_id"].startswith("ta_")
+
+
 def test_near_close_taker_exit_cancels_active_profit_take_before_stop(tmp_path) -> None:
     class FakeTrader:
         def __init__(self) -> None:

@@ -1456,6 +1456,42 @@ body.armed-state .status-chip.hot .status-dot {
   font-weight: 700;
 }
 
+.trade-autopsy-card {
+  border-radius: 1.15rem;
+  padding: 0.82rem 0.9rem;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(23, 38, 31, 0.12);
+}
+
+.trade-autopsy-card header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.trade-autopsy-card strong {
+  display: block;
+  color: var(--ink);
+  font-size: 1rem;
+  line-height: 1.22;
+  overflow-wrap: anywhere;
+}
+
+.trade-autopsy-card p {
+  margin: 0.18rem 0 0;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.trade-autopsy-card time {
+  display: block;
+  margin-top: 0.62rem;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+}
+
 .trade-metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.clients.crypto_price_client import CryptoPriceClient, binance_symbol_for_asset
@@ -79,6 +80,24 @@ def _execution_price_from_leg(leg: LiveExecutionLegResult) -> float | None:
     return None
 
 
+def _execution_size_from_leg(leg: LiveExecutionLegResult) -> float | None:
+    candidates = (
+        leg.response.get("matched_size"),
+        leg.response.get("matched_amount"),
+        leg.response.get("matchedAmount"),
+        leg.response.get("filled_size"),
+        leg.response.get("size"),
+    )
+    for value in candidates:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0:
+            return numeric
+    return None
+
+
 def _execution_telemetry(legs: list[LiveExecutionLegResult]) -> list[dict[str, object]]:
     return [
         {
@@ -88,6 +107,7 @@ def _execution_telemetry(legs: list[LiveExecutionLegResult]) -> list[dict[str, o
             "target_price": leg.target_price,
             "requested_size": leg.requested_size,
             "reported_execution_price": _execution_price_from_leg(leg),
+            "reported_matched_size": _execution_size_from_leg(leg),
             "response": leg.response,
         }
         for leg in legs
@@ -114,6 +134,24 @@ def _crypto_updown_symbol(market_slug: str, entry_metadata: dict[str, Any]) -> s
         return None
     symbol = binance_symbol_for_asset(asset)
     return symbol.upper() if symbol else None
+
+
+def _time_to_resolution_sec(market_slug: str) -> float | None:
+    end_ts = ScannerRepository._parse_slug_end_timestamp(str(market_slug or ""))
+    if end_ts is None:
+        return None
+    return max(end_ts - datetime.now(timezone.utc).timestamp(), 0.0)
+
+
+def _direction_still_valid(details: dict[str, object]) -> bool | None:
+    if "crypto_direction_broken" in details:
+        return not bool(details.get("crypto_direction_broken"))
+    reason = str(details.get("crypto_direction_guard_reason") or "")
+    if reason == "direction_still_valid":
+        return True
+    if reason == "direction_broken":
+        return False
+    return None
 
 
 async def _crypto_price(
@@ -235,6 +273,57 @@ def _record_stop_exit_skip(
     )
 
 
+def _record_stop_exit_check(
+    *,
+    repository: ScannerRepository,
+    opportunity_id: str,
+    trade_autopsy_id: str,
+    market_slug: str,
+    token_id: str,
+    outcome_label: str,
+    entry_price: float,
+    size: float,
+    book_source: str,
+    reference_price: float | None,
+    target_price: float | None,
+    stop_required: bool,
+    stop_reason: str,
+    direction_details: dict[str, object],
+    orderbook_telemetry: dict[str, object],
+) -> None:
+    payload = {
+        "trade_autopsy_id": trade_autopsy_id,
+        "event_type": "stop_check",
+        "check_timestamp": datetime.now(timezone.utc).isoformat(),
+        "market_slug": market_slug,
+        "token_id": token_id,
+        "outcome": outcome_label,
+        "entry_price": entry_price,
+        "size": size,
+        "time_to_resolution_sec": _time_to_resolution_sec(market_slug),
+        "stop_orderbook_source": book_source,
+        "reference_price": reference_price,
+        "target_price": target_price,
+        "stop_required": stop_required,
+        "stop_reason": stop_reason,
+        "expected_winning_outcome": direction_details.get("crypto_stop_outcome") or outcome_label,
+        "direction_still_valid": _direction_still_valid(direction_details),
+        "crypto_spot": direction_details.get("crypto_stop_spot_price"),
+        "crypto_start_price": direction_details.get("crypto_stop_start_price"),
+        "current_start_distance": direction_details.get("crypto_stop_start_distance"),
+        **direction_details,
+        **orderbook_telemetry,
+    }
+    repository.save_execution_event(
+        source="trade-autopsy",
+        mode="live",
+        opportunity_id=opportunity_id,
+        status="trade_autopsy_stop_check",
+        message=f"Near-close stop/exit check: {stop_reason}.",
+        details=payload,
+    )
+
+
 async def _cancel_orders_for_panic_exit(
     *,
     repository: ScannerRepository,
@@ -306,30 +395,23 @@ async def execute_near_close_taker_exits(
                 book_source = "stored_orderbook" if book is not None else "missing"
             size = float(group.get("open_size") or 0.0)
             entry_price = float(group.get("open_cost_basis") or 0.0) / size if size > 1e-9 else 0.0
-            reference_price = manager.taker_exit_reference_price(book=book) if book is not None else None
-            if book is None or not manager.taker_exit_required(book=book, entry_price=entry_price):
-                continue
-            target_price = manager.taker_exit_price(book=book)
-            if target_price is None or target_price <= 0:
-                continue
-
             opportunity_id = f"stop-exit:{market_slug}:{token_id}"
-            orderbook_telemetry = _book_telemetry(book)
-            spread = _float_or_none(getattr(book, "spread", None))
-            max_stop_spread = max(float(settings.near_close_stop_exit_max_spread), 0.0)
-            orderbook_telemetry.update(
-                {
-                    "max_stop_exit_spread": max_stop_spread,
-                    "panic_exit_wide_spread": bool(spread is not None and max_stop_spread > 0 and spread > max_stop_spread),
-                }
-            )
-
             outcome_label = str(group.get("outcome_label") or "Outcome")
             entry_metadata = repository.near_close_entry_metadata_for_position(
                 market_slug=market_slug,
                 token_id=token_id,
                 outcome_label=outcome_label,
             )
+            trade_autopsy_id = str(entry_metadata.get("trade_autopsy_id") or "").strip()
+            if not trade_autopsy_id:
+                trade_autopsy_id = ScannerRepository.make_trade_autopsy_id(
+                    market_slug=market_slug,
+                    token_id=token_id,
+                    outcome_label=outcome_label,
+                    order_id=str(group.get("source_order_id") or ""),
+                    opportunity_id=str(group.get("opportunity_id") or ""),
+                    created_at=str(group.get("latest_at") or ""),
+                )
             direction_allows_exit, direction_details = await _crypto_updown_direction_guard(
                 settings=settings,
                 market_slug=market_slug,
@@ -337,6 +419,92 @@ async def execute_near_close_taker_exits(
                 entry_metadata=entry_metadata,
                 price_cache=price_cache,
                 client_holder=client_holder,
+            )
+            reference_price = manager.taker_exit_reference_price(book=book) if book is not None else None
+            orderbook_telemetry = _book_telemetry(book)
+            spread = _float_or_none(getattr(book, "spread", None)) if book is not None else None
+            max_stop_spread = max(float(settings.near_close_stop_exit_max_spread), 0.0)
+            orderbook_telemetry.update(
+                {
+                    "max_stop_exit_spread": max_stop_spread,
+                    "panic_exit_wide_spread": bool(spread is not None and max_stop_spread > 0 and spread > max_stop_spread),
+                }
+            )
+            if book is None:
+                _record_stop_exit_check(
+                    repository=repository,
+                    opportunity_id=opportunity_id,
+                    trade_autopsy_id=trade_autopsy_id,
+                    market_slug=market_slug,
+                    token_id=token_id,
+                    outcome_label=outcome_label,
+                    entry_price=entry_price,
+                    size=size,
+                    book_source=book_source,
+                    reference_price=reference_price,
+                    target_price=None,
+                    stop_required=False,
+                    stop_reason="missing_orderbook",
+                    direction_details=direction_details,
+                    orderbook_telemetry=orderbook_telemetry,
+                )
+                continue
+            stop_required = manager.taker_exit_required(book=book, entry_price=entry_price)
+            target_price = manager.taker_exit_price(book=book)
+            if not stop_required:
+                _record_stop_exit_check(
+                    repository=repository,
+                    opportunity_id=opportunity_id,
+                    trade_autopsy_id=trade_autopsy_id,
+                    market_slug=market_slug,
+                    token_id=token_id,
+                    outcome_label=outcome_label,
+                    entry_price=entry_price,
+                    size=size,
+                    book_source=book_source,
+                    reference_price=reference_price,
+                    target_price=target_price,
+                    stop_required=False,
+                    stop_reason="stop_not_triggered",
+                    direction_details=direction_details,
+                    orderbook_telemetry=orderbook_telemetry,
+                )
+                continue
+            if target_price is None or target_price <= 0:
+                _record_stop_exit_check(
+                    repository=repository,
+                    opportunity_id=opportunity_id,
+                    trade_autopsy_id=trade_autopsy_id,
+                    market_slug=market_slug,
+                    token_id=token_id,
+                    outcome_label=outcome_label,
+                    entry_price=entry_price,
+                    size=size,
+                    book_source=book_source,
+                    reference_price=reference_price,
+                    target_price=target_price,
+                    stop_required=True,
+                    stop_reason="invalid_exit_target",
+                    direction_details=direction_details,
+                    orderbook_telemetry=orderbook_telemetry,
+                )
+                continue
+            _record_stop_exit_check(
+                repository=repository,
+                opportunity_id=opportunity_id,
+                trade_autopsy_id=trade_autopsy_id,
+                market_slug=market_slug,
+                token_id=token_id,
+                outcome_label=outcome_label,
+                entry_price=entry_price,
+                size=size,
+                book_source=book_source,
+                reference_price=reference_price,
+                target_price=target_price,
+                stop_required=True,
+                stop_reason="stop_triggered",
+                direction_details=direction_details,
+                orderbook_telemetry=orderbook_telemetry,
             )
             if not direction_allows_exit:
                 _record_stop_exit_skip(
@@ -352,6 +520,7 @@ async def execute_near_close_taker_exits(
                     entry_price=entry_price,
                     size=size,
                     details={
+                        "trade_autopsy_id": trade_autopsy_id,
                         "stop_orderbook_source": book_source,
                         **direction_details,
                         **orderbook_telemetry,
@@ -362,6 +531,23 @@ async def execute_near_close_taker_exits(
             assumed_fill = bool(group.get("assumed_fill"))
             source_order_id = str(group.get("source_order_id") or "").strip()
             if assumed_fill and not settings.near_close_assume_submitted_filled_stop_exit:
+                _record_stop_exit_check(
+                    repository=repository,
+                    opportunity_id=opportunity_id,
+                    trade_autopsy_id=trade_autopsy_id,
+                    market_slug=market_slug,
+                    token_id=token_id,
+                    outcome_label=outcome_label,
+                    entry_price=entry_price,
+                    size=size,
+                    book_source=book_source,
+                    reference_price=reference_price,
+                    target_price=target_price,
+                    stop_required=True,
+                    stop_reason="assumed_fill_stop_exit_disabled",
+                    direction_details=direction_details,
+                    orderbook_telemetry=orderbook_telemetry,
+                )
                 continue
 
             active_maker_order_ids = [
@@ -440,7 +626,11 @@ async def execute_near_close_taker_exits(
                         post_only=False,
                         metadata={
                             "strategy_variant": "near_close_stop_exit",
+                            "trade_autopsy_id": trade_autopsy_id,
                             "panic_exit": True,
+                            "exit_trigger_reason": "stop_triggered",
+                            "attempted_exit_price": target_price,
+                            "observed_bid_before_exit": orderbook_telemetry.get("observed_best_bid"),
                             "stop_trigger_price": settings.near_close_taker_exit_price,
                             "stop_reference_price": reference_price,
                             "stop_entry_price": entry_price,
@@ -473,6 +663,40 @@ async def execute_near_close_taker_exits(
             live_result = await live_trader.execute(plan)
             repository.save_live_execution(live_result)
             execution_telemetry = _execution_telemetry(live_result.leg_results)
+            first_execution = execution_telemetry[0] if execution_telemetry else {}
+            actual_matched_size = _float_or_none(first_execution.get("reported_matched_size"))
+            actual_matched_price = _float_or_none(first_execution.get("reported_execution_price"))
+            remaining_position = (max(size - actual_matched_size, 0.0) if actual_matched_size is not None else None)
+            exit_autopsy_details = {
+                "trade_autopsy_id": trade_autopsy_id,
+                "event_type": "panic_exit_attempt",
+                "trigger_reason": "stop_triggered",
+                "market_slug": market_slug,
+                "token_id": token_id,
+                "outcome": outcome_label,
+                "time_to_resolution_sec": _time_to_resolution_sec(market_slug),
+                "observed_bid_before_exit": orderbook_telemetry.get("observed_best_bid"),
+                "attempted_exit_price": target_price,
+                "order_type": live_result.order_type,
+                "order_id": first_execution.get("order_id"),
+                "exit_status": live_result.status,
+                "response": first_execution.get("response") if first_execution else None,
+                "actual_matched_size": actual_matched_size,
+                "actual_matched_price": actual_matched_price,
+                "remaining_position": remaining_position,
+                "reference_price": reference_price,
+                "entry_price": entry_price,
+                **direction_details,
+                **orderbook_telemetry,
+            }
+            repository.save_execution_event(
+                source="trade-autopsy",
+                mode="live",
+                opportunity_id=plan.opportunity_id,
+                status="trade_autopsy_exit",
+                message="Panic stop-exit attempt autopsy snapshot recorded.",
+                details=exit_autopsy_details,
+            )
             repository.save_execution_event(
                 source="watch",
                 mode="live",
@@ -480,6 +704,7 @@ async def execute_near_close_taker_exits(
                 status=live_result.status,
                 message=live_result.message,
                 details={
+                    "trade_autopsy_id": trade_autopsy_id,
                     "panic_exit": True,
                     "stop_trigger_price": settings.near_close_taker_exit_price,
                     "reference_price": reference_price,
@@ -510,6 +735,7 @@ async def execute_near_close_taker_exits(
             )
             exits.append(
                 {
+                    "trade_autopsy_id": trade_autopsy_id,
                     "market_slug": market_slug,
                     "token_id": token_id,
                     "status": live_result.status,

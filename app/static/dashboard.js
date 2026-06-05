@@ -47,6 +47,7 @@ const alertFeed = document.getElementById("alertFeed");
 const executionFeed = document.getElementById("executionFeed");
 const executionOrderFeed = document.getElementById("executionOrderFeed");
 const positionFeed = document.getElementById("positionFeed");
+const tradeAutopsyFeed = document.getElementById("tradeAutopsyFeed");
 const tradePnlValue = document.getElementById("tradePnlValue");
 const tradePnlMeta = document.getElementById("tradePnlMeta");
 const tradePnlNote = document.getElementById("tradePnlNote");
@@ -62,6 +63,7 @@ const TEXT = {
   noLiveOrders: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u771f\u5be6\u59d4\u8a17\u3002",
   noHeartbeats: "\u5c1a\u672a\u6709 watch \u5fc3\u8df3\u3002",
   noTrades: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u3002",
+  noTradeAutopsy: "\u5c1a\u672a\u5efa\u7acb trade autopsy\u3002",
   noTradeRecords: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u7d00\u9304",
   noMarkets: "\u5c1a\u672a\u540c\u6b65\u5e02\u5834\u8cc7\u6599\u3002",
   scanNow: "\u7acb\u5373\u6383\u63cf",
@@ -1075,6 +1077,68 @@ function renderTradeJournal(positions, tradeJournal) {
     .join("");
 }
 
+function renderTradeAutopsy(rows) {
+  if (!tradeAutopsyFeed) {
+    return;
+  }
+  const items = Array.isArray(rows) ? rows : [];
+  if (!items.length) {
+    tradeAutopsyFeed.innerHTML = `<p class="empty-block">${TEXT.noTradeAutopsy}</p>`;
+    return;
+  }
+  tradeAutopsyFeed.innerHTML = items
+    .map((item) => {
+      const pnl = item.realized_pnl === null || item.realized_pnl === undefined ? null : Number(item.realized_pnl);
+      const pnlClass = pnl === null ? "neutral" : pnl > 0 ? "positive" : pnl < 0 ? "negative" : "neutral";
+      const win =
+        item.did_bought_outcome_win === null || item.did_bought_outcome_win === undefined
+          ? "-"
+          : item.did_bought_outcome_win
+            ? "\u8d0f"
+            : "\u8f38";
+      const exitStatus = item.exit_status || (item.exit_attempted ? "\u5df2\u5617\u8a66" : "\u672a\u5617\u8a66");
+      const diagnosis = Array.isArray(item.diagnosis) && item.diagnosis.length
+        ? item.diagnosis.slice(0, 3).join(", ")
+        : item.last_stop_reason || "-";
+      return `
+        <article class="trade-autopsy-card">
+          <header>
+            <div>
+              <strong>${escapeHtml(item.market_slug || "-")}</strong>
+              <p>${escapeHtml(item.outcome || "-")} · ${escapeHtml(item.trade_autopsy_id || "-")}</p>
+            </div>
+            <span class="feed-pill ${pnlClass}">${escapeHtml(win)}</span>
+          </header>
+          <div class="trade-metric-grid">
+            <div>
+              <span>entry</span>
+              <strong>${item.entry_price === null || item.entry_price === undefined ? "-" : formatToken(item.entry_price)}</strong>
+            </div>
+            <div>
+              <span>fill</span>
+              <strong>${item.actual_fill_price === null || item.actual_fill_price === undefined ? "-" : formatToken(item.actual_fill_price)}</strong>
+            </div>
+            <div>
+              <span>stop checks</span>
+              <strong>${formatNumber(item.stop_check_count || 0)}</strong>
+            </div>
+            <div>
+              <span>PnL</span>
+              <strong>${pnl === null ? "-" : `${formatSignedToken(pnl)} pUSD`}</strong>
+            </div>
+          </div>
+          <div class="trade-group__summary">
+            <span>exit ${escapeHtml(String(exitStatus))}</span>
+            <span>last stop ${escapeHtml(String(item.last_stop_reason || "-"))}</span>
+            <span>${escapeHtml(String(diagnosis))}</span>
+          </div>
+          <time>${formatTime(item.latest_event_at)}</time>
+        </article>
+      `;
+    })
+    .join("");
+}
+
 function renderMarkets(markets) {
   if (!markets?.length) {
     marketList.innerHTML = `<p class="empty-block">${TEXT.noMarkets}</p>`;
@@ -1420,6 +1484,7 @@ function applyDashboardPayload(payload) {
   renderLiveOrders(payload.live_orders || []);
   renderExecutionEvents(payload.execution_events || []);
   renderTradeJournal(payload.trade_groups || payload.positions || [], payload.trade_journal || payload.pnl || {});
+  renderTradeAutopsy(payload.trade_autopsy || []);
   renderMarkets(payload.markets || []);
   renderTrading(
     payload.trading || latestTradingState,

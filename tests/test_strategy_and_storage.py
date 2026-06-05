@@ -1793,3 +1793,51 @@ def test_loss_autopsy_records_entry_books_stop_and_hedge_context(tmp_path) -> No
     assert details["hedge"]["observed"] is True
     assert "stop_exit_fak_no_match" in details["diagnosis"]
     assert "hedge_skipped_too_close_to_resolution" in details["diagnosis"]
+
+
+def test_trade_autopsy_entry_snapshot_is_reportable(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "trade-autopsy-entry.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="entry-autopsy",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="btc-up",
+                    market_slug="btc-updown-5m-1780202400",
+                    outcome_label="Up",
+                    target_price=0.88,
+                    requested_size=5.0,
+                    order_id="0xentry-autopsy",
+                    status="submitted",
+                    response={
+                        "strategy_variant": "near_close_maker",
+                        "time_to_resolution_sec": 45,
+                        "entry_price": 0.88,
+                        "best_bid": 0.87,
+                        "best_ask": 0.91,
+                        "spread": 0.04,
+                        "midpoint": 0.89,
+                        "bid_depth_at_best": 25,
+                        "ask_depth_at_best": 40,
+                        "crypto_start_distance": 0.0012,
+                    },
+                )
+            ],
+        )
+    )
+
+    row = repository.connection.fetchone("SELECT response_json FROM live_trades WHERE order_id = ?", ("0xentry-autopsy",))
+    response = json.loads(row["response_json"])
+    report = repository.trade_autopsy_report(limit=5)
+
+    assert response["trade_autopsy_id"].startswith("ta_")
+    assert response["entry_autopsy_snapshot"]["resolution_bucket_key"] == "1780202400"
+    assert report[0]["trade_autopsy_id"] == response["trade_autopsy_id"]
+    assert report[0]["entry_price"] == 0.88
+    assert report[0]["best_bid_at_entry"] == 0.87

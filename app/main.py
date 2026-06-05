@@ -532,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
         "watch",
         "backfill",
         "report",
+        "report-trade-autopsy",
         "research-near-close",
         "serve",
         "maintain-db",
@@ -1568,6 +1569,44 @@ def cmd_report(settings: Settings) -> None:
         console.print(f"Alert to fill latency: {latency if latency is not None else 'N/A'} sec")
 
 
+def cmd_report_trade_autopsy(settings: Settings) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    with closing(connect_db(settings)) as connection:
+        rows = ScannerRepository(connection).trade_autopsy_report(limit=20)
+
+    table = Table(title="Trade Autopsy Report")
+    table.add_column("Autopsy ID")
+    table.add_column("Market")
+    table.add_column("Outcome")
+    table.add_column("Entry", justify="right")
+    table.add_column("Fill", justify="right")
+    table.add_column("Stop Checks", justify="right")
+    table.add_column("Last Stop")
+    table.add_column("Exit")
+    table.add_column("Win")
+    table.add_column("PnL", justify="right")
+    for row in rows:
+        entry = row.get("entry_price")
+        fill = row.get("actual_fill_price")
+        pnl = row.get("realized_pnl")
+        table.add_row(
+            str(row.get("trade_autopsy_id") or ""),
+            str(row.get("market_slug") or ""),
+            str(row.get("outcome") or ""),
+            "N/A" if entry is None else f"{float(entry):.4f}",
+            "N/A" if fill is None else f"{float(fill):.4f}",
+            str(row.get("stop_check_count") or 0),
+            str(row.get("last_stop_reason") or "N/A"),
+            str(row.get("exit_status") or ("attempted" if row.get("exit_attempted") else "N/A")),
+            "N/A" if row.get("did_bought_outcome_win") is None else ("yes" if row.get("did_bought_outcome_win") else "no"),
+            "N/A" if pnl is None else f"{float(pnl):.4f}",
+        )
+    console.print(table)
+
+
 async def _refresh_near_close_research_markets(
     settings: Settings,
     repository: ScannerRepository,
@@ -1739,6 +1778,8 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await cmd_backfill(settings, args)
     elif args.command == "report":
         cmd_report(settings)
+    elif args.command == "report-trade-autopsy":
+        cmd_report_trade_autopsy(settings)
     elif args.command == "research-near-close":
         await cmd_research_near_close(settings, args)
     elif args.command == "maintain-db":

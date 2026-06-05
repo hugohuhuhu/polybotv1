@@ -365,6 +365,20 @@ def _is_closed_losing_market(payload: dict[str, Any], outcome_index: int) -> boo
         return False
 
 
+def _winning_outcome_label(payload: dict[str, Any], market: dict[str, Any]) -> str | None:
+    labels = [str(value) for value in _jsonish_list(payload.get("outcomes"))]
+    if not labels:
+        labels = [str(value) for value in market.get("outcome_labels") or []]
+    prices = _jsonish_list(payload.get("outcomePrices"))
+    for label, price in zip(labels, prices, strict=False):
+        try:
+            if float(price) >= 0.999:
+                return label
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _ctf_balance_data(wallet: str, token_id: str) -> str:
     return _encode_call("balanceOf(address,uint256)", [("address", wallet), ("uint256", int(token_id))])
 
@@ -477,6 +491,10 @@ def run_auto_redeem_once(
                         "token_id": token_id,
                         "outcome_index": outcome_index,
                         "outcome_prices": payload.get("outcomePrices"),
+                        "final_outcome": _winning_outcome_label(payload, market),
+                        "did_bought_outcome_win": False,
+                        "settlement_price": 0.0,
+                        "settlement_source": "gamma_outcomePrices",
                     }
                     message = "Conditional token expired worthless; no redeemable payout."
                     if condition_id:
@@ -532,6 +550,7 @@ def run_auto_redeem_once(
                             )
                             result.redeem_tx = redeem_tx
                             result.redeemed_size = _base_units_to_float(balance_units)
+                            settlement_details["redeem_amount"] = result.redeemed_size
                             message = "Redeemed zero-payout losing conditional token; shares were burned."
                     if result.trade_ids:
                         repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
@@ -567,21 +586,36 @@ def run_auto_redeem_once(
                 _ctf_balance_data(wallet, token_id),
             )
             if balance_units <= 0:
+                settlement_details = {
+                    "market_slug": result.market_slug,
+                    "outcome_label": result.outcome_label,
+                    "token_id": token_id,
+                    "condition_id": condition_id,
+                    "ctf_units": balance_units,
+                    "outcome_index": outcome_index,
+                    "outcome_prices": payload.get("outcomePrices"),
+                    "final_outcome": _winning_outcome_label(payload, market),
+                    "did_bought_outcome_win": True,
+                    "settlement_price": 1.0,
+                    "redeem_amount": 0.0,
+                    "settlement_source": "gamma_outcomePrices",
+                    "reason": "no_conditional_token_balance",
+                    "autopsy_reason": "redeemed_no_wallet_balance",
+                }
                 repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
+                if result.trade_ids:
+                    repository.save_trade_settlement_autopsy(
+                        result.trade_ids,
+                        risk_settings=_loss_autopsy_risk_settings(settings),
+                        settlement_details=settlement_details,
+                    )
                 repository.save_execution_event(
                     source="auto-redeem",
                     mode="live",
                     opportunity_id=str(candidate.get("opportunity_id") or ""),
                     status="redeemed",
                     message="Winning conditional token has no wallet balance; marking local position complete.",
-                    details={
-                        "market_slug": result.market_slug,
-                        "outcome_label": result.outcome_label,
-                        "token_id": token_id,
-                        "condition_id": condition_id,
-                        "ctf_units": balance_units,
-                        "reason": "no_conditional_token_balance",
-                    },
+                    details=settlement_details,
                 )
                 result.status = "redeemed"
                 result.message = "No conditional token balance to redeem; local position marked complete."
@@ -622,28 +656,44 @@ def run_auto_redeem_once(
                     amount_units=usdce_delta,
                 )
             repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
+            redeemed_size = _base_units_to_float(balance_units)
+            settlement_details = {
+                "market_slug": result.market_slug,
+                "outcome_label": result.outcome_label,
+                "token_id": token_id,
+                "condition_id": condition_id,
+                "index_set": index_set,
+                "ctf_units": balance_units,
+                "outcome_index": outcome_index,
+                "outcome_prices": payload.get("outcomePrices"),
+                "final_outcome": _winning_outcome_label(payload, market),
+                "did_bought_outcome_win": True,
+                "settlement_price": 1.0,
+                "redeem_amount": redeemed_size,
+                "redeem_tx": redeem_tx,
+                "approve_tx": approve_tx,
+                "wrap_tx": wrap_tx,
+                "usdce_delta": _base_units_to_float(usdce_delta),
+                "settlement_source": "gamma_outcomePrices",
+                "autopsy_reason": "redeemed",
+            }
+            if result.trade_ids:
+                repository.save_trade_settlement_autopsy(
+                    result.trade_ids,
+                    risk_settings=_loss_autopsy_risk_settings(settings),
+                    settlement_details=settlement_details,
+                )
             repository.save_execution_event(
                 source="auto-redeem",
                 mode="live",
                 opportunity_id=str(candidate.get("opportunity_id") or ""),
                 status="redeemed",
                 message="Redeemed winning conditional token and wrapped USDC.e to pUSD.",
-                details={
-                    "market_slug": result.market_slug,
-                    "outcome_label": result.outcome_label,
-                    "token_id": token_id,
-                    "condition_id": condition_id,
-                    "index_set": index_set,
-                    "ctf_units": balance_units,
-                    "redeem_tx": redeem_tx,
-                    "approve_tx": approve_tx,
-                    "wrap_tx": wrap_tx,
-                    "usdce_delta": _base_units_to_float(usdce_delta),
-                },
+                details=settlement_details,
             )
             result.status = "redeemed"
             result.message = "Redeemed and wrapped to pUSD."
-            result.redeemed_size = _base_units_to_float(balance_units)
+            result.redeemed_size = redeemed_size
             result.redeem_tx = redeem_tx
             result.approve_tx = approve_tx
             result.wrap_tx = wrap_tx
