@@ -407,6 +407,7 @@ function notOpenReasonLabel(reason) {
 }
 
 function liveOrderNotOpenDetail(order) {
+  const cancelDetail = order?.cancel_attempt?.detail;
   const rawReasons = Array.isArray(order?.not_open_reasons)
     ? order.not_open_reasons
     : order?.not_open_reason
@@ -415,10 +416,14 @@ function liveOrderNotOpenDetail(order) {
   const reasons = rawReasons.map((reason) => String(reason || "").trim()).filter(Boolean);
   const checkedAt = order?.cancel_reason_context?.cancel_reason_checked_at;
   const checkedAtText = checkedAt ? `\uff08\u53d6\u6d88\u5224\u5b9a ${formatTime(checkedAt)}\uff09` : "";
+  const detailText = String(cancelDetail || "");
+  const matchedCancel = Boolean(order?.cancel_attempt_matched) || /matched orders (can't|cannot) be canceled/i.test(detailText);
+  if (matchedCancel) {
+    return `\u53d6\u6d88\u5617\u8a66\uff1a\u5df2\u6210\u4ea4\uff0c\u7121\u6cd5\u53d6\u6d88${checkedAtText}`;
+  }
   if (!reasons.length) {
-    const detail = order?.cancel_attempt?.detail;
-    if (detail && detail !== "canceled") {
-      return `\u672a\u958b\u55ae\u539f\u56e0\uff1a${String(detail)}${checkedAtText}`;
+    if (cancelDetail && cancelDetail !== "canceled") {
+      return `\u672a\u958b\u55ae\u539f\u56e0\uff1a${String(cancelDetail)}${checkedAtText}`;
     }
     return "";
   }

@@ -234,6 +234,41 @@ async def _crypto_updown_direction_guard(
     return direction_broken, details
 
 
+def _crypto_updown_stop_hard_override(
+    *,
+    settings: Settings,
+    market_slug: str,
+    time_to_resolution_sec: float | None,
+    orderbook_telemetry: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    enabled = bool(settings.near_close_crypto_updown_stop_hard_override_enabled)
+    max_seconds = max(float(settings.near_close_crypto_updown_stop_hard_override_max_seconds), 0.0)
+    max_bid = max(float(settings.near_close_crypto_updown_stop_hard_override_max_bid), 0.0)
+    max_midpoint = max(float(settings.near_close_crypto_updown_stop_hard_override_max_midpoint), 0.0)
+    best_bid = _float_or_none(orderbook_telemetry.get("observed_best_bid"))
+    midpoint = _float_or_none(orderbook_telemetry.get("observed_midpoint"))
+    reasons: list[str] = []
+    if enabled and "updown" in str(market_slug).lower():
+        if max_seconds > 0 and time_to_resolution_sec is not None and time_to_resolution_sec <= max_seconds:
+            reasons.append("final_seconds")
+        if max_bid > 0 and best_bid is not None and best_bid <= max_bid:
+            reasons.append("best_bid_collapse")
+        if max_midpoint > 0 and midpoint is not None and midpoint <= max_midpoint:
+            reasons.append("midpoint_collapse")
+    active = bool(reasons)
+    return active, {
+        "crypto_direction_hard_override_enabled": enabled,
+        "crypto_direction_hard_override_active": active,
+        "crypto_direction_hard_override_reasons": reasons,
+        "crypto_direction_hard_override_time_to_resolution_sec": time_to_resolution_sec,
+        "crypto_direction_hard_override_max_seconds": max_seconds,
+        "crypto_direction_hard_override_max_bid": max_bid,
+        "crypto_direction_hard_override_max_midpoint": max_midpoint,
+        "crypto_direction_hard_override_best_bid": best_bid,
+        "crypto_direction_hard_override_midpoint": midpoint,
+    }
+
+
 def _record_stop_exit_skip(
     *,
     repository: ScannerRepository,
@@ -437,6 +472,15 @@ async def execute_near_close_taker_exits(
                     "panic_exit_wide_spread": bool(spread is not None and max_stop_spread > 0 and spread > max_stop_spread),
                 }
             )
+            time_to_resolution_sec = _time_to_resolution_sec(market_slug)
+            hard_override_allows_exit, hard_override_details = _crypto_updown_stop_hard_override(
+                settings=settings,
+                market_slug=market_slug,
+                time_to_resolution_sec=time_to_resolution_sec,
+                orderbook_telemetry=orderbook_telemetry,
+            )
+            effective_direction_allows_exit = direction_allows_exit or hard_override_allows_exit
+            stop_details = {**direction_details, **hard_override_details}
             if book is None:
                 _record_stop_exit_check(
                     repository=repository,
@@ -452,7 +496,7 @@ async def execute_near_close_taker_exits(
                     target_price=None,
                     stop_required=False,
                     stop_reason="missing_orderbook",
-                    direction_details=direction_details,
+                    direction_details=stop_details,
                     orderbook_telemetry=orderbook_telemetry,
                 )
                 continue
@@ -473,7 +517,7 @@ async def execute_near_close_taker_exits(
                     target_price=target_price,
                     stop_required=False,
                     stop_reason="stop_not_triggered",
-                    direction_details=direction_details,
+                    direction_details=stop_details,
                     orderbook_telemetry=orderbook_telemetry,
                 )
                 continue
@@ -492,7 +536,7 @@ async def execute_near_close_taker_exits(
                     target_price=target_price,
                     stop_required=True,
                     stop_reason="invalid_exit_target",
-                    direction_details=direction_details,
+                    direction_details=stop_details,
                     orderbook_telemetry=orderbook_telemetry,
                 )
                 continue
@@ -510,10 +554,30 @@ async def execute_near_close_taker_exits(
                 target_price=target_price,
                 stop_required=True,
                 stop_reason="stop_triggered",
-                direction_details=direction_details,
+                direction_details=stop_details,
                 orderbook_telemetry=orderbook_telemetry,
             )
-            if not direction_allows_exit:
+            if hard_override_allows_exit and not direction_allows_exit:
+                repository.save_execution_event(
+                    source="watch",
+                    mode="live",
+                    opportunity_id=opportunity_id,
+                    status="stop_exit_crypto_direction_hard_override",
+                    message="Panic FAK stop-exit bypassed crypto direction guard because hard risk override fired.",
+                    details={
+                        "market_slug": market_slug,
+                        "token_id": token_id,
+                        "reference_price": reference_price,
+                        "target_price": target_price,
+                        "entry_price": entry_price,
+                        "size": size,
+                        "trade_autopsy_id": trade_autopsy_id,
+                        "stop_orderbook_source": book_source,
+                        **stop_details,
+                        **orderbook_telemetry,
+                    },
+                )
+            if not effective_direction_allows_exit:
                 _record_stop_exit_skip(
                     repository=repository,
                     exits=exits,
@@ -529,7 +593,7 @@ async def execute_near_close_taker_exits(
                     details={
                         "trade_autopsy_id": trade_autopsy_id,
                         "stop_orderbook_source": book_source,
-                        **direction_details,
+                        **stop_details,
                         **orderbook_telemetry,
                     },
                 )
@@ -552,7 +616,7 @@ async def execute_near_close_taker_exits(
                     target_price=target_price,
                     stop_required=True,
                     stop_reason="assumed_fill_stop_exit_disabled",
-                    direction_details=direction_details,
+                    direction_details=stop_details,
                     orderbook_telemetry=orderbook_telemetry,
                 )
                 continue
@@ -644,7 +708,7 @@ async def execute_near_close_taker_exits(
                             "stop_limit_price": target_price,
                             "stop_slippage": settings.near_close_emergency_slippage,
                             "stop_orderbook_source": book_source,
-                            **direction_details,
+                            **stop_details,
                             "assumed_fill_stop_exit": assumed_fill,
                             "source_order_id": source_order_id or None,
                             "source_cancel_response": source_cancel_response,
@@ -693,7 +757,7 @@ async def execute_near_close_taker_exits(
                 "remaining_position": remaining_position,
                 "reference_price": reference_price,
                 "entry_price": entry_price,
-                **direction_details,
+                **stop_details,
                 **orderbook_telemetry,
             }
             repository.save_execution_event(
@@ -719,7 +783,7 @@ async def execute_near_close_taker_exits(
                     "target_price": target_price,
                     "slippage": settings.near_close_emergency_slippage,
                     "orderbook_source": book_source,
-                    **direction_details,
+                    **stop_details,
                     "assumed_fill_stop_exit": assumed_fill,
                     "source_order_id": source_order_id or None,
                     "source_cancel_response": source_cancel_response,

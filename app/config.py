@@ -196,6 +196,22 @@ class Settings(BaseSettings):
         default=0.00075,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_DIRECTION_BREAK_BUFFER",
     )
+    near_close_crypto_updown_stop_hard_override_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_ENABLED",
+    )
+    near_close_crypto_updown_stop_hard_override_max_seconds: float = Field(
+        default=10.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_SECONDS",
+    )
+    near_close_crypto_updown_stop_hard_override_max_bid: float = Field(
+        default=0.5,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_BID",
+    )
+    near_close_crypto_updown_stop_hard_override_max_midpoint: float = Field(
+        default=0.5,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_MIDPOINT",
+    )
     near_close_assume_submitted_filled_stop_exit: bool = Field(
         default=True,
         alias="NEAR_CLOSE_ASSUME_SUBMITTED_FILLED_STOP_EXIT",

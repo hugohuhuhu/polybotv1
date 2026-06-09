@@ -401,7 +401,11 @@ def test_near_close_taker_exit_skips_down_proxy_tie_at_start(tmp_path, monkeypat
         _execute_near_close_taker_exits(
             repository=repository,
             live_trader=trader,
-            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
+            settings=Settings(
+                NEAR_CLOSE_TAKER_EXIT_PRICE=0.52,
+                NEAR_CLOSE_HARD_STOP_OFFSET=0.2,
+                NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_ENABLED=False,
+            ),
             watch_books={"token-sol": make_book(bid=0.37, ask=0.38)},
         )
     )
@@ -411,6 +415,81 @@ def test_near_close_taker_exit_skips_down_proxy_tie_at_start(tmp_path, monkeypat
     assert exits[0]["crypto_stop_spot_price"] == 100.0
     assert exits[0]["crypto_direction_break_buffer"] == 0.00075
     assert exits[0]["crypto_direction_broken"] is False
+
+
+def test_near_close_taker_exit_hard_override_bypasses_intact_crypto_direction(tmp_path, monkeypatch) -> None:
+    class FakePriceClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def get_prices(self, symbols):
+            return {"BTCUSDT": 99.0}
+
+        async def close(self) -> None:
+            return None
+
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.plan = None
+
+        async def execute(self, plan):
+            self.plan = plan
+            return LiveExecutionResult(
+                opportunity_id=plan.opportunity_id,
+                status="submitted",
+                message="ok",
+                order_type=plan.legs[0].order_type,
+                leg_results=[],
+            )
+
+    monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    repository = ScannerRepository(connect_db(tmp_path / "stop-direction-hard-override.db"))
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "direction-hard-override-stop",
+                1,
+                "BUY",
+                "token-btc",
+                "btc-updown-15m-test",
+                "Down",
+                0.94,
+                5.0,
+                "0xopen",
+                "CONFIRMED",
+                json.dumps(
+                    {
+                        "strategy_variant": "near_close_maker",
+                        "crypto_start_price": 100.0,
+                        "crypto_winning_outcome": "Down",
+                    }
+                ),
+                "2026-05-14T00:58:16+00:00",
+            ),
+        )
+    trader = FakeTrader()
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
+            watch_books={"token-btc": make_book(bid=0.37, ask=0.38)},
+        )
+    )
+
+    assert trader.plan is not None
+    assert exits[0]["status"] == "submitted"
+    assert trader.plan.legs[0].order_type == "FAK"
+    assert trader.plan.legs[0].metadata["crypto_direction_broken"] is False
+    assert trader.plan.legs[0].metadata["crypto_direction_hard_override_active"] is True
+    assert "best_bid_collapse" in trader.plan.legs[0].metadata["crypto_direction_hard_override_reasons"]
 
 
 def test_near_close_taker_exit_allows_when_crypto_direction_breaks(tmp_path, monkeypatch) -> None:
@@ -602,7 +681,17 @@ def test_near_close_taker_exit_includes_matched_cancel_unconfirmed_order(tmp_pat
         [order_id],
         status="cancel_unconfirmed",
         cancel_response={"not_canceled": {order_id: "matched orders can't be canceled"}},
+        cancel_reason_by_order={
+            order_id: {
+                "not_open_reason": "would_cross_post_only",
+                "not_open_reasons": ["would_cross_post_only"],
+            }
+        },
     )
+    order = repository.recent_live_orders(limit=1)[0]
+    assert order["cancel_attempt_matched"] is True
+    assert order["not_open_reason"] is None
+    assert order["not_open_reasons"] == []
     trader = FakeTrader()
 
     asyncio.run(

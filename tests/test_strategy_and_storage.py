@@ -619,6 +619,15 @@ def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
         "0xlocalmaker": "CONFIRMED",
         "data-api:0xduplicatetx:duplicate-token:BUY": "MISATTRIBUTED_FILL_IGNORED",
     }
+    local_maker_row = repository.connection.fetchone(
+        "SELECT response_json FROM live_trades WHERE order_id = ?",
+        ("0xlocalmaker",),
+    )
+    local_maker_response = json.loads(local_maker_row["response_json"])
+    assert local_maker_response["actual_fill_source"] == "user_fill"
+    assert round(float(local_maker_response["actual_fill_price"]), 6) == 0.780000
+    assert round(float(local_maker_response["actual_matched_size"]), 6) == 3.285453
+    assert round(float(local_maker_response["clob_fill"]["price"]), 6) == 0.220000
     duplicate_group = next(
         group for group in repository.live_trade_groups(limit=10) if group["market_slug"] == "sol-updown-5m-1779611100"
     )

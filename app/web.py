@@ -626,6 +626,13 @@ def _trading_parameters_payload(
                         "value": "開" if settings.near_close_crypto_updown_stop_requires_direction_break else "關",
                     },
                     {"label": "方向破壞 buffer", "value": settings.near_close_crypto_updown_stop_direction_break_buffer},
+                    {
+                        "label": "Hard override",
+                        "value": "開" if settings.near_close_crypto_updown_stop_hard_override_enabled else "關",
+                    },
+                    {"label": "Hard override 秒數", "value": settings.near_close_crypto_updown_stop_hard_override_max_seconds, "unit": "秒"},
+                    {"label": "Hard override bid", "value": settings.near_close_crypto_updown_stop_hard_override_max_bid},
+                    {"label": "Hard override midpoint", "value": settings.near_close_crypto_updown_stop_hard_override_max_midpoint},
                     {"label": "SELL FAK 滑價", "value": settings.near_close_emergency_slippage},
                     {"label": "背景檢查間隔", "value": NEAR_CLOSE_STOP_EXIT_INTERVAL_SEC, "unit": "秒"},
                 ],

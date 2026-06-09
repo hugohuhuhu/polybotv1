@@ -1521,7 +1521,7 @@ class ScannerRepository:
         existing = self._load_json(existing_response_json, {})
         if not isinstance(existing, dict):
             existing = {}
-        autopsy_fields = self._fill_trade_autopsy_fields(fill, source="clob_fill")
+        autopsy_fields = self._fill_trade_autopsy_fields(user_fill, source="user_fill")
         return {
             **existing,
             **fill,
@@ -2983,6 +2983,18 @@ class ScannerRepository:
             elif action == "SELL" and status_bucket in {"matched", "finished"}:
                 current_value = notional
                 pnl = 0.0
+            cancel_attempt = response.get("cancel_attempt") if isinstance(response.get("cancel_attempt"), dict) else {}
+            cancel_attempt_matched = self._cancel_detail_indicates_matched(response)
+            show_not_open_reason = (
+                normalized_status in self.LIVE_JOURNAL_RESPONSE_RECHECK_STATUSES
+                and status_bucket not in {"matched", "settlement_pending", "finished"}
+                and not cancel_attempt_matched
+            )
+            not_open_reasons = (
+                response.get("not_open_reasons")
+                if show_not_open_reason and isinstance(response.get("not_open_reasons"), list)
+                else []
+            )
 
             orders.append(
                 {
@@ -3007,12 +3019,13 @@ class ScannerRepository:
                     "transaction_hash": response.get("transaction_hash") or response.get("transactionHash"),
                     "clob_fill_id": response.get("id"),
                     "trader_side": response.get("trader_side"),
-                    "not_open_reason": response.get("not_open_reason"),
-                    "not_open_reasons": response.get("not_open_reasons") if isinstance(response.get("not_open_reasons"), list) else [],
+                    "not_open_reason": response.get("not_open_reason") if show_not_open_reason else None,
+                    "not_open_reasons": not_open_reasons,
                     "cancel_reason_context": response.get("cancel_reason_context")
                     if isinstance(response.get("cancel_reason_context"), dict)
                     else {},
-                    "cancel_attempt": response.get("cancel_attempt") if isinstance(response.get("cancel_attempt"), dict) else {},
+                    "cancel_attempt": cancel_attempt,
+                    "cancel_attempt_matched": cancel_attempt_matched,
                     "created_at": row["created_at"],
                 }
             )
