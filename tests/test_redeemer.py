@@ -223,3 +223,51 @@ def test_auto_redeem_burns_zero_payout_wallet_position(monkeypatch) -> None:
     assert repository.events[0]["details"]["zero_payout_redeem"] is True
     assert repository.autopsies[0]["settlement_details"]["redeem_tx"] == "0xredeem"
     assert sent_transactions[0]["to"] == settings.polymarket_ctf_address
+
+
+def test_auto_redeem_wraps_wallet_usdce_without_redeem_candidate(monkeypatch) -> None:
+    settings = Settings(
+        POLYMARKET_PRIVATE_KEY="0x" + "1" * 64,
+        AUTO_REDEEM_ENABLED=True,
+        AUTO_REDEEM_MIN_USDCE=0.01,
+        POLYGON_USDC_E_TOKEN_ADDRESS="0x" + "2" * 40,
+        POLYGON_PUSD_TOKEN_ADDRESS="0x" + "3" * 40,
+        POLYMARKET_COLLATERAL_ONRAMP_ADDRESS="0x" + "4" * 40,
+    )
+    sent_transactions: list[dict] = []
+
+    monkeypatch.setattr(redeemer, "_fetch_redeemable_wallet_positions", lambda *_args: [])
+    monkeypatch.setattr(redeemer, "_rpc", lambda *_args: hex(settings.polymarket_chain_id))
+
+    def fake_call_uint(_client, _rpc_url, to, data):
+        if str(to).lower() == settings.polygon_usdc_e_token_address.lower():
+            if str(data).startswith("0xdd62ed3e"):
+                return 0
+            return 20_980_674
+        if str(to).lower() == settings.polygon_pusd_token_address.lower():
+            return 3_901_254
+        return 0
+
+    def fake_send_transaction(_client, _settings, **kwargs):
+        sent_transactions.append(kwargs)
+        if str(kwargs["to"]).lower() == settings.polygon_usdc_e_token_address.lower():
+            return "0xapprove"
+        return "0xwrap"
+
+    monkeypatch.setattr(redeemer, "_call_uint", fake_call_uint)
+    monkeypatch.setattr(redeemer, "_send_transaction", fake_send_transaction)
+    monkeypatch.setattr(redeemer, "_wait_receipt", lambda *_args: {"status": "0x1"})
+
+    repository = FakeRepository()
+    results = redeemer.run_auto_redeem_once(settings, repository)
+
+    assert len(results) == 1
+    assert results[0].status == "wrapped_usdce_to_pusd"
+    assert results[0].approve_tx == "0xapprove"
+    assert results[0].wrap_tx == "0xwrap"
+    assert repository.events[0]["status"] == "wrapped_usdce_to_pusd"
+    assert repository.events[0]["details"]["amount"] == 20.980674
+    assert [item["to"] for item in sent_transactions] == [
+        settings.polygon_usdc_e_token_address,
+        settings.polymarket_collateral_onramp_address,
+    ]

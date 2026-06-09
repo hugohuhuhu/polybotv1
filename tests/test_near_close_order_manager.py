@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
 from app.config import Settings
-from app.main import _sync_live_fills_to_db
+from app.main import _cancel_unqualified_near_close_orders, _sync_live_fills_to_db
 from app.models.core import BookLevel, LiveExecutionLegResult, LiveExecutionResult, OrderBookSnapshot
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
@@ -73,6 +74,77 @@ def test_near_close_manager_requires_entry_relative_taker_exit() -> None:
     assert manager.taker_exit_required(book=make_book(bid=0.84, ask=0.86), entry_price=0.87) is True
     assert manager.taker_exit_required(book=make_book(bid=0.85, ask=0.87), entry_price=0.87) is False
     assert manager.taker_exit_price(book=make_book(bid=0.84, ask=0.86)) == 0.83
+
+
+def test_cancel_unqualified_order_records_not_open_reason(tmp_path) -> None:
+    class FakeTrader:
+        async def cancel_orders(self, order_ids):
+            return {"canceled": order_ids}
+
+    class FakeCycle:
+        opportunities = []
+
+        def __init__(self, token_id: str) -> None:
+            self.books = {
+                token_id: OrderBookSnapshot(
+                    token_id=token_id,
+                    bids=[BookLevel(price=0.9, size=100)],
+                    asks=[BookLevel(price=0.96, size=100)],
+                )
+            }
+
+    repository = ScannerRepository(connect_db(tmp_path / "qualification-cancel-reason.db"))
+    token_id = "token-btc"
+    start_epoch = int(datetime.now(timezone.utc).timestamp()) - 290
+    market_slug = f"btc-updown-5m-{start_epoch}"
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "cancel-reason",
+                1,
+                "BUY",
+                token_id,
+                market_slug,
+                "Up",
+                0.9,
+                5.0,
+                "0xcancelreason",
+                "SUBMITTED",
+                json.dumps({"strategy_variant": "near_close_maker", "near_close_variant": "crypto_updown"}),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    asyncio.run(
+        _cancel_unqualified_near_close_orders(
+            cycle=FakeCycle(token_id),
+            repository=repository,
+            live_trader=FakeTrader(),
+            settings=Settings(NEAR_CLOSE_ENTRY_MIN_SECONDS=30, NEAR_CLOSE_ENTRY_MAX_SECONDS=60),
+        )
+    )
+
+    row = repository.connection.fetchone(
+        "SELECT status, response_json FROM live_trades WHERE order_id = ?",
+        ("0xcancelreason",),
+    )
+    response = json.loads(row["response_json"])
+    assert row["status"].upper() == "QUALIFICATION_CANCELLED"
+    assert response["not_open_reason"] == "entry_after_window"
+    assert "entry_after_window" in response["not_open_reasons"]
+    assert response["cancel_reason_context"]["trigger"] == "qualification_cancel"
+    assert 0 <= response["cancel_reason_context"]["time_to_resolution_sec"] <= 30
+    assert response["cancel_reason_context"]["cancel_reason_checked_at"]
+
+    order = repository.recent_live_orders(limit=1)[0]
+    assert order["not_open_reason"] == "entry_after_window"
+    assert "entry_after_window" in order["not_open_reasons"]
 
 
 def test_near_close_taker_exit_uses_fak_to_take_available_liquidity(tmp_path) -> None:

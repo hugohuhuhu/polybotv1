@@ -30,6 +30,7 @@ def test_wallet_status_reports_missing_private_key() -> None:
 def test_wallet_status_derives_address_and_balances(monkeypatch) -> None:
     balances = {
         "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": 12_500_000,
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": 8_750_000,
         "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": 3_250_000,
     }
 
@@ -61,6 +62,7 @@ def test_wallet_status_derives_address_and_balances(monkeypatch) -> None:
     balance_map = {item["symbol"]: item["amount"] for item in status["balances"]}
     assert balance_map["POL"] == 1.5
     assert balance_map["USDC"] == 12.5
+    assert balance_map["USDC.e"] == 8.75
     assert balance_map["pUSD"] == 3.25
     assert status["portfolio"]["position_value"] == 24.995
     assert status["portfolio"]["source"] == "polymarket_data_api"

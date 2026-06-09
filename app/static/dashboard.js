@@ -384,6 +384,47 @@ function liveOrderStatusClass(status) {
   return "problem";
 }
 
+function notOpenReasonLabel(reason) {
+  const mapping = {
+    entry_after_window: "\u5df2\u904e\u9032\u5834\u6642\u9593\u7a97",
+    entry_before_window: "\u5c1a\u672a\u9032\u5165\u9032\u5834\u6642\u9593\u7a97",
+    final_seconds_entry_disabled: "\u6700\u5f8c\u79d2\u6578\u9032\u5834\u672a\u958b\u653e",
+    missing_time_to_resolution: "\u7f3a\u5c11\u7d50\u7b97\u5012\u6578",
+    best_ask_below_floor: "best ask \u4f4e\u65bc\u4e0b\u9650",
+    best_ask_below_min: "best ask \u4f4e\u65bc\u4e0b\u9650",
+    midpoint_below_floor: "midpoint \u4f4e\u65bc\u4e0b\u9650",
+    midpoint_below_min: "midpoint \u4f4e\u65bc\u4e0b\u9650",
+    spread_too_wide: "spread \u904e\u5927",
+    spread_above_max: "spread \u904e\u5927",
+    would_cross_post_only: "post-only \u6703\u8de8\u50f9",
+    bid_depth_below_min: "\u8cb7\u76e4\u6df1\u5ea6\u4e0d\u8db3",
+    bid_at_or_above_skip: "bid \u904e\u9ad8\uff0c\u4e0d\u8ffd\u50f9",
+    missing_orderbook: "\u7f3a\u5c11 orderbook",
+    scanner_criteria_not_passed: "\u5df2\u4e0d\u7b26\u5408\u6383\u63cf\u689d\u4ef6",
+    reprice_target_changed: "\u91cd\u65b0\u5b9a\u50f9\u53d6\u6d88\u820a\u55ae",
+  };
+  return mapping[reason] || reason;
+}
+
+function liveOrderNotOpenDetail(order) {
+  const rawReasons = Array.isArray(order?.not_open_reasons)
+    ? order.not_open_reasons
+    : order?.not_open_reason
+      ? [order.not_open_reason]
+      : [];
+  const reasons = rawReasons.map((reason) => String(reason || "").trim()).filter(Boolean);
+  const checkedAt = order?.cancel_reason_context?.cancel_reason_checked_at;
+  const checkedAtText = checkedAt ? `\uff08\u53d6\u6d88\u5224\u5b9a ${formatTime(checkedAt)}\uff09` : "";
+  if (!reasons.length) {
+    const detail = order?.cancel_attempt?.detail;
+    if (detail && detail !== "canceled") {
+      return `\u672a\u958b\u55ae\u539f\u56e0\uff1a${String(detail)}${checkedAtText}`;
+    }
+    return "";
+  }
+  return `\u672a\u958b\u55ae\u539f\u56e0\uff1a${reasons.map(notOpenReasonLabel).join("\uff0c")}${checkedAtText}`;
+}
+
 function riskReasonLabel(item) {
   const message = String(item?.message || "");
   const mapping = [
@@ -928,6 +969,7 @@ function renderLiveOrders(orders) {
         isMatched && order.market_url
           ? `<a href="${escapeHtml(order.market_url)}" target="_blank" rel="noreferrer">${title}</a>`
           : title;
+      const notOpenDetail = liveOrderNotOpenDetail(order);
       return `
         <article class="order-card">
           <header>
@@ -942,6 +984,7 @@ function renderLiveOrders(orders) {
             <span>${valueTitle} ${valueLabel}</span>
             <span>${pnlTitle} ${pnlLabel}</span>
           </div>
+          ${notOpenDetail ? `<p>${escapeHtml(notOpenDetail)}</p>` : ""}
           <time>${formatTime(order.created_at)}</time>
         </article>
       `;
@@ -1390,7 +1433,7 @@ function renderWallet(wallet) {
   const balances = Object.fromEntries((wallet.balances || []).map((item) => [item.symbol, item]));
   walletAddress.textContent = wallet.address || "-";
   walletPol.textContent = formatToken(balances.POL?.amount);
-  walletUsdc.textContent = formatToken(balances.USDC?.amount);
+  walletUsdc.textContent = formatToken(balances["USDC.e"]?.amount);
   walletPusd.textContent = formatToken(balances.pUSD?.amount);
 }
 

@@ -7,7 +7,7 @@ from math import log1p
 import re
 
 from app.clients.clob_client import ClobClient
-from app.clients.crypto_price_client import CryptoPriceClient, binance_symbol_for_asset
+from app.clients.crypto_price_client import crypto_price_client_from_settings, binance_symbol_for_asset
 from app.clients.gamma_client import GammaClient
 from app.config import Settings
 from app.models.core import EventRecord, MarketRecord, Opportunity, OrderBookSnapshot
@@ -215,12 +215,13 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
     if not symbols:
         return
-    client = CryptoPriceClient(timeout=settings.crypto_price_timeout_sec)
+    client = crypto_price_client_from_settings(settings)
     try:
         prices = await client.get_prices(symbols)
         start_prices = await client.get_open_prices_for_requests(start_price_requests) if start_price_requests else {}
     finally:
         await client.close()
+    price_source = getattr(client, "source", "unknown")
     for market in markets:
         parsed = parsed_by_market.get(market.market_id)
         if parsed is not None:
@@ -233,6 +234,7 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
             market.raw["near_close_crypto_symbol"] = symbol
             market.raw["near_close_crypto_side"] = side
             market.raw["near_close_crypto_spot_price"] = spot
+            market.raw["near_close_crypto_spot_source"] = price_source
             market.raw["near_close_crypto_strike_price"] = strike
             market.raw["near_close_crypto_strike_distance"] = abs(spot - strike) / strike
             market.raw["near_close_crypto_winning_outcome"] = "Yes" if condition_true else "No"
@@ -249,7 +251,9 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         market.raw["near_close_crypto_symbol"] = symbol
         market.raw["near_close_crypto_side"] = "updown"
         market.raw["near_close_crypto_spot_price"] = spot
+        market.raw["near_close_crypto_spot_source"] = price_source
         market.raw["near_close_crypto_start_price"] = start_price
+        market.raw["near_close_crypto_start_price_source"] = price_source
         market.raw["near_close_crypto_start_time"] = start_time.isoformat()
         market.raw["near_close_crypto_start_distance"] = abs(spot - start_price) / start_price
         market.raw["near_close_crypto_winning_outcome"] = "Up" if spot > start_price else "Down"

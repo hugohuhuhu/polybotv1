@@ -75,6 +75,17 @@ class Settings(BaseSettings):
     gamma_timeout_sec: float = Field(default=15.0, alias="GAMMA_TIMEOUT_SEC")
     gamma_retries: int = Field(default=3, alias="GAMMA_RETRIES")
     crypto_price_timeout_sec: float = Field(default=8.0, alias="CRYPTO_PRICE_TIMEOUT_SEC")
+    crypto_price_source: str = Field(default="chainlink", alias="CRYPTO_PRICE_SOURCE")
+    chainlink_price_stale_sec: float = Field(default=3600.0, alias="CHAINLINK_PRICE_STALE_SEC")
+    chainlink_price_feed_addresses: str = Field(
+        default=(
+            "BTCUSDT:0xc907E116054Ad103354f2D350FD2514433D57F6f,"
+            "ETHUSDT:0xF9680D99D6C9589e2a93a78A04A279e509205945,"
+            "SOLUSDT:0x10C8264C0935b3B9870013e057f330Ff3e9C56dC,"
+            "BNBUSDT:0x82a6c4AF830caa6c97bb504425f6A66165C2c26e"
+        ),
+        alias="CHAINLINK_PRICE_FEED_ADDRESSES",
+    )
     min_minutes_to_resolution: int = Field(default=120, alias="MIN_MINUTES_TO_RESOLUTION")
     candidate_min_minutes_to_resolution: int = Field(default=30, alias="CANDIDATE_MIN_MINUTES_TO_RESOLUTION")
     allow_near_resolution: bool = Field(default=False, alias="ALLOW_NEAR_RESOLUTION")

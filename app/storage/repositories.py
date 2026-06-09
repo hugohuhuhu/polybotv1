@@ -773,11 +773,12 @@ class ScannerRepository:
         *,
         status: str = "cancelled",
         cancel_response: object | None = None,
+        cancel_reason_by_order: dict[str, Any] | None = None,
     ) -> int:
         cleaned = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
         if not cleaned:
             return 0
-        if cancel_response is None:
+        if cancel_response is None and not cancel_reason_by_order:
             placeholders = ",".join("?" for _ in cleaned)
             with self.connection.transaction():
                 cursor = self.connection.execute(
@@ -806,10 +807,16 @@ class ScannerRepository:
                 response = self._load_json(row.get("response_json"), {})
                 if not isinstance(response, dict):
                     response = {}
-                response["cancel_attempt"] = {
-                    "status": status,
-                    "detail": self._cancel_response_detail(cancel_response, order_id),
-                }
+                cancel_detail = self._cancel_response_detail(cancel_response, order_id) if cancel_response is not None else None
+                if cancel_detail is not None:
+                    response["cancel_attempt"] = {
+                        "status": status,
+                        "detail": cancel_detail,
+                    }
+                self._merge_not_open_reason(
+                    response,
+                    self._cancel_reason_for_order(cancel_reason_by_order, order_id),
+                )
                 cursor = self.connection.execute(
                     """
                     UPDATE live_trades
@@ -880,6 +887,14 @@ class ScannerRepository:
 
     @staticmethod
     def _parse_slug_end_timestamp(slug: str) -> float | None:
+        updown_match = re.search(r"-updown-(\d+)m-(\d{10})$", slug)
+        if updown_match:
+            try:
+                minutes = int(updown_match.group(1))
+                start_ts = float(updown_match.group(2))
+            except ValueError:
+                return None
+            return start_ts + minutes * 60
         epoch_match = re.search(r"-(\d{10})$", slug)
         if epoch_match:
             try:
@@ -1115,6 +1130,34 @@ class ScannerRepository:
         if isinstance(canceled, list) and order_id in {str(item) for item in canceled}:
             return "canceled"
         return cancel_response
+
+    @staticmethod
+    def _cancel_reason_for_order(cancel_reason_by_order: dict[str, Any] | None, order_id: str) -> dict[str, Any] | None:
+        if not isinstance(cancel_reason_by_order, dict):
+            return None
+        detail = cancel_reason_by_order.get(order_id)
+        if detail is None:
+            detail = cancel_reason_by_order.get(str(order_id))
+        return detail if isinstance(detail, dict) else None
+
+    @staticmethod
+    def _merge_not_open_reason(response: dict[str, Any], reason_detail: dict[str, Any] | None) -> None:
+        if not reason_detail:
+            return
+        reason = str(reason_detail.get("not_open_reason") or "").strip()
+        reasons = reason_detail.get("not_open_reasons")
+        if not isinstance(reasons, list):
+            reasons = [reason] if reason else []
+        clean_reasons = [str(item).strip() for item in reasons if str(item or "").strip()]
+        if clean_reasons:
+            response["not_open_reason"] = clean_reasons[0]
+            response["not_open_reasons"] = list(dict.fromkeys(clean_reasons))
+        elif reason:
+            response["not_open_reason"] = reason
+            response["not_open_reasons"] = [reason]
+        context = reason_detail.get("cancel_reason_context")
+        if isinstance(context, dict):
+            response["cancel_reason_context"] = context
 
     @staticmethod
     def _cancel_detail_indicates_matched(response: dict[str, Any]) -> bool:
@@ -2891,6 +2934,8 @@ class ScannerRepository:
             notional = effective_price * size
             action = str(row["action"] or "").upper()
             response = self._load_json(row.get("response_json"), {})
+            if not isinstance(response, dict):
+                response = {}
             normalized_status = self._normalized_live_trade_status(row)
             status_bucket = self._live_order_status_bucket(normalized_status)
             market_slug = str(row["market_slug"] or "")
@@ -2962,6 +3007,12 @@ class ScannerRepository:
                     "transaction_hash": response.get("transaction_hash") or response.get("transactionHash"),
                     "clob_fill_id": response.get("id"),
                     "trader_side": response.get("trader_side"),
+                    "not_open_reason": response.get("not_open_reason"),
+                    "not_open_reasons": response.get("not_open_reasons") if isinstance(response.get("not_open_reasons"), list) else [],
+                    "cancel_reason_context": response.get("cancel_reason_context")
+                    if isinstance(response.get("cancel_reason_context"), dict)
+                    else {},
+                    "cancel_attempt": response.get("cancel_attempt") if isinstance(response.get("cancel_attempt"), dict) else {},
                     "created_at": row["created_at"],
                 }
             )

@@ -36,6 +36,7 @@ from app.storage.backups import backup_sqlite_database
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
+from app.strategy.near_close_order_manager import NearCloseOrderManager
 from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, resolve_funder_address
 from app.strategy.post_fill_hedge import execute_post_fill_hedges
@@ -247,6 +248,91 @@ def _split_cancel_response(order_ids: list[str], response: object) -> tuple[list
     return canceled_ids, uncertain_ids
 
 
+def _slug_seconds_to_resolution(market_slug: str, *, at: datetime | None = None) -> float | None:
+    end_ts = ScannerRepository._parse_slug_end_timestamp(str(market_slug or ""))
+    if end_ts is None:
+        return None
+    checked_at = at or datetime.now(timezone.utc)
+    return float(end_ts) - checked_at.timestamp()
+
+
+def _near_close_order_cancel_reason(
+    *,
+    order: dict[str, Any],
+    books: dict[str, Any],
+    qualified_pairs: set[tuple[str, str]],
+    settings: Settings,
+    trigger: str,
+) -> dict[str, Any]:
+    market_slug = str(order.get("market_slug") or "")
+    token_id = str(order.get("token_id") or "")
+    response = order.get("response") if isinstance(order.get("response"), dict) else {}
+    variant = str(response.get("near_close_variant") or response.get("variant") or "official")
+    if response.get("market_filter_reason") == "crypto_updown_proxy_price_ready":
+        variant = "crypto_updown"
+    book = books.get(token_id)
+    checked_at = datetime.now(timezone.utc)
+    seconds_left = _slug_seconds_to_resolution(market_slug, at=checked_at)
+    reasons: list[str] = []
+    entry_price = float(order.get("target_price") or response.get("entry_bid") or response.get("entry_price") or 0.0)
+    try:
+        crypto_strike_distance = float(response.get("crypto_strike_distance"))
+    except (TypeError, ValueError):
+        crypto_strike_distance = None
+    context: dict[str, Any] = {
+        "trigger": trigger,
+        "market_slug": market_slug,
+        "token_id": token_id,
+        "order_id": str(order.get("order_id") or ""),
+        "entry_price": entry_price,
+        "near_close_variant": variant,
+        "cancel_reason_checked_at": checked_at.isoformat(),
+        "time_to_resolution_sec": seconds_left,
+        "qualified_pair": (market_slug, token_id) in qualified_pairs,
+    }
+    if book is None:
+        reasons.append("missing_orderbook")
+    else:
+        manager = NearCloseOrderManager(settings)
+        reasons.extend(
+            manager.entry_cancel_reasons(
+                book=book,
+                minutes_to_end=(seconds_left / 60.0) if seconds_left is not None else None,
+                entry_price=entry_price,
+                variant=variant,
+                crypto_strike_distance=crypto_strike_distance,
+            )
+        )
+        best_bid = book.best_bid
+        best_ask = book.best_ask
+        bid_depth = book.depth_for_side("bid", best_bid) if best_bid is not None else None
+        ask_depth = book.depth_for_side("ask", best_ask) if best_ask is not None else None
+        min_depth = settings.near_close_crypto_updown_min_depth if variant == "crypto_updown" else settings.near_close_min_depth
+        if bid_depth is not None and bid_depth < min_depth:
+            reasons.append("bid_depth_below_min")
+        if variant == "crypto_updown" and best_bid is not None and best_bid >= settings.near_close_crypto_updown_skip_bid_at_or_above:
+            reasons.append("bid_at_or_above_skip")
+        context.update(
+            {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": book.spread,
+                "midpoint": book.midpoint,
+                "bid_depth_at_best": bid_depth,
+                "ask_depth_at_best": ask_depth,
+                "min_depth": min_depth,
+            }
+        )
+    clean_reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    if not clean_reasons:
+        clean_reasons = ["scanner_criteria_not_passed"]
+    return {
+        "not_open_reason": clean_reasons[0],
+        "not_open_reasons": clean_reasons,
+        "cancel_reason_context": context,
+    }
+
+
 async def _sync_live_fills_to_db(
     *,
     repository: ScannerRepository,
@@ -379,6 +465,7 @@ async def _manage_near_close_reprice(
     now_ts = time()
     stale_order_ids: list[str] = []
     held_orders: list[dict[str, object]] = []
+    cancel_reason_by_order: dict[str, dict[str, Any]] = {}
     for order in active_orders:
         order_id = str(order.get("order_id") or "").strip()
         if not order_id:
@@ -395,6 +482,20 @@ async def _manage_near_close_reprice(
             held_orders.append(order)
             continue
         stale_order_ids.append(order_id)
+        cancel_reason_by_order[order_id] = {
+            "not_open_reason": "reprice_target_changed",
+            "not_open_reasons": ["reprice_target_changed"],
+            "cancel_reason_context": {
+                "trigger": "reprice_cancel",
+                "order_id": order_id,
+                "market_slug": str(order.get("market_slug") or ""),
+                "token_id": str(order.get("token_id") or ""),
+                "old_entry_price": order_price,
+                "new_entry_price": target_price,
+                "price_delta": price_delta,
+                "age_sec": age_sec,
+            },
+        }
 
     if not stale_order_ids:
         return True
@@ -420,11 +521,17 @@ async def _manage_near_close_reprice(
         return True
 
     canceled_ids, uncertain_ids = _split_cancel_response(stale_order_ids, cancel_response)
-    updated = repository.mark_live_orders_cancelled(canceled_ids, status="reprice_cancelled")
+    updated = repository.mark_live_orders_cancelled(
+        canceled_ids,
+        status="reprice_cancelled",
+        cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
+    )
     uncertain_updated = repository.mark_live_orders_cancelled(
         uncertain_ids,
         status="cancel_unconfirmed",
         cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
     )
     repository.save_execution_event(
         source="watch",
@@ -440,6 +547,7 @@ async def _manage_near_close_reprice(
             "unconfirmed_updated_rows": uncertain_updated,
             "target_price": target_price,
             "cancel_response": cancel_response,
+            "cancel_reason_by_order": cancel_reason_by_order,
         },
     )
     return bool(held_orders)
@@ -450,6 +558,7 @@ async def _cancel_unqualified_near_close_orders(
     cycle: object,
     repository: ScannerRepository,
     live_trader: PolymarketLiveTradingAdapter,
+    settings: Settings,
 ) -> None:
     active_orders = repository.near_close_active_orders_for_market()
     if not active_orders:
@@ -466,6 +575,7 @@ async def _cancel_unqualified_near_close_orders(
 
     books = getattr(cycle, "books", {}) or {}
     cancel_ids: list[str] = []
+    cancel_reason_by_order: dict[str, dict[str, Any]] = {}
     for order in active_orders:
         market_slug = str(order.get("market_slug") or "")
         token_id = str(order.get("token_id") or "")
@@ -477,6 +587,13 @@ async def _cancel_unqualified_near_close_orders(
         if (market_slug, token_id) in qualified_pairs:
             continue
         cancel_ids.append(order_id)
+        cancel_reason_by_order[order_id] = _near_close_order_cancel_reason(
+            order=order,
+            books=books,
+            qualified_pairs=qualified_pairs,
+            settings=settings,
+            trigger="qualification_cancel",
+        )
 
     if not cancel_ids:
         return
@@ -499,11 +616,17 @@ async def _cancel_unqualified_near_close_orders(
         return
 
     canceled_ids, uncertain_ids = _split_cancel_response(cancel_ids, cancel_response)
-    updated = repository.mark_live_orders_cancelled(canceled_ids, status="qualification_cancelled")
+    updated = repository.mark_live_orders_cancelled(
+        canceled_ids,
+        status="qualification_cancelled",
+        cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
+    )
     uncertain_updated = repository.mark_live_orders_cancelled(
         uncertain_ids,
         status="cancel_unconfirmed",
         cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
     )
     repository.save_execution_event(
         source="watch",
@@ -518,6 +641,7 @@ async def _cancel_unqualified_near_close_orders(
             "updated_rows": updated,
             "unconfirmed_updated_rows": uncertain_updated,
             "cancel_response": cancel_response,
+            "cancel_reason_by_order": cancel_reason_by_order,
         },
     )
 
@@ -1211,6 +1335,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         cycle=cycle,
                         repository=repository,
                         live_trader=live_trader,
+                        settings=runtime_settings,
                     )
                     try:
                         await execute_near_close_taker_exits(

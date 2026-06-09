@@ -60,6 +60,40 @@ function Clear-InvalidPrivateKeyOverride {
     }
 }
 
+function Enable-AutoExecuteIfPreflightReady {
+    $controlCode = @'
+import asyncio
+
+from app.config import Settings
+from app.models.runtime import TradingControls
+from app.services.preflight import load_preflight_report
+from app.storage.db import connect_db
+from app.storage.repositories import ScannerRepository
+
+
+async def main() -> None:
+    settings = Settings()
+    report = await load_preflight_report(settings, verify_clob_credentials=False)
+    controls = TradingControls(
+        live_trading_enabled=True,
+        auto_execute_enabled=report.ready,
+        kill_switch_enabled=False,
+    )
+    repo = ScannerRepository(connect_db(settings))
+    repo.save_trading_controls(controls)
+    if report.ready:
+        print("Runtime controls armed: live=true auto=true kill_switch=false")
+    else:
+        print("Runtime controls not armed; preflight blockers:")
+        for reason in report.blocking_reasons:
+            print(f"- {reason}")
+
+
+asyncio.run(main())
+'@
+    $controlCode | & $python -
+}
+
 if (-not (Test-Path $python)) {
     Write-Host "Python not found:"
     Write-Host $python
@@ -169,6 +203,8 @@ $env:CRYPTO_PRICE_TIMEOUT_SEC = "1"
 $env:BOOK_FETCH_TIMEOUT_SEC = "1.5"
 $env:BOOK_FETCH_RETRIES = "1"
 $env:BOOK_FETCH_CONCURRENCY = "12"
+
+Enable-AutoExecuteIfPreflightReady
 
 Write-Host "[1/3] Starting dashboard..."
 Stop-WatchFromPidFiles

@@ -165,7 +165,13 @@ async def _crypto_price(
         return cache[symbol]
     client = client_holder.get("client")
     if client is None:
-        client = CryptoPriceClient(timeout=settings.crypto_price_timeout_sec)
+        client = CryptoPriceClient(
+            timeout=settings.crypto_price_timeout_sec,
+            source=settings.crypto_price_source,
+            rpc_url=settings.polygon_rpc_url,
+            chainlink_feeds=settings.chainlink_price_feed_addresses,
+            chainlink_stale_after_sec=settings.chainlink_price_stale_sec,
+        )
         client_holder["client"] = client
     prices = await client.get_prices({symbol})
     price = prices.get(symbol)
@@ -197,6 +203,7 @@ async def _crypto_updown_direction_guard(
             "crypto_stop_symbol": symbol,
             "crypto_stop_outcome": outcome or None,
             "crypto_stop_start_price": start_price,
+            "crypto_stop_price_source": settings.crypto_price_source,
         }
     )
     if start_price is None or start_price <= 0 or outcome not in {"up", "down"}:

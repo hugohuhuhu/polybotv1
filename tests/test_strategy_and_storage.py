@@ -106,9 +106,9 @@ def test_orderbook_snapshots_dedupe_by_token_and_minute(tmp_path) -> None:
 
 
 def test_near_close_resolution_bucket_uses_utc_five_minute_cutoffs() -> None:
-    assert ScannerRepository.near_close_resolution_bucket_key("btc-updown-5m-1780202700") == "1780202700"
-    assert ScannerRepository.near_close_resolution_bucket_key("sol-updown-5m-1780202671") == "1780202700"
-    assert ScannerRepository.near_close_resolution_bucket_key("eth-updown-5m-1780202412") == "1780202700"
+    assert ScannerRepository.near_close_resolution_bucket_key("btc-updown-5m-1780202700") == "1780203000"
+    assert ScannerRepository.near_close_resolution_bucket_key("sol-updown-5m-1780202671") == "1780203000"
+    assert ScannerRepository.near_close_resolution_bucket_key("eth-updown-5m-1780202412") == "1780203000"
 
 
 def test_database_maintenance_keeps_daily_summary_and_prunes_raw_rows(tmp_path) -> None:
@@ -1129,7 +1129,7 @@ def test_near_close_signal_replay_report_groups_settled_opportunities(tmp_path) 
 
 def test_expire_open_orders_for_ended_timestamp_slug_without_market_row(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-slug-orders.db"))
-    ended_slug = f"doge-updown-5m-{int(time.time()) - 60}"
+    ended_slug = f"doge-updown-5m-{int(time.time()) - 360}"
     repository.save_live_execution(
         LiveExecutionResult(
             opportunity_id="ended-slug-live",
@@ -1195,7 +1195,7 @@ def test_expire_open_orders_for_ended_et_slug_without_market_row(tmp_path) -> No
 def test_recent_live_orders_use_settlement_value_after_market_end(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-confirmed-order.db"))
     token_id = "btc-up"
-    slug = f"btc-updown-15m-{int(time.time()) - 60}"
+    slug = f"btc-updown-15m-{int(time.time()) - 960}"
     repository.save_markets(
         [EventRecord(event_id="event-ended", title="Ended", active=True, closed=False)],
         [
@@ -1268,7 +1268,7 @@ def test_recent_live_orders_use_settlement_value_after_market_end(tmp_path) -> N
 def test_recent_live_orders_use_outcome_prices_after_market_end(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-outcome-prices-order.db"))
     token_id = "sol-up"
-    slug = f"sol-updown-15m-{int(time.time()) - 60}"
+    slug = f"sol-updown-15m-{int(time.time()) - 960}"
     repository.save_markets(
         [EventRecord(event_id="event-ended-prices", title="Ended", active=True, closed=True)],
         [
@@ -1387,7 +1387,7 @@ def test_live_trade_groups_offset_settled_lost_entry_with_stop_exit_sell(tmp_pat
 def test_recent_live_orders_do_not_use_entry_prediction_as_settlement_winner(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-response-winner-order.db"))
     token_id = "eth-up"
-    slug = f"eth-updown-15m-{int(time.time()) - 60}"
+    slug = f"eth-updown-15m-{int(time.time()) - 960}"
     repository.save_live_execution(
         LiveExecutionResult(
             opportunity_id="ended-response-winner",
@@ -1427,7 +1427,7 @@ def test_recent_live_orders_do_not_use_entry_prediction_as_settlement_winner(tmp
 def test_recent_live_orders_fall_back_to_book_value_for_unresolved_matched_order(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-unresolved-order.db"))
     token_id = "sol-up"
-    slug = f"sol-updown-15m-{int(time.time()) - 60}"
+    slug = f"sol-updown-15m-{int(time.time()) - 960}"
     repository.save_live_execution(
         LiveExecutionResult(
             opportunity_id="ended-unresolved",
@@ -1837,7 +1837,7 @@ def test_trade_autopsy_entry_snapshot_is_reportable(tmp_path) -> None:
     report = repository.trade_autopsy_report(limit=5)
 
     assert response["trade_autopsy_id"].startswith("ta_")
-    assert response["entry_autopsy_snapshot"]["resolution_bucket_key"] == "1780202400"
+    assert response["entry_autopsy_snapshot"]["resolution_bucket_key"] == "1780202700"
     assert report[0]["trade_autopsy_id"] == response["trade_autopsy_id"]
     assert report[0]["entry_price"] == 0.88
     assert report[0]["best_bid_at_entry"] == 0.87

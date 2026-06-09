@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v30" />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v33" />
   </head>
   <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
     <div class="ambient ambient-a"></div>
@@ -36,7 +36,15 @@
     <main class="layout">
       <section class="risk-banner hidden" id="riskBanner"></section>
 
-      <section class="hero-card">
+      <nav class="quick-nav" aria-label="Dashboard sections">
+        <a href="#operations">操作</a>
+        <a href="#risk">風控</a>
+        <a href="#opportunities">機會</a>
+        <a href="#execution">執行</a>
+        <a href="#journal">紀錄</a>
+      </nav>
+
+      <section class="hero-card" id="operations">
         <div>
           <p class="hero-label">控制中心</p>
           <h2>把掃描、風控與交易紀錄集中在同一個遠端面板</h2>
@@ -65,7 +73,7 @@
                 <strong id="walletPusd">-</strong>
               </article>
               <article class="wallet-item">
-                <span>USDC</span>
+                <span>USDC.e</span>
                 <strong id="walletUsdc">-</strong>
               </article>
             </div>
@@ -146,6 +154,11 @@
         </div>
       </section>
 
+      <section class="section-heading" id="execution">
+        <p class="panel-kicker">Execution</p>
+        <h2>執行與事件</h2>
+      </section>
+
       <section class="panel execution-panel">
         <div class="panel-header">
           <div>
@@ -171,6 +184,11 @@
             </div>
           </article>
         </div>
+      </section>
+
+      <section class="section-heading" id="journal">
+        <p class="panel-kicker">Journal</p>
+        <h2>部位、成交與事後追蹤</h2>
       </section>
 
       <section class="panel trade-journal-panel">
@@ -205,6 +223,11 @@
         </div>
       </section>
 
+      <section class="section-heading" id="risk">
+        <p class="panel-kicker">Risk Check</p>
+        <h2>交易前置檢查與參數</h2>
+      </section>
+
       <section class="control-strip">
         <article class="control-card preflight-card">
           <div class="panel-header">
@@ -234,6 +257,11 @@
             </div>
           </div>
         </article>
+      </section>
+
+      <section class="section-heading" id="opportunities">
+        <p class="panel-kicker">Market Intelligence</p>
+        <h2>掃描摘要與候選機會</h2>
       </section>
 
       <section class="summary-grid" id="summaryGrid">
@@ -328,7 +356,7 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v30" defer></script>
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v33" defer></script>
   </body>
 </html>
 

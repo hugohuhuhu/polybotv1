@@ -29,6 +29,7 @@ def _default_empty_balances(status: str) -> list[dict[str, Any]]:
     return [
         _empty_balance("POL", status=status),
         _empty_balance("USDC", status=status),
+        _empty_balance("USDC.e", status=status),
         _empty_balance("pUSD", status=status),
     ]
 
@@ -103,6 +104,7 @@ async def load_wallet_status(settings: Settings) -> dict[str, Any]:
 
     token_configs = [
         ("USDC", settings.polygon_usdc_token_address),
+        ("USDC.e", settings.polygon_usdc_e_token_address),
         ("pUSD", settings.polygon_pusd_token_address),
     ]
     async with httpx.AsyncClient(timeout=10.0) as client:

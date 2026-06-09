@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -16,6 +19,7 @@ from app.storage.repositories import ScannerRepository
 
 TOKEN_DECIMALS = 6
 ZERO_COLLECTION_ID = "0x" + ("0" * 64)
+AUTO_REDEEM_LOCK_STALE_SEC = 600
 
 
 def _loss_autopsy_risk_settings(settings: Settings) -> dict[str, Any]:
@@ -160,6 +164,40 @@ def _decimal_to_base_units(value: float) -> int:
 
 def _wallet_address(settings: Settings, private_key: str) -> str:
     return settings.polymarket_funder_address or Account.from_key(private_key).address
+
+
+def _auto_redeem_lock_path(settings: Settings) -> Path:
+    return settings.sqlite_path.with_name(f"{settings.sqlite_path.name}.auto-redeem.lock")
+
+
+def _acquire_auto_redeem_lock(settings: Settings) -> Path | None:
+    path = _auto_redeem_lock_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stale_after = max(float(settings.auto_redeem_refresh_sec) * 2, AUTO_REDEEM_LOCK_STALE_SEC)
+    for _attempt in range(2):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                stale = (time.time() - path.stat().st_mtime) > stale_after
+            except FileNotFoundError:
+                continue
+            if stale:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                continue
+            return None
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return path
+    return None
+
+
+def _release_auto_redeem_lock(path: Path | None) -> None:
+    if path is None:
+        return
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
 
 
 def _jsonish_list(value: Any) -> list[Any]:
@@ -426,6 +464,61 @@ def _wrap_usdce_to_pusd(
     return approve_tx, wrap_tx
 
 
+def _wrap_wallet_usdce_balance_to_pusd(
+    client: httpx.Client,
+    settings: Settings,
+    repository: ScannerRepository,
+    *,
+    private_key: str,
+    wallet: str,
+) -> RedeemResult | None:
+    balance_data = _erc20_balance_data(wallet)
+    amount_units = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, balance_data)
+    min_units = _decimal_to_base_units(settings.auto_redeem_min_usdce)
+    if amount_units < min_units:
+        return None
+    pusd_before = _call_uint(client, settings.polygon_rpc_url, settings.polygon_pusd_token_address, balance_data)
+    approve_tx, wrap_tx = _wrap_usdce_to_pusd(
+        client,
+        settings,
+        private_key=private_key,
+        wallet=wallet,
+        amount_units=amount_units,
+    )
+    pusd_after = _call_uint(client, settings.polygon_rpc_url, settings.polygon_pusd_token_address, balance_data)
+    amount = _base_units_to_float(amount_units)
+    result = RedeemResult(
+        token_id=settings.polygon_usdc_e_token_address,
+        market_slug="wallet-usdce",
+        outcome_label="USDC.e",
+        redeemed_size=0.0,
+        approve_tx=approve_tx,
+        wrap_tx=wrap_tx,
+        status="wrapped_usdce_to_pusd",
+        message="Wrapped wallet USDC.e balance to pUSD.",
+    )
+    repository.save_execution_event(
+        source="auto-redeem",
+        mode="live",
+        opportunity_id="wallet-usdce-wrap",
+        status="wrapped_usdce_to_pusd",
+        message="Wrapped wallet USDC.e balance to pUSD.",
+        details={
+            "asset": "USDC.e",
+            "target_asset": "pUSD",
+            "amount_units": amount_units,
+            "amount": amount,
+            "min_wrap_amount": settings.auto_redeem_min_usdce,
+            "approve_tx": approve_tx,
+            "wrap_tx": wrap_tx,
+            "pusd_before": _base_units_to_float(pusd_before),
+            "pusd_after": _base_units_to_float(pusd_after),
+            "trigger": "wallet_usdce_balance_scan",
+        },
+    )
+    return result
+
+
 def run_auto_redeem_once(
     settings: Settings,
     repository: ScannerRepository,
@@ -442,119 +535,191 @@ def run_auto_redeem_once(
     wallet = _wallet_address(settings, private_key)
     selected = token_ids or set()
     results: list[RedeemResult] = []
+    lock_path = _acquire_auto_redeem_lock(settings)
+    if lock_path is None:
+        repository.save_execution_event(
+            source="auto-redeem",
+            mode="live",
+            opportunity_id=None,
+            status="skipped_lock_active",
+            message="Skipped auto redeem because another process is already running it.",
+            details={"lock": str(_auto_redeem_lock_path(settings))},
+        )
+        return results
     candidates = repository.redeem_candidate_live_trades(limit=100)
-    with httpx.Client(timeout=20.0) as client:
-        try:
-            wallet_positions = _fetch_redeemable_wallet_positions(client, settings, wallet)
-        except Exception as exc:
-            wallet_positions = []
-            repository.save_execution_event(
-                source="auto-redeem",
-                mode="live",
-                opportunity_id=None,
-                status="portfolio_scan_failed",
-                message=str(exc),
-                details={"stage": "fetch_redeemable_wallet_positions"},
-            )
-        candidates = _merge_wallet_redeem_candidates(candidates, wallet_positions, repository)
-        chain_id = int(_rpc(client, settings.polygon_rpc_url, "eth_chainId", []), 16)
-        if chain_id != settings.polymarket_chain_id:
-            raise RuntimeError(f"RPC chain id is {chain_id}, expected {settings.polymarket_chain_id}")
-        usdce_balance_data = _erc20_balance_data(wallet)
-        for candidate in candidates:
-            token_id = str(candidate["token_id"])
-            if selected and token_id not in selected:
-                continue
-            market = dict(candidate.get("market") or {})
-            market_slug = str(market.get("slug") or candidate.get("market_slug") or "")
-            payload = _fetch_latest_market(
-                client,
-                settings,
-                str(market.get("market_id") or ""),
-                dict(market.get("raw") or {}),
-                market_slug=market_slug,
-            )
-            outcome_index = _outcome_index_for_token(payload, token_id, int(candidate["outcome_index"]))
-            result = RedeemResult(
-                token_id=token_id,
-                market_slug=market_slug,
-                outcome_label=str(candidate.get("outcome_label") or ""),
-                redeemed_size=0.0,
-                trade_ids=[int(value) for value in candidate.get("trade_ids", [])],
-            )
-            condition_id = str(payload.get("conditionId") or market.get("raw", {}).get("conditionId") or "")
-            if not _is_winning_market(payload, outcome_index):
-                if _is_closed_losing_market(payload, outcome_index):
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            try:
+                wallet_positions = _fetch_redeemable_wallet_positions(client, settings, wallet)
+            except Exception as exc:
+                wallet_positions = []
+                repository.save_execution_event(
+                    source="auto-redeem",
+                    mode="live",
+                    opportunity_id=None,
+                    status="portfolio_scan_failed",
+                    message=str(exc),
+                    details={"stage": "fetch_redeemable_wallet_positions"},
+                )
+            candidates = _merge_wallet_redeem_candidates(candidates, wallet_positions, repository)
+            chain_id = int(_rpc(client, settings.polygon_rpc_url, "eth_chainId", []), 16)
+            if chain_id != settings.polymarket_chain_id:
+                raise RuntimeError(f"RPC chain id is {chain_id}, expected {settings.polymarket_chain_id}")
+            usdce_balance_data = _erc20_balance_data(wallet)
+            if not selected:
+                wallet_wrap_result = _wrap_wallet_usdce_balance_to_pusd(
+                    client,
+                    settings,
+                    repository,
+                    private_key=private_key,
+                    wallet=wallet,
+                )
+                if wallet_wrap_result is not None:
+                    results.append(wallet_wrap_result)
+            for candidate in candidates:
+                token_id = str(candidate["token_id"])
+                if selected and token_id not in selected:
+                    continue
+                market = dict(candidate.get("market") or {})
+                market_slug = str(market.get("slug") or candidate.get("market_slug") or "")
+                payload = _fetch_latest_market(
+                    client,
+                    settings,
+                    str(market.get("market_id") or ""),
+                    dict(market.get("raw") or {}),
+                    market_slug=market_slug,
+                )
+                outcome_index = _outcome_index_for_token(payload, token_id, int(candidate["outcome_index"]))
+                result = RedeemResult(
+                    token_id=token_id,
+                    market_slug=market_slug,
+                    outcome_label=str(candidate.get("outcome_label") or ""),
+                    redeemed_size=0.0,
+                    trade_ids=[int(value) for value in candidate.get("trade_ids", [])],
+                )
+                condition_id = str(payload.get("conditionId") or market.get("raw", {}).get("conditionId") or "")
+                if not _is_winning_market(payload, outcome_index):
+                    if _is_closed_losing_market(payload, outcome_index):
+                        settlement_details = {
+                            "market_slug": result.market_slug,
+                            "outcome_label": result.outcome_label,
+                            "token_id": token_id,
+                            "outcome_index": outcome_index,
+                            "outcome_prices": payload.get("outcomePrices"),
+                            "final_outcome": _winning_outcome_label(payload, market),
+                            "did_bought_outcome_win": False,
+                            "settlement_price": 0.0,
+                            "settlement_source": "gamma_outcomePrices",
+                        }
+                        message = "Conditional token expired worthless; no redeemable payout."
+                        if condition_id:
+                            balance_units = _call_uint(
+                                client,
+                                settings.polygon_rpc_url,
+                                settings.polymarket_ctf_address,
+                                _ctf_balance_data(wallet, token_id),
+                            )
+                            settlement_details["condition_id"] = condition_id
+                            settlement_details["ctf_units"] = balance_units
+                            if balance_units > 0:
+                                usdce_before = _call_uint(
+                                    client,
+                                    settings.polygon_rpc_url,
+                                    settings.polygon_usdc_e_token_address,
+                                    usdce_balance_data,
+                                )
+                                index_set = 1 << outcome_index
+                                redeem_data = _encode_call(
+                                    "redeemPositions(address,bytes32,bytes32,uint256[])",
+                                    [
+                                        ("address", settings.polygon_usdc_e_token_address),
+                                        ("bytes32", ZERO_COLLECTION_ID),
+                                        ("bytes32", condition_id),
+                                        ("uint256[]", [index_set]),
+                                    ],
+                                )
+                                redeem_tx = _send_transaction(
+                                    client,
+                                    settings,
+                                    private_key=private_key,
+                                    from_address=wallet,
+                                    to=settings.polymarket_ctf_address,
+                                    data=redeem_data,
+                                )
+                                receipt = _wait_receipt(client, settings.polygon_rpc_url, redeem_tx)
+                                if int(receipt.get("status", "0x0"), 16) != 1:
+                                    raise RuntimeError(f"zero-payout redeem failed: {redeem_tx}")
+                                usdce_after = _call_uint(
+                                    client,
+                                    settings.polygon_rpc_url,
+                                    settings.polygon_usdc_e_token_address,
+                                    usdce_balance_data,
+                                )
+                                settlement_details.update(
+                                    {
+                                        "index_set": index_set,
+                                        "redeem_tx": redeem_tx,
+                                        "usdce_delta": _base_units_to_float(max(0, usdce_after - usdce_before)),
+                                        "zero_payout_redeem": True,
+                                    }
+                                )
+                                result.redeem_tx = redeem_tx
+                                result.redeemed_size = _base_units_to_float(balance_units)
+                                settlement_details["redeem_amount"] = result.redeemed_size
+                                message = "Redeemed zero-payout losing conditional token; shares were burned."
+                        if result.trade_ids:
+                            repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
+                            repository.save_loss_autopsy(
+                                result.trade_ids,
+                                risk_settings=_loss_autopsy_risk_settings(settings),
+                                settlement_details=settlement_details,
+                            )
+                        repository.save_execution_event(
+                            source="auto-redeem",
+                            mode="live",
+                            opportunity_id=str(candidate.get("opportunity_id") or ""),
+                            status="settled_lost",
+                            message=message,
+                            details=settlement_details,
+                        )
+                        result.status = "settled_lost"
+                        result.message = "Market is closed and this token settled at 0."
+                        if result.redeem_tx:
+                            result.message += " Zero-payout redeem sent to clear wallet position."
+                    else:
+                        result.message = "Market is not closed with this outcome at 1.00 yet."
+                    results.append(result)
+                    continue
+                if not condition_id:
+                    result.message = "Missing conditionId."
+                    results.append(result)
+                    continue
+                balance_units = _call_uint(
+                    client,
+                    settings.polygon_rpc_url,
+                    settings.polymarket_ctf_address,
+                    _ctf_balance_data(wallet, token_id),
+                )
+                if balance_units <= 0:
                     settlement_details = {
                         "market_slug": result.market_slug,
                         "outcome_label": result.outcome_label,
                         "token_id": token_id,
+                        "condition_id": condition_id,
+                        "ctf_units": balance_units,
                         "outcome_index": outcome_index,
                         "outcome_prices": payload.get("outcomePrices"),
                         "final_outcome": _winning_outcome_label(payload, market),
-                        "did_bought_outcome_win": False,
-                        "settlement_price": 0.0,
+                        "did_bought_outcome_win": True,
+                        "settlement_price": 1.0,
+                        "redeem_amount": 0.0,
                         "settlement_source": "gamma_outcomePrices",
+                        "reason": "no_conditional_token_balance",
+                        "autopsy_reason": "redeemed_no_wallet_balance",
                     }
-                    message = "Conditional token expired worthless; no redeemable payout."
-                    if condition_id:
-                        balance_units = _call_uint(
-                            client,
-                            settings.polygon_rpc_url,
-                            settings.polymarket_ctf_address,
-                            _ctf_balance_data(wallet, token_id),
-                        )
-                        settlement_details["condition_id"] = condition_id
-                        settlement_details["ctf_units"] = balance_units
-                        if balance_units > 0:
-                            usdce_before = _call_uint(
-                                client,
-                                settings.polygon_rpc_url,
-                                settings.polygon_usdc_e_token_address,
-                                usdce_balance_data,
-                            )
-                            index_set = 1 << outcome_index
-                            redeem_data = _encode_call(
-                                "redeemPositions(address,bytes32,bytes32,uint256[])",
-                                [
-                                    ("address", settings.polygon_usdc_e_token_address),
-                                    ("bytes32", ZERO_COLLECTION_ID),
-                                    ("bytes32", condition_id),
-                                    ("uint256[]", [index_set]),
-                                ],
-                            )
-                            redeem_tx = _send_transaction(
-                                client,
-                                settings,
-                                private_key=private_key,
-                                from_address=wallet,
-                                to=settings.polymarket_ctf_address,
-                                data=redeem_data,
-                            )
-                            receipt = _wait_receipt(client, settings.polygon_rpc_url, redeem_tx)
-                            if int(receipt.get("status", "0x0"), 16) != 1:
-                                raise RuntimeError(f"zero-payout redeem failed: {redeem_tx}")
-                            usdce_after = _call_uint(
-                                client,
-                                settings.polygon_rpc_url,
-                                settings.polygon_usdc_e_token_address,
-                                usdce_balance_data,
-                            )
-                            settlement_details.update(
-                                {
-                                    "index_set": index_set,
-                                    "redeem_tx": redeem_tx,
-                                    "usdce_delta": _base_units_to_float(max(0, usdce_after - usdce_before)),
-                                    "zero_payout_redeem": True,
-                                }
-                            )
-                            result.redeem_tx = redeem_tx
-                            result.redeemed_size = _base_units_to_float(balance_units)
-                            settlement_details["redeem_amount"] = result.redeemed_size
-                            message = "Redeemed zero-payout losing conditional token; shares were burned."
+                    repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
                     if result.trade_ids:
-                        repository.mark_live_trade_ids_status(result.trade_ids, "settled_lost")
-                        repository.save_loss_autopsy(
+                        repository.save_trade_settlement_autopsy(
                             result.trade_ids,
                             risk_settings=_loss_autopsy_risk_settings(settings),
                             settlement_details=settlement_details,
@@ -563,46 +728,70 @@ def run_auto_redeem_once(
                         source="auto-redeem",
                         mode="live",
                         opportunity_id=str(candidate.get("opportunity_id") or ""),
-                        status="settled_lost",
-                        message=message,
+                        status="redeemed",
+                        message="Winning conditional token has no wallet balance; marking local position complete.",
                         details=settlement_details,
                     )
-                    result.status = "settled_lost"
-                    result.message = "Market is closed and this token settled at 0."
-                    if result.redeem_tx:
-                        result.message += " Zero-payout redeem sent to clear wallet position."
-                else:
-                    result.message = "Market is not closed with this outcome at 1.00 yet."
-                results.append(result)
-                continue
-            if not condition_id:
-                result.message = "Missing conditionId."
-                results.append(result)
-                continue
-            balance_units = _call_uint(
-                client,
-                settings.polygon_rpc_url,
-                settings.polymarket_ctf_address,
-                _ctf_balance_data(wallet, token_id),
-            )
-            if balance_units <= 0:
+                    result.status = "redeemed"
+                    result.message = "No conditional token balance to redeem; local position marked complete."
+                    results.append(result)
+                    continue
+                usdce_before = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)
+                index_set = 1 << outcome_index
+                redeem_data = _encode_call(
+                    "redeemPositions(address,bytes32,bytes32,uint256[])",
+                    [
+                        ("address", settings.polygon_usdc_e_token_address),
+                        ("bytes32", ZERO_COLLECTION_ID),
+                        ("bytes32", condition_id),
+                        ("uint256[]", [index_set]),
+                    ],
+                )
+                redeem_tx = _send_transaction(
+                    client,
+                    settings,
+                    private_key=private_key,
+                    from_address=wallet,
+                    to=settings.polymarket_ctf_address,
+                    data=redeem_data,
+                )
+                receipt = _wait_receipt(client, settings.polygon_rpc_url, redeem_tx)
+                if int(receipt.get("status", "0x0"), 16) != 1:
+                    raise RuntimeError(f"redeem failed: {redeem_tx}")
+                usdce_after = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)
+                usdce_delta = max(0, usdce_after - usdce_before)
+                approve_tx = None
+                wrap_tx = None
+                if usdce_delta >= _decimal_to_base_units(settings.auto_redeem_min_usdce):
+                    approve_tx, wrap_tx = _wrap_usdce_to_pusd(
+                        client,
+                        settings,
+                        private_key=private_key,
+                        wallet=wallet,
+                        amount_units=usdce_delta,
+                    )
+                repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
+                redeemed_size = _base_units_to_float(balance_units)
                 settlement_details = {
                     "market_slug": result.market_slug,
                     "outcome_label": result.outcome_label,
                     "token_id": token_id,
                     "condition_id": condition_id,
+                    "index_set": index_set,
                     "ctf_units": balance_units,
                     "outcome_index": outcome_index,
                     "outcome_prices": payload.get("outcomePrices"),
                     "final_outcome": _winning_outcome_label(payload, market),
                     "did_bought_outcome_win": True,
                     "settlement_price": 1.0,
-                    "redeem_amount": 0.0,
+                    "redeem_amount": redeemed_size,
+                    "redeem_tx": redeem_tx,
+                    "approve_tx": approve_tx,
+                    "wrap_tx": wrap_tx,
+                    "usdce_delta": _base_units_to_float(usdce_delta),
                     "settlement_source": "gamma_outcomePrices",
-                    "reason": "no_conditional_token_balance",
-                    "autopsy_reason": "redeemed_no_wallet_balance",
+                    "autopsy_reason": "redeemed",
                 }
-                repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
                 if result.trade_ids:
                     repository.save_trade_settlement_autopsy(
                         result.trade_ids,
@@ -614,88 +803,16 @@ def run_auto_redeem_once(
                     mode="live",
                     opportunity_id=str(candidate.get("opportunity_id") or ""),
                     status="redeemed",
-                    message="Winning conditional token has no wallet balance; marking local position complete.",
+                    message="Redeemed winning conditional token and wrapped USDC.e to pUSD.",
                     details=settlement_details,
                 )
                 result.status = "redeemed"
-                result.message = "No conditional token balance to redeem; local position marked complete."
+                result.message = "Redeemed and wrapped to pUSD."
+                result.redeemed_size = redeemed_size
+                result.redeem_tx = redeem_tx
+                result.approve_tx = approve_tx
+                result.wrap_tx = wrap_tx
                 results.append(result)
-                continue
-            usdce_before = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)
-            index_set = 1 << outcome_index
-            redeem_data = _encode_call(
-                "redeemPositions(address,bytes32,bytes32,uint256[])",
-                [
-                    ("address", settings.polygon_usdc_e_token_address),
-                    ("bytes32", ZERO_COLLECTION_ID),
-                    ("bytes32", condition_id),
-                    ("uint256[]", [index_set]),
-                ],
-            )
-            redeem_tx = _send_transaction(
-                client,
-                settings,
-                private_key=private_key,
-                from_address=wallet,
-                to=settings.polymarket_ctf_address,
-                data=redeem_data,
-            )
-            receipt = _wait_receipt(client, settings.polygon_rpc_url, redeem_tx)
-            if int(receipt.get("status", "0x0"), 16) != 1:
-                raise RuntimeError(f"redeem failed: {redeem_tx}")
-            usdce_after = _call_uint(client, settings.polygon_rpc_url, settings.polygon_usdc_e_token_address, usdce_balance_data)
-            usdce_delta = max(0, usdce_after - usdce_before)
-            approve_tx = None
-            wrap_tx = None
-            if usdce_delta >= _decimal_to_base_units(settings.auto_redeem_min_usdce):
-                approve_tx, wrap_tx = _wrap_usdce_to_pusd(
-                    client,
-                    settings,
-                    private_key=private_key,
-                    wallet=wallet,
-                    amount_units=usdce_delta,
-                )
-            repository.mark_live_trade_ids_status(result.trade_ids, "redeemed")
-            redeemed_size = _base_units_to_float(balance_units)
-            settlement_details = {
-                "market_slug": result.market_slug,
-                "outcome_label": result.outcome_label,
-                "token_id": token_id,
-                "condition_id": condition_id,
-                "index_set": index_set,
-                "ctf_units": balance_units,
-                "outcome_index": outcome_index,
-                "outcome_prices": payload.get("outcomePrices"),
-                "final_outcome": _winning_outcome_label(payload, market),
-                "did_bought_outcome_win": True,
-                "settlement_price": 1.0,
-                "redeem_amount": redeemed_size,
-                "redeem_tx": redeem_tx,
-                "approve_tx": approve_tx,
-                "wrap_tx": wrap_tx,
-                "usdce_delta": _base_units_to_float(usdce_delta),
-                "settlement_source": "gamma_outcomePrices",
-                "autopsy_reason": "redeemed",
-            }
-            if result.trade_ids:
-                repository.save_trade_settlement_autopsy(
-                    result.trade_ids,
-                    risk_settings=_loss_autopsy_risk_settings(settings),
-                    settlement_details=settlement_details,
-                )
-            repository.save_execution_event(
-                source="auto-redeem",
-                mode="live",
-                opportunity_id=str(candidate.get("opportunity_id") or ""),
-                status="redeemed",
-                message="Redeemed winning conditional token and wrapped USDC.e to pUSD.",
-                details=settlement_details,
-            )
-            result.status = "redeemed"
-            result.message = "Redeemed and wrapped to pUSD."
-            result.redeemed_size = redeemed_size
-            result.redeem_tx = redeem_tx
-            result.approve_tx = approve_tx
-            result.wrap_tx = wrap_tx
-            results.append(result)
-    return results
+        return results
+    finally:
+        _release_auto_redeem_lock(lock_path)
