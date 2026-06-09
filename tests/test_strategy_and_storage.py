@@ -1850,3 +1850,88 @@ def test_trade_autopsy_entry_snapshot_is_reportable(tmp_path) -> None:
     assert report[0]["trade_autopsy_id"] == response["trade_autopsy_id"]
     assert report[0]["entry_price"] == 0.88
     assert report[0]["best_bid_at_entry"] == 0.87
+
+
+def test_cancel_autopsy_records_fillability_and_hypothetical_hold_pnl(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "cancel-autopsy.db"))
+    market_slug = "btc-updown-test"
+    token_id = "btc-up"
+    repository.save_markets(
+        [],
+        [
+            MarketRecord(
+                market_id="m-cancel-autopsy",
+                question="BTC Up/Down",
+                slug=market_slug,
+                outcome_labels=["Up", "Down"],
+                token_ids=[token_id, "btc-down"],
+                active=False,
+                closed=True,
+                raw={"outcomes": '["Up","Down"]', "outcomePrices": '["1","0"]'},
+            )
+        ],
+    )
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="cancel-autopsy-opportunity",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id=token_id,
+                    market_slug=market_slug,
+                    outcome_label="Up",
+                    target_price=0.89,
+                    requested_size=5.0,
+                    order_id="0xcancel-autopsy",
+                    status="submitted",
+                    response={"strategy_variant": "near_close_maker", "entry_price": 0.89},
+                )
+            ],
+        )
+    )
+
+    repository.mark_live_orders_cancelled(
+        ["0xcancel-autopsy"],
+        status="qualification_cancelled",
+        cancel_response={"canceled": ["0xcancel-autopsy"]},
+        cancel_reason_by_order={
+            "0xcancel-autopsy": {
+                "not_open_reason": "would_cross_post_only",
+                "not_open_reasons": ["would_cross_post_only"],
+                "cancel_reason_context": {
+                    "best_bid": 0.88,
+                    "best_ask": 0.89,
+                    "midpoint": 0.885,
+                    "spread": 0.01,
+                    "time_to_resolution_sec": 20,
+                },
+            }
+        },
+    )
+    repository.save_orderbooks(
+        [
+            OrderBookSnapshot(
+                token_id=token_id,
+                market_id="m-cancel-autopsy",
+                bids=[BookLevel(price=0.88, size=10)],
+                asks=[BookLevel(price=0.89, size=8)],
+                updated_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            )
+        ]
+    )
+
+    events = repository.cancel_autopsy_events(limit=5)
+    report = repository.cancel_autopsy_report(limit=5)
+    row = report["rows"][0]
+
+    assert events[0]["status"] == "cancel_autopsy"
+    assert events[0]["details"]["fillability"] == "would_cross_post_only"
+    assert row["fillability"] == "likely_fill"
+    assert row["cancel_quality"] == "bad_cancel"
+    assert row["did_bought_outcome_win"] is True
+    assert round(float(row["hypothetical_hold_pnl"]), 6) == 0.55

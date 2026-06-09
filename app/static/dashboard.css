@@ -1575,6 +1575,39 @@ body.armed-state .status-chip.hot .status-dot {
   color: #8a5417;
 }
 
+.feed-pill.fill-likely {
+  background: rgba(20, 132, 76, 0.16);
+  color: #12643d;
+}
+
+.feed-pill.fill-touch {
+  background: rgba(89, 146, 70, 0.16);
+  color: #3d6b2f;
+}
+
+.feed-pill.fill-cross {
+  background: rgba(214, 167, 45, 0.2);
+  color: #7b5a11;
+}
+
+.feed-pill.fill-unfillable {
+  background: rgba(190, 87, 62, 0.16);
+  color: #963f2a;
+}
+
+.feed-pill.fill-unknown {
+  background: rgba(23, 38, 31, 0.08);
+  color: var(--ink-soft);
+}
+
+.trade-metric-grid strong.positive {
+  color: var(--teal-deep);
+}
+
+.trade-metric-grid strong.negative {
+  color: var(--rose-deep);
+}
+
 .execution-list {
   gap: 0.55rem;
 }

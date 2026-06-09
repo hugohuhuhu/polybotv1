@@ -84,6 +84,31 @@ class ScannerRepository:
         digest = md5(raw_key.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
         return f"ta_{digest}"
 
+    @classmethod
+    def make_cancel_autopsy_id(
+        cls,
+        *,
+        market_slug: str,
+        token_id: str,
+        outcome_label: str,
+        order_id: str | None = None,
+        cancel_status: str | None = None,
+        cancelled_at: str | None = None,
+    ) -> str:
+        raw_key = "|".join(
+            str(value or "")
+            for value in (
+                market_slug,
+                token_id,
+                outcome_label,
+                order_id,
+                cancel_status,
+                cancelled_at,
+            )
+        )
+        digest = md5(raw_key.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        return f"ca_{digest}"
+
     def _entry_trade_autopsy_snapshot(
         self,
         *,
@@ -778,29 +803,19 @@ class ScannerRepository:
         cleaned = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
         if not cleaned:
             return 0
-        if cancel_response is None and not cancel_reason_by_order:
-            placeholders = ",".join("?" for _ in cleaned)
-            with self.connection.transaction():
-                cursor = self.connection.execute(
-                    f"""
-                    UPDATE live_trades
-                    SET status = ?
-                    WHERE order_id IN ({placeholders})
-                    """,
-                    (status, *cleaned),
-                )
-            return int(getattr(cursor, "rowcount", 0) or 0)
-
         placeholders = ",".join("?" for _ in cleaned)
         rows = self.connection.fetchall(
             f"""
-            SELECT id, order_id, response_json
+            SELECT id, opportunity_id, action, token_id, market_slug, outcome_label,
+                   target_price, requested_size, order_id, status, response_json, created_at
             FROM live_trades
             WHERE order_id IN ({placeholders})
             """,
             tuple(cleaned),
         )
         updated = 0
+        cancel_autopsy_events: list[dict[str, Any]] = []
+        cancelled_at = self._now().isoformat()
         with self.connection.transaction():
             for row in rows:
                 order_id = str(row["order_id"] or "")
@@ -808,15 +823,23 @@ class ScannerRepository:
                 if not isinstance(response, dict):
                     response = {}
                 cancel_detail = self._cancel_response_detail(cancel_response, order_id) if cancel_response is not None else None
+                reason_detail = self._cancel_reason_for_order(cancel_reason_by_order, order_id)
                 if cancel_detail is not None:
                     response["cancel_attempt"] = {
                         "status": status,
                         "detail": cancel_detail,
                     }
-                self._merge_not_open_reason(
-                    response,
-                    self._cancel_reason_for_order(cancel_reason_by_order, order_id),
+                self._merge_not_open_reason(response, reason_detail)
+                cancel_autopsy = self._build_cancel_autopsy_event(
+                    row=row,
+                    response=response,
+                    status=status,
+                    cancel_detail=cancel_detail,
+                    reason_detail=reason_detail,
+                    cancelled_at=cancelled_at,
                 )
+                if cancel_autopsy is not None:
+                    cancel_autopsy_events.append(cancel_autopsy)
                 cursor = self.connection.execute(
                     """
                     UPDATE live_trades
@@ -826,6 +849,15 @@ class ScannerRepository:
                     (status, json.dumps(response), int(row["id"])),
                 )
                 updated += int(getattr(cursor, "rowcount", 0) or 0)
+        for event in cancel_autopsy_events:
+            self.save_execution_event(
+                source="cancel-autopsy",
+                mode="live",
+                opportunity_id=str(event.get("opportunity_id") or ""),
+                status="cancel_autopsy",
+                message="Cancelled near-close order counterfactual recorded.",
+                details=event,
+            )
         return updated
 
     def active_live_order_ids(self, limit: int = 200) -> list[str]:
@@ -1158,6 +1190,125 @@ class ScannerRepository:
         context = reason_detail.get("cancel_reason_context")
         if isinstance(context, dict):
             response["cancel_reason_context"] = context
+
+    @staticmethod
+    def _cancel_fillability_weight(label: str | None) -> float | None:
+        weights = {
+            "unfillable": 0.05,
+            "would_cross_post_only": 0.55,
+            "touch_possible": 0.7,
+            "likely_fill": 0.9,
+        }
+        return weights.get(str(label or ""))
+
+    @classmethod
+    def _cancel_fillability_rank(cls, label: str | None) -> int:
+        ranks = {
+            "unknown": 0,
+            "unfillable": 1,
+            "would_cross_post_only": 2,
+            "touch_possible": 3,
+            "likely_fill": 4,
+        }
+        return ranks.get(str(label or "unknown"), 0)
+
+    @classmethod
+    def _initial_cancel_fillability(
+        cls,
+        *,
+        reasons: list[str],
+        cancel_detail: object | None,
+    ) -> str:
+        detail = str(cancel_detail or "").lower()
+        if "matched" in detail and ("can't be canceled" in detail or "cannot be canceled" in detail):
+            return "likely_fill"
+        if "would_cross_post_only" in reasons:
+            return "would_cross_post_only"
+        if any(reason in {"missing_orderbook", "missing_orderbook_prices"} for reason in reasons):
+            return "unknown"
+        if reasons:
+            return "unfillable"
+        return "unknown"
+
+    def _build_cancel_autopsy_event(
+        self,
+        *,
+        row: dict[str, Any],
+        response: dict[str, Any],
+        status: str,
+        cancel_detail: object | None,
+        reason_detail: dict[str, Any] | None,
+        cancelled_at: str,
+    ) -> dict[str, Any] | None:
+        market_slug = str(row.get("market_slug") or response.get("market_slug") or "")
+        token_id = str(row.get("token_id") or response.get("token_id") or "")
+        order_id = str(row.get("order_id") or response.get("orderID") or "")
+        if not market_slug and not token_id and not order_id:
+            return None
+        outcome_label = str(row.get("outcome_label") or response.get("outcome_label") or response.get("outcome") or "")
+        action = str(row.get("action") or response.get("side") or "").upper().strip()
+        entry_price = self._float_or_none(row.get("target_price"))
+        if entry_price is None:
+            entry_price = self._json_float(response, "entry_price", "entry_bid", "submitted_price", "requested_price")
+        size = self._float_or_none(row.get("requested_size"))
+        if size is None:
+            size = self._json_float(response, "submitted_size", "desired_shares", "size")
+        notional = (entry_price * size) if entry_price is not None and size is not None else None
+        context = dict(response.get("cancel_reason_context") if isinstance(response.get("cancel_reason_context"), dict) else {})
+        if reason_detail and isinstance(reason_detail.get("cancel_reason_context"), dict):
+            context = {**context, **dict(reason_detail.get("cancel_reason_context") or {})}
+        reasons = response.get("not_open_reasons")
+        if not isinstance(reasons, list):
+            reason = str(response.get("not_open_reason") or "").strip()
+            reasons = [reason] if reason else []
+        clean_reasons = [str(reason).strip() for reason in reasons if str(reason or "").strip()]
+        fillability = self._initial_cancel_fillability(reasons=clean_reasons, cancel_detail=cancel_detail)
+        return {
+            "cancel_autopsy_id": self.make_cancel_autopsy_id(
+                market_slug=market_slug,
+                token_id=token_id,
+                outcome_label=outcome_label,
+                order_id=order_id,
+                cancel_status=status,
+                cancelled_at=cancelled_at,
+            ),
+            "event_type": "cancel_recorded",
+            "opportunity_id": str(row.get("opportunity_id") or ""),
+            "order_id": order_id,
+            "market_slug": market_slug,
+            "token_id": token_id,
+            "outcome": outcome_label,
+            "action": action,
+            "cancel_status": status,
+            "cancelled_at": cancelled_at,
+            "created_at": str(row.get("created_at") or ""),
+            "entry_price": entry_price,
+            "size": size,
+            "notional": notional,
+            "not_open_reason": clean_reasons[0] if clean_reasons else None,
+            "not_open_reasons": clean_reasons,
+            "cancel_attempt_detail": cancel_detail,
+            "cancel_reason_context": context,
+            "time_to_resolution_sec": context.get("time_to_resolution_sec"),
+            "best_bid": context.get("best_bid"),
+            "best_ask": context.get("best_ask"),
+            "spread": context.get("spread"),
+            "midpoint": context.get("midpoint"),
+            "bid_depth_at_best": context.get("bid_depth_at_best"),
+            "ask_depth_at_best": context.get("ask_depth_at_best"),
+            "crypto_spot_price": response.get("crypto_spot_price") or context.get("crypto_spot_price"),
+            "crypto_start_price": response.get("crypto_start_price") or context.get("crypto_start_price"),
+            "crypto_start_distance": response.get("crypto_start_distance") or context.get("crypto_start_distance"),
+            "selected_asset": response.get("selected_asset") or self._slug_asset(market_slug),
+            "resolution_bucket_key": response.get("resolution_bucket_key")
+            or self.near_close_resolution_bucket_key(market_slug),
+            "fillability": fillability,
+            "fillability_weight": self._cancel_fillability_weight(fillability),
+            "fillability_evidence": {
+                "source": "cancel_reason",
+                "reasons": clean_reasons,
+            },
+        }
 
     @staticmethod
     def _cancel_detail_indicates_matched(response: dict[str, Any]) -> bool:
@@ -3459,6 +3610,254 @@ class ScannerRepository:
             if entry_id:
                 return entry_id
         return str(details.get("autopsy_key") or "").strip()
+
+    @staticmethod
+    def _cancel_autopsy_id_from_details(details: dict[str, Any]) -> str:
+        return str(details.get("cancel_autopsy_id") or details.get("autopsy_key") or "").strip()
+
+    def cancel_autopsy_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id, source, mode, status, message, details_json, created_at
+            FROM execution_audit_log
+            WHERE source = 'cancel-autopsy'
+               OR status = 'cancel_autopsy'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            details = self._load_json(row.get("details_json"), {})
+            if not isinstance(details, dict):
+                details = {}
+            events.append(
+                {
+                    **dict(row),
+                    "details": details,
+                    "cancel_autopsy_id": self._cancel_autopsy_id_from_details(details),
+                }
+            )
+        return events
+
+    def _cancel_autopsy_orderbook_evidence(
+        self,
+        *,
+        token_id: str,
+        market_slug: str,
+        entry_price: float | None,
+        size: float | None,
+        cancelled_at: str,
+    ) -> tuple[str, dict[str, Any]]:
+        if not token_id or entry_price is None or entry_price <= 0:
+            return "unknown", {"source": "orderbook_after_cancel", "reason": "missing_entry_price"}
+        end_ts = self._parse_slug_end_timestamp(market_slug)
+        end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat() if end_ts is not None else None
+        rows = self.connection.fetchall(
+            """
+            SELECT best_bid, best_ask, midpoint, bids_json, asks_json, captured_at
+            FROM orderbook_snapshots
+            WHERE token_id = ?
+              AND (? = '' OR captured_at >= ?)
+              AND (? IS NULL OR captured_at <= ?)
+            ORDER BY captured_at ASC
+            LIMIT 80
+            """,
+            (token_id, cancelled_at, cancelled_at, end_iso, end_iso),
+        )
+        if not rows:
+            return "unknown", {"source": "orderbook_after_cancel", "snapshot_count": 0}
+        first_bid_touch: dict[str, Any] | None = None
+        first_ask_cross: dict[str, Any] | None = None
+        for row in rows:
+            best_bid = self._float_or_none(row.get("best_bid"))
+            best_ask = self._float_or_none(row.get("best_ask"))
+            asks = self._load_json(row.get("asks_json"), [])
+            ask_depth = self._book_level_size_at_price(asks, best_ask)
+            snapshot = {
+                "captured_at": row.get("captured_at"),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "midpoint": self._float_or_none(row.get("midpoint")),
+                "ask_depth_at_best": ask_depth,
+            }
+            if first_ask_cross is None and best_ask is not None and best_ask <= entry_price:
+                first_ask_cross = snapshot
+                break
+            if first_bid_touch is None and best_bid is not None and best_bid >= entry_price:
+                first_bid_touch = snapshot
+        if first_ask_cross is not None:
+            label = "likely_fill"
+            if size is not None and first_ask_cross.get("ask_depth_at_best") is not None:
+                try:
+                    if float(first_ask_cross["ask_depth_at_best"]) + 1e-9 < float(size):
+                        label = "touch_possible"
+                except (TypeError, ValueError):
+                    label = "likely_fill"
+            return label, {
+                "source": "orderbook_after_cancel",
+                "snapshot_count": len(rows),
+                "first_ask_cross": first_ask_cross,
+            }
+        if first_bid_touch is not None:
+            return "touch_possible", {
+                "source": "orderbook_after_cancel",
+                "snapshot_count": len(rows),
+                "first_bid_touch": first_bid_touch,
+            }
+        return "unfillable", {
+            "source": "orderbook_after_cancel",
+            "snapshot_count": len(rows),
+            "reason": "no_bid_or_ask_touch_after_cancel",
+        }
+
+    def _cancel_autopsy_market_statuses(self, market_slugs: list[str]) -> dict[str, dict[str, Any]]:
+        if not market_slugs:
+            return {}
+        placeholders = ",".join("?" for _ in market_slugs)
+        rows = self.connection.fetchall(
+            f"""
+            SELECT slug, end_date, active, closed, raw_json
+            FROM markets
+            WHERE slug IN ({placeholders})
+            """,
+            tuple(market_slugs),
+        )
+        now_ts = self._now().timestamp()
+        statuses = {str(row["slug"]): self._market_status(row, now_ts=now_ts) for row in rows}
+        for slug in market_slugs:
+            statuses.setdefault(
+                slug,
+                {
+                    "ended": self._is_market_ended(
+                        slug,
+                        end_date=None,
+                        active=None,
+                        closed=None,
+                        now_ts=now_ts,
+                    ),
+                    "winning_outcome": None,
+                },
+            )
+        return statuses
+
+    def cancel_autopsy_report(self, limit: int = 20) -> dict[str, Any]:
+        events = self.cancel_autopsy_events(limit=max(limit * 5, 120))
+        market_slugs = sorted(
+            {str(event.get("details", {}).get("market_slug") or "") for event in events if event.get("details")}
+        )
+        market_status = self._cancel_autopsy_market_statuses([slug for slug in market_slugs if slug])
+        rows: list[dict[str, Any]] = []
+        summary: dict[str, dict[str, Any]] = {}
+        for event in events:
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            market_slug = str(details.get("market_slug") or "")
+            outcome = str(details.get("outcome") or "")
+            action = str(details.get("action") or "").upper()
+            entry_price = self._float_or_none(details.get("entry_price"))
+            size = self._float_or_none(details.get("size"))
+            status = market_status.get(market_slug, {})
+            settlement_price = self._settlement_price_for_outcome(outcome, status.get("winning_outcome"))
+            did_win = None if settlement_price is None else settlement_price >= 0.999
+            hypothetical_hold_pnl = None
+            if action == "BUY" and settlement_price is not None and entry_price is not None and size is not None:
+                hypothetical_hold_pnl = (settlement_price - entry_price) * size
+            initial_fillability = str(details.get("fillability") or "unknown")
+            evidence_label, evidence = self._cancel_autopsy_orderbook_evidence(
+                token_id=str(details.get("token_id") or ""),
+                market_slug=market_slug,
+                entry_price=entry_price,
+                size=size,
+                cancelled_at=str(details.get("cancelled_at") or event.get("created_at") or ""),
+            )
+            fillability = (
+                evidence_label
+                if self._cancel_fillability_rank(evidence_label) > self._cancel_fillability_rank(initial_fillability)
+                else initial_fillability
+            )
+            fillability_weight = self._cancel_fillability_weight(fillability)
+            weighted_pnl = (
+                hypothetical_hold_pnl * fillability_weight
+                if hypothetical_hold_pnl is not None and fillability_weight is not None
+                else None
+            )
+            cancel_quality = "pending_settlement"
+            if hypothetical_hold_pnl is not None:
+                if hypothetical_hold_pnl > 1e-9:
+                    cancel_quality = "bad_cancel"
+                elif hypothetical_hold_pnl < -1e-9:
+                    cancel_quality = "good_cancel"
+                else:
+                    cancel_quality = "neutral_cancel"
+            reason = str(details.get("not_open_reason") or "unknown")
+            row = {
+                "cancel_autopsy_id": event.get("cancel_autopsy_id"),
+                "market_slug": market_slug,
+                "token_id": details.get("token_id"),
+                "outcome": outcome,
+                "action": action,
+                "order_id": details.get("order_id"),
+                "cancel_status": details.get("cancel_status"),
+                "cancel_reason": reason,
+                "cancel_reasons": details.get("not_open_reasons") if isinstance(details.get("not_open_reasons"), list) else [],
+                "cancelled_at": details.get("cancelled_at") or event.get("created_at"),
+                "time_to_resolution_sec": details.get("time_to_resolution_sec"),
+                "entry_price": entry_price,
+                "size": size,
+                "notional": details.get("notional"),
+                "best_bid": details.get("best_bid"),
+                "best_ask": details.get("best_ask"),
+                "midpoint": details.get("midpoint"),
+                "spread": details.get("spread"),
+                "fillability": fillability,
+                "initial_fillability": initial_fillability,
+                "fillability_weight": fillability_weight,
+                "fillability_evidence": evidence,
+                "market_ended": status.get("ended"),
+                "final_outcome": status.get("winning_outcome"),
+                "did_bought_outcome_win": did_win,
+                "hypothetical_hold_pnl": hypothetical_hold_pnl,
+                "fillability_weighted_hold_pnl": weighted_pnl,
+                "cancel_quality": cancel_quality,
+            }
+            rows.append(row)
+            bucket = summary.setdefault(
+                reason,
+                {
+                    "cancel_reason": reason,
+                    "count": 0,
+                    "settled_count": 0,
+                    "hypothetical_hold_pnl_total": 0.0,
+                    "fillability_weighted_hold_pnl_total": 0.0,
+                    "bad_cancel_count": 0,
+                    "good_cancel_count": 0,
+                    "unknown_count": 0,
+                    "likely_fill_count": 0,
+                },
+            )
+            bucket["count"] = int(bucket["count"]) + 1
+            if fillability == "unknown":
+                bucket["unknown_count"] = int(bucket["unknown_count"]) + 1
+            if fillability == "likely_fill":
+                bucket["likely_fill_count"] = int(bucket["likely_fill_count"]) + 1
+            if hypothetical_hold_pnl is not None:
+                bucket["settled_count"] = int(bucket["settled_count"]) + 1
+                bucket["hypothetical_hold_pnl_total"] = float(bucket["hypothetical_hold_pnl_total"]) + hypothetical_hold_pnl
+                if weighted_pnl is not None:
+                    bucket["fillability_weighted_hold_pnl_total"] = (
+                        float(bucket["fillability_weighted_hold_pnl_total"]) + weighted_pnl
+                    )
+                if cancel_quality == "bad_cancel":
+                    bucket["bad_cancel_count"] = int(bucket["bad_cancel_count"]) + 1
+                elif cancel_quality == "good_cancel":
+                    bucket["good_cancel_count"] = int(bucket["good_cancel_count"]) + 1
+        rows = sorted(rows, key=lambda row: str(row.get("cancelled_at") or ""), reverse=True)[:limit]
+        return {
+            "rows": rows,
+            "by_reason": sorted(summary.values(), key=lambda row: int(row.get("count") or 0), reverse=True),
+            "generated_at": self._now().isoformat(),
+        }
 
     def trade_autopsy_events(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(

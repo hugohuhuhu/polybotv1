@@ -48,6 +48,7 @@ const executionFeed = document.getElementById("executionFeed");
 const executionOrderFeed = document.getElementById("executionOrderFeed");
 const positionFeed = document.getElementById("positionFeed");
 const tradeAutopsyFeed = document.getElementById("tradeAutopsyFeed");
+const cancelAutopsyFeed = document.getElementById("cancelAutopsyFeed");
 const tradePnlValue = document.getElementById("tradePnlValue");
 const tradePnlMeta = document.getElementById("tradePnlMeta");
 const tradePnlNote = document.getElementById("tradePnlNote");
@@ -64,6 +65,7 @@ const TEXT = {
   noHeartbeats: "\u5c1a\u672a\u6709 watch \u5fc3\u8df3\u3002",
   noTrades: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u3002",
   noTradeAutopsy: "\u5c1a\u672a\u5efa\u7acb trade autopsy\u3002",
+  noCancelAutopsy: "\u5c1a\u672a\u5efa\u7acb cancel autopsy\u3002",
   noTradeRecords: "\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u4ea4\u6613\u7d00\u9304",
   noMarkets: "\u5c1a\u672a\u540c\u6b65\u5e02\u5834\u8cc7\u6599\u3002",
   scanNow: "\u7acb\u5373\u6383\u63cf",
@@ -1187,6 +1189,105 @@ function renderTradeAutopsy(rows) {
     .join("");
 }
 
+function cancelFillabilityLabel(value) {
+  const mapping = {
+    likely_fill: "\u9ad8\u6a5f\u7387\u6210\u4ea4",
+    touch_possible: "\u6709\u78b0\u50f9\u8b49\u64da",
+    would_cross_post_only: "post-only \u6703\u8de8\u50f9",
+    unfillable: "\u4f4e\u6a5f\u7387\u6210\u4ea4",
+    unknown: "\u8cc7\u6599\u4e0d\u8db3",
+  };
+  return mapping[value] || value || "\u8cc7\u6599\u4e0d\u8db3";
+}
+
+function cancelFillabilityClass(value) {
+  const mapping = {
+    likely_fill: "fill-likely",
+    touch_possible: "fill-touch",
+    would_cross_post_only: "fill-cross",
+    unfillable: "fill-unfillable",
+    unknown: "fill-unknown",
+  };
+  return mapping[value] || "fill-unknown";
+}
+
+function cancelQualityLabel(value) {
+  const mapping = {
+    good_cancel: "\u597d\u53d6\u6d88",
+    bad_cancel: "\u53ef\u80fd\u932f\u6bba",
+    neutral_cancel: "\u6301\u5e73",
+    pending_settlement: "\u7b49\u5f85\u7d50\u7b97",
+  };
+  return mapping[value] || value || "-";
+}
+
+function renderCancelAutopsy(report) {
+  if (!cancelAutopsyFeed) {
+    return;
+  }
+  const rows = Array.isArray(report?.rows) ? report.rows : Array.isArray(report) ? report : [];
+  if (!rows.length) {
+    cancelAutopsyFeed.innerHTML = `<p class="empty-block">${TEXT.noCancelAutopsy}</p>`;
+    return;
+  }
+  cancelAutopsyFeed.innerHTML = rows
+    .map((item) => {
+      const pnl =
+        item.hypothetical_hold_pnl === null || item.hypothetical_hold_pnl === undefined
+          ? null
+          : Number(item.hypothetical_hold_pnl);
+      const pnlClass = pnl === null ? "neutral" : pnl > 0 ? "positive" : pnl < 0 ? "negative" : "neutral";
+      const fillability = item.fillability || "unknown";
+      const fillabilityClass = cancelFillabilityClass(fillability);
+      const win =
+        item.did_bought_outcome_win === null || item.did_bought_outcome_win === undefined
+          ? "-"
+          : item.did_bought_outcome_win
+            ? "\u8d0f"
+            : "\u8f38";
+      const weighted =
+        item.fillability_weighted_hold_pnl === null || item.fillability_weighted_hold_pnl === undefined
+          ? null
+          : Number(item.fillability_weighted_hold_pnl);
+      return `
+        <article class="trade-autopsy-card cancel-autopsy-card">
+          <header>
+            <div>
+              <strong>${escapeHtml(item.market_slug || "-")}</strong>
+              <p>${escapeHtml(item.outcome || "-")} · ${escapeHtml(item.cancel_autopsy_id || "-")}</p>
+            </div>
+            <span class="feed-pill ${fillabilityClass}">${escapeHtml(cancelFillabilityLabel(fillability))}</span>
+          </header>
+          <div class="trade-metric-grid">
+            <div>
+              <span>entry</span>
+              <strong>${item.entry_price === null || item.entry_price === undefined ? "-" : formatToken(item.entry_price)}</strong>
+            </div>
+            <div>
+              <span>size</span>
+              <strong>${item.size === null || item.size === undefined ? "-" : formatToken(item.size)}</strong>
+            </div>
+            <div>
+              <span>hold PnL</span>
+              <strong class="${pnlClass}">${pnl === null ? "-" : `${formatSignedToken(pnl)} pUSD`}</strong>
+            </div>
+            <div>
+              <span>weighted</span>
+              <strong>${weighted === null ? "-" : `${formatSignedToken(weighted)} pUSD`}</strong>
+            </div>
+          </div>
+          <div class="trade-group__summary">
+            <span>${escapeHtml(notOpenReasonLabel(item.cancel_reason || "unknown"))}</span>
+            <span>${escapeHtml(cancelQualityLabel(item.cancel_quality))}</span>
+            <span>final ${escapeHtml(String(item.final_outcome || win))}</span>
+          </div>
+          <time>${formatTime(item.cancelled_at)}</time>
+        </article>
+      `;
+    })
+    .join("");
+}
+
 function renderMarkets(markets) {
   if (!markets?.length) {
     marketList.innerHTML = `<p class="empty-block">${TEXT.noMarkets}</p>`;
@@ -1533,6 +1634,7 @@ function applyDashboardPayload(payload) {
   renderExecutionEvents(payload.execution_events || []);
   renderTradeJournal(payload.trade_groups || payload.positions || [], payload.trade_journal || payload.pnl || {});
   renderTradeAutopsy(payload.trade_autopsy || []);
+  renderCancelAutopsy(payload.cancel_autopsy || {});
   renderMarkets(payload.markets || []);
   renderTrading(
     payload.trading || latestTradingState,

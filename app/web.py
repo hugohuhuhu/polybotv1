@@ -931,6 +931,7 @@ async def build_dashboard_payload(
         "pnl": repository.settled_pnl_summary(),
         "trade_journal": _trade_journal_payload(repository, settings, wallet or {}),
         "trade_autopsy": repository.trade_autopsy_report(limit=8),
+        "cancel_autopsy": repository.cancel_autopsy_report(limit=8),
         "refresh_sec": settings.dashboard_refresh_sec,
         "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
         "risk": {
@@ -1833,6 +1834,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "open_positions": repo.open_live_positions(limit=12),
                 "pnl": repo.settled_pnl_summary(),
                 "trade_journal": _trade_journal_payload(repo, current_settings, wallet),
+                "trade_autopsy": repo.trade_autopsy_report(limit=8),
+                "cancel_autopsy": repo.cancel_autopsy_report(limit=8),
                 "refresh_sec": current_settings.dashboard_refresh_sec,
                 "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
                 "risk": {

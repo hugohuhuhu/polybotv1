@@ -657,6 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill",
         "report",
         "report-trade-autopsy",
+        "report-cancel-autopsy",
         "research-near-close",
         "serve",
         "maintain-db",
@@ -1732,6 +1733,70 @@ def cmd_report_trade_autopsy(settings: Settings) -> None:
     console.print(table)
 
 
+def cmd_report_cancel_autopsy(settings: Settings) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    with closing(connect_db(settings)) as connection:
+        report = ScannerRepository(connection).cancel_autopsy_report(limit=30)
+
+    rows = report.get("rows") if isinstance(report, dict) else []
+    table = Table(title="Cancel Autopsy Report")
+    table.add_column("Cancel ID")
+    table.add_column("Market")
+    table.add_column("Outcome")
+    table.add_column("Reason")
+    table.add_column("Fillability")
+    table.add_column("Entry", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Win")
+    table.add_column("Hold PnL", justify="right")
+    table.add_column("Quality")
+    for row in rows if isinstance(rows, list) else []:
+        entry = row.get("entry_price")
+        size = row.get("size")
+        pnl = row.get("hypothetical_hold_pnl")
+        table.add_row(
+            str(row.get("cancel_autopsy_id") or ""),
+            str(row.get("market_slug") or ""),
+            str(row.get("outcome") or ""),
+            str(row.get("cancel_reason") or ""),
+            str(row.get("fillability") or "unknown"),
+            "N/A" if entry is None else f"{float(entry):.4f}",
+            "N/A" if size is None else f"{float(size):.2f}",
+            "N/A"
+            if row.get("did_bought_outcome_win") is None
+            else ("yes" if row.get("did_bought_outcome_win") else "no"),
+            "N/A" if pnl is None else f"{float(pnl):.4f}",
+            str(row.get("cancel_quality") or ""),
+        )
+    console.print(table)
+
+    summary = report.get("by_reason") if isinstance(report, dict) else []
+    summary_table = Table(title="Cancel Autopsy by Reason")
+    summary_table.add_column("Reason")
+    summary_table.add_column("Count", justify="right")
+    summary_table.add_column("Settled", justify="right")
+    summary_table.add_column("Good", justify="right")
+    summary_table.add_column("Bad", justify="right")
+    summary_table.add_column("Likely Fill", justify="right")
+    summary_table.add_column("Hold PnL", justify="right")
+    summary_table.add_column("Weighted PnL", justify="right")
+    for row in summary if isinstance(summary, list) else []:
+        summary_table.add_row(
+            str(row.get("cancel_reason") or ""),
+            str(row.get("count") or 0),
+            str(row.get("settled_count") or 0),
+            str(row.get("good_cancel_count") or 0),
+            str(row.get("bad_cancel_count") or 0),
+            str(row.get("likely_fill_count") or 0),
+            f"{float(row.get('hypothetical_hold_pnl_total') or 0.0):.4f}",
+            f"{float(row.get('fillability_weighted_hold_pnl_total') or 0.0):.4f}",
+        )
+    console.print(summary_table)
+
+
 async def _refresh_near_close_research_markets(
     settings: Settings,
     repository: ScannerRepository,
@@ -1905,6 +1970,8 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         cmd_report(settings)
     elif args.command == "report-trade-autopsy":
         cmd_report_trade_autopsy(settings)
+    elif args.command == "report-cancel-autopsy":
+        cmd_report_cancel_autopsy(settings)
     elif args.command == "research-near-close":
         await cmd_research_near_close(settings, args)
     elif args.command == "maintain-db":
