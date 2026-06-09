@@ -109,6 +109,19 @@ class ScannerRepository:
         digest = md5(raw_key.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
         return f"ca_{digest}"
 
+    @classmethod
+    def make_candidate_autopsy_id(
+        cls,
+        *,
+        opportunity_id: str,
+        market_slug: str,
+        token_id: str,
+        observed_at: str | None = None,
+    ) -> str:
+        raw_key = "|".join(str(value or "") for value in (opportunity_id, market_slug, token_id, observed_at))
+        digest = md5(raw_key.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        return f"oa_{digest}"
+
     def _entry_trade_autopsy_snapshot(
         self,
         *,
@@ -141,6 +154,82 @@ class ScannerRepository:
             "resolution_bucket_key": response.get("resolution_bucket_key")
             or self.near_close_resolution_bucket_key(market_slug),
             "created_at": created_at,
+        }
+
+    @staticmethod
+    def _is_candidate_autopsy_opportunity(opportunity: Opportunity, details: dict[str, Any]) -> bool:
+        strategy_type = getattr(opportunity.strategy_type, "value", opportunity.strategy_type)
+        return strategy_type == "late_resolution" and details.get("strategy_variant") == "near_close_maker"
+
+    def _candidate_autopsy_snapshot(self, opportunity: Opportunity, details: dict[str, Any]) -> dict[str, Any]:
+        market_slugs = list(opportunity.market_slugs or [])
+        token_ids = list(opportunity.token_ids or [])
+        prices = dict(opportunity.prices or {})
+        observed_at = to_isoformat(opportunity.timestamp)
+        market_slug = str(details.get("market_slug") or (market_slugs[0] if market_slugs else ""))
+        token_id = str(details.get("token_id") or (token_ids[0] if token_ids else ""))
+        entry_price = self._json_float(details, "entry_price", "entry_bid")
+        if entry_price is None:
+            entry_price = self._float_or_none(prices.get("entry_bid"))
+        size = self._float_or_none(details.get("effective_order_size"))
+        if size is None:
+            size = self._float_or_none(opportunity.max_safe_size)
+        notional = entry_price * size if entry_price is not None and size is not None else None
+        best_bid = self._json_float(details, "best_bid", "current_bid")
+        best_ask = self._json_float(details, "best_ask", "entry_ask")
+        spread = self._json_float(details, "spread")
+        start_distance = self._json_float(details, "crypto_start_distance")
+        return {
+            "candidate_autopsy_id": self.make_candidate_autopsy_id(
+                opportunity_id=opportunity.opportunity_id,
+                market_slug=market_slug,
+                token_id=token_id,
+                observed_at=observed_at,
+            ),
+            "event_type": "candidate_observed",
+            "passed_gate": 8,
+            "passed_gate_label": "entry_price_liquidity_post_only",
+            "opportunity_id": opportunity.opportunity_id,
+            "market_slug": market_slug,
+            "market_title": opportunity.title,
+            "token_id": token_id,
+            "outcome": str(details.get("outcome_label") or ""),
+            "action": "BUY",
+            "observed_at": observed_at,
+            "time_to_resolution_sec": self._json_float(details, "time_to_resolution_sec"),
+            "entry_price": entry_price,
+            "size": size,
+            "notional": notional,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "midpoint": self._json_float(details, "midpoint", "current_midpoint"),
+            "bid_depth_at_best": self._json_float(details, "bid_depth_at_best"),
+            "ask_depth_at_best": self._json_float(details, "ask_depth_at_best"),
+            "crypto_spot_price": self._json_float(details, "crypto_spot_price"),
+            "crypto_start_price": self._json_float(details, "crypto_start_price"),
+            "crypto_start_distance": start_distance,
+            "crypto_start_distance_required": self._json_float(details, "crypto_start_distance_required"),
+            "crypto_winning_outcome": details.get("crypto_winning_outcome"),
+            "selected_asset": details.get("selected_asset") or self._slug_asset(market_slug),
+            "resolution_bucket_key": details.get("resolution_bucket_key")
+            or self.near_close_resolution_bucket_key(market_slug),
+            "qualification_tier": details.get("qualification_tier"),
+            "qualification_label": details.get("qualification_label"),
+            "alert_eligible": bool(details.get("alert_eligible", False)),
+            "tradable_live": bool(details.get("tradable_live", False)),
+            "post_only": bool(details.get("post_only", True)),
+            "order_type": details.get("order_type") or "GTD",
+            "entry_price_bucket": self._entry_price_bucket(entry_price),
+            "spread_bucket": self._spread_bucket(spread),
+            "start_distance_bucket": self._start_distance_bucket(start_distance),
+            "fillability": "unknown",
+            "fillability_evidence": {
+                "source": "candidate_snapshot",
+                "post_only_would_rest": (
+                    entry_price is not None and best_ask is not None and entry_price < best_ask
+                ),
+            },
         }
 
     def _enrich_live_response_for_autopsy(
@@ -526,6 +615,7 @@ class ScannerRepository:
         }
 
     def save_opportunities(self, opportunities: Iterable[Opportunity]) -> None:
+        candidate_autopsy_events: list[dict[str, Any]] = []
         with self.connection.transaction():
             for opportunity in opportunities:
                 details = dict(opportunity.details)
@@ -569,6 +659,18 @@ class ScannerRepository:
                         to_isoformat(opportunity.timestamp),
                     ),
                 )
+                if self._is_candidate_autopsy_opportunity(opportunity, details):
+                    candidate_autopsy_events.append(self._candidate_autopsy_snapshot(opportunity, details))
+        for event in candidate_autopsy_events:
+            self.save_execution_event(
+                source="candidate-autopsy",
+                mode="paper",
+                opportunity_id=str(event.get("opportunity_id") or ""),
+                status="candidate_autopsy_observation",
+                message="Near-close candidate observation recorded.",
+                details=event,
+                claim_key=str(event.get("candidate_autopsy_id") or ""),
+            )
 
     def was_alerted_recently(self, opportunity_id: str, cooldown_sec: int) -> bool:
         row = self.connection.fetchone(
@@ -3615,6 +3717,36 @@ class ScannerRepository:
     def _cancel_autopsy_id_from_details(details: dict[str, Any]) -> str:
         return str(details.get("cancel_autopsy_id") or details.get("autopsy_key") or "").strip()
 
+    @staticmethod
+    def _candidate_autopsy_id_from_details(details: dict[str, Any]) -> str:
+        return str(details.get("candidate_autopsy_id") or details.get("autopsy_key") or "").strip()
+
+    def candidate_autopsy_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.connection.fetchall(
+            """
+            SELECT opportunity_id, source, mode, status, message, details_json, created_at
+            FROM execution_audit_log
+            WHERE source = 'candidate-autopsy'
+               OR status = 'candidate_autopsy_observation'
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            details = self._load_json(row.get("details_json"), {})
+            if not isinstance(details, dict):
+                details = {}
+            events.append(
+                {
+                    **dict(row),
+                    "details": details,
+                    "candidate_autopsy_id": self._candidate_autopsy_id_from_details(details),
+                }
+            )
+        return events
+
     def cancel_autopsy_events(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.connection.fetchall(
             """
@@ -3649,9 +3781,10 @@ class ScannerRepository:
         entry_price: float | None,
         size: float | None,
         cancelled_at: str,
+        evidence_source: str = "orderbook_after_cancel",
     ) -> tuple[str, dict[str, Any]]:
         if not token_id or entry_price is None or entry_price <= 0:
-            return "unknown", {"source": "orderbook_after_cancel", "reason": "missing_entry_price"}
+            return "unknown", {"source": evidence_source, "reason": "missing_entry_price"}
         end_ts = self._parse_slug_end_timestamp(market_slug)
         end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat() if end_ts is not None else None
         rows = self.connection.fetchall(
@@ -3667,7 +3800,7 @@ class ScannerRepository:
             (token_id, cancelled_at, cancelled_at, end_iso, end_iso),
         )
         if not rows:
-            return "unknown", {"source": "orderbook_after_cancel", "snapshot_count": 0}
+            return "unknown", {"source": evidence_source, "snapshot_count": 0}
         first_bid_touch: dict[str, Any] | None = None
         first_ask_cross: dict[str, Any] | None = None
         for row in rows:
@@ -3696,18 +3829,18 @@ class ScannerRepository:
                 except (TypeError, ValueError):
                     label = "likely_fill"
             return label, {
-                "source": "orderbook_after_cancel",
+                "source": evidence_source,
                 "snapshot_count": len(rows),
                 "first_ask_cross": first_ask_cross,
             }
         if first_bid_touch is not None:
             return "touch_possible", {
-                "source": "orderbook_after_cancel",
+                "source": evidence_source,
                 "snapshot_count": len(rows),
                 "first_bid_touch": first_bid_touch,
             }
         return "unfillable", {
-            "source": "orderbook_after_cancel",
+            "source": evidence_source,
             "snapshot_count": len(rows),
             "reason": "no_bid_or_ask_touch_after_cancel",
         }
@@ -3741,6 +3874,130 @@ class ScannerRepository:
                 },
             )
         return statuses
+
+    def candidate_autopsy_report(self, limit: int = 20) -> dict[str, Any]:
+        events = self.candidate_autopsy_events(limit=max(int(limit), 1))
+        market_slugs = sorted(
+            {str(event.get("details", {}).get("market_slug") or "") for event in events if event.get("details")}
+        )
+        market_status = self._cancel_autopsy_market_statuses([slug for slug in market_slugs if slug])
+        rows: list[dict[str, Any]] = []
+        summary = {
+            "count": 0,
+            "settled_count": 0,
+            "profitable_count": 0,
+            "loss_count": 0,
+            "likely_fill_count": 0,
+            "unknown_count": 0,
+            "hypothetical_hold_pnl_total": 0.0,
+            "fillability_weighted_hold_pnl_total": 0.0,
+        }
+        for event in events:
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            market_slug = str(details.get("market_slug") or "")
+            outcome = str(details.get("outcome") or "")
+            action = str(details.get("action") or "").upper()
+            entry_price = self._float_or_none(details.get("entry_price"))
+            size = self._float_or_none(details.get("size"))
+            status = market_status.get(market_slug, {})
+            settlement_price = self._settlement_price_for_outcome(outcome, status.get("winning_outcome"))
+            did_win = None if settlement_price is None else settlement_price >= 0.999
+            hypothetical_hold_pnl = None
+            if action == "BUY" and settlement_price is not None and entry_price is not None and size is not None:
+                hypothetical_hold_pnl = (settlement_price - entry_price) * size
+            initial_fillability = str(details.get("fillability") or "unknown")
+            evidence_label, evidence = self._cancel_autopsy_orderbook_evidence(
+                token_id=str(details.get("token_id") or ""),
+                market_slug=market_slug,
+                entry_price=entry_price,
+                size=size,
+                cancelled_at=str(details.get("observed_at") or event.get("created_at") or ""),
+                evidence_source="orderbook_after_observation",
+            )
+            fillability = (
+                evidence_label
+                if self._cancel_fillability_rank(evidence_label) > self._cancel_fillability_rank(initial_fillability)
+                else initial_fillability
+            )
+            fillability_weight = self._cancel_fillability_weight(fillability)
+            weighted_pnl = (
+                hypothetical_hold_pnl * fillability_weight
+                if hypothetical_hold_pnl is not None and fillability_weight is not None
+                else None
+            )
+            candidate_quality = "pending_settlement"
+            if hypothetical_hold_pnl is not None:
+                if hypothetical_hold_pnl > 1e-9:
+                    candidate_quality = "would_profit"
+                elif hypothetical_hold_pnl < -1e-9:
+                    candidate_quality = "would_loss"
+                else:
+                    candidate_quality = "flat"
+            row = {
+                "candidate_autopsy_id": event.get("candidate_autopsy_id"),
+                "opportunity_id": details.get("opportunity_id") or event.get("opportunity_id"),
+                "market_slug": market_slug,
+                "market_title": details.get("market_title"),
+                "token_id": details.get("token_id"),
+                "outcome": outcome,
+                "action": action,
+                "observed_at": details.get("observed_at") or event.get("created_at"),
+                "passed_gate": details.get("passed_gate"),
+                "passed_gate_label": details.get("passed_gate_label"),
+                "time_to_resolution_sec": details.get("time_to_resolution_sec"),
+                "entry_price": entry_price,
+                "size": size,
+                "notional": details.get("notional"),
+                "best_bid": details.get("best_bid"),
+                "best_ask": details.get("best_ask"),
+                "midpoint": details.get("midpoint"),
+                "spread": details.get("spread"),
+                "bid_depth_at_best": details.get("bid_depth_at_best"),
+                "ask_depth_at_best": details.get("ask_depth_at_best"),
+                "crypto_spot_price": details.get("crypto_spot_price"),
+                "crypto_start_price": details.get("crypto_start_price"),
+                "crypto_start_distance": details.get("crypto_start_distance"),
+                "selected_asset": details.get("selected_asset"),
+                "resolution_bucket_key": details.get("resolution_bucket_key"),
+                "qualification_tier": details.get("qualification_tier"),
+                "alert_eligible": details.get("alert_eligible"),
+                "tradable_live": details.get("tradable_live"),
+                "fillability": fillability,
+                "initial_fillability": initial_fillability,
+                "fillability_weight": fillability_weight,
+                "fillability_evidence": evidence,
+                "market_ended": status.get("ended"),
+                "final_outcome": status.get("winning_outcome"),
+                "did_bought_outcome_win": did_win,
+                "hypothetical_hold_pnl": hypothetical_hold_pnl,
+                "fillability_weighted_hold_pnl": weighted_pnl,
+                "candidate_quality": candidate_quality,
+            }
+            rows.append(row)
+            summary["count"] = int(summary["count"]) + 1
+            if fillability == "unknown":
+                summary["unknown_count"] = int(summary["unknown_count"]) + 1
+            if fillability == "likely_fill":
+                summary["likely_fill_count"] = int(summary["likely_fill_count"]) + 1
+            if hypothetical_hold_pnl is not None:
+                summary["settled_count"] = int(summary["settled_count"]) + 1
+                summary["hypothetical_hold_pnl_total"] = (
+                    float(summary["hypothetical_hold_pnl_total"]) + hypothetical_hold_pnl
+                )
+                if weighted_pnl is not None:
+                    summary["fillability_weighted_hold_pnl_total"] = (
+                        float(summary["fillability_weighted_hold_pnl_total"]) + weighted_pnl
+                    )
+                if candidate_quality == "would_profit":
+                    summary["profitable_count"] = int(summary["profitable_count"]) + 1
+                elif candidate_quality == "would_loss":
+                    summary["loss_count"] = int(summary["loss_count"]) + 1
+        rows = sorted(rows, key=lambda row: str(row.get("observed_at") or ""), reverse=True)[:limit]
+        return {
+            "rows": rows,
+            "summary": summary,
+            "generated_at": self._now().isoformat(),
+        }
 
     def cancel_autopsy_report(self, limit: int = 20) -> dict[str, Any]:
         events = self.cancel_autopsy_events(limit=max(limit * 5, 120))

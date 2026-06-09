@@ -1935,3 +1935,100 @@ def test_cancel_autopsy_records_fillability_and_hypothetical_hold_pnl(tmp_path) 
     assert row["cancel_quality"] == "bad_cancel"
     assert row["did_bought_outcome_win"] is True
     assert round(float(row["hypothetical_hold_pnl"]), 6) == 0.55
+
+
+def test_candidate_autopsy_records_each_near_close_observation_and_reports_hold_pnl(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "candidate-autopsy.db"))
+    market_slug = "btc-updown-test"
+    token_id = "btc-up"
+    repository.save_markets(
+        [],
+        [
+            MarketRecord(
+                market_id="m-candidate-autopsy",
+                question="BTC Up/Down",
+                slug=market_slug,
+                outcome_labels=["Up", "Down"],
+                token_ids=[token_id, "btc-down"],
+                active=False,
+                closed=True,
+                raw={"outcomes": '["Up","Down"]', "outcomePrices": '["1","0"]'},
+            )
+        ],
+    )
+    observed_at = datetime(2026, 6, 9, 12, 0, 10, tzinfo=timezone.utc)
+    base_details = {
+        "strategy_variant": "near_close_maker",
+        "outcome_label": "Up",
+        "market_slug": market_slug,
+        "token_id": token_id,
+        "time_to_resolution_sec": 50,
+        "entry_price": 0.89,
+        "entry_bid": 0.89,
+        "best_bid": 0.88,
+        "best_ask": 0.91,
+        "spread": 0.03,
+        "midpoint": 0.895,
+        "bid_depth_at_best": 30,
+        "ask_depth_at_best": 24,
+        "crypto_start_distance": 0.0012,
+        "crypto_winning_outcome": "Up",
+        "tradable_live": True,
+        "post_only": True,
+        "effective_order_size": 5,
+    }
+    opportunity = Opportunity(
+        opportunity_id="candidate-autopsy-opportunity",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="BTC Up/Down | near-close maker Up",
+        summary="Near-close maker bid 0.890 on Up.",
+        market_slugs=[market_slug],
+        market_ids=["m-candidate-autopsy"],
+        token_ids=[token_id],
+        prices={"entry_bid": 0.89, "entry_ask": 0.91},
+        gross_edge=0.11,
+        estimated_fees=0.0,
+        slippage_estimate=0.0,
+        net_edge=0.10,
+        max_safe_size=5.0,
+        available_liquidity=30.0,
+        confidence_score=0.9,
+        timestamp=observed_at,
+        suggested_action="Paper observe",
+        details=base_details,
+    )
+    repository.save_opportunities([opportunity])
+    repository.save_opportunities(
+        [
+            opportunity.model_copy(
+                update={
+                    "timestamp": observed_at + timedelta(seconds=8),
+                    "prices": {"entry_bid": 0.90, "entry_ask": 0.92},
+                    "details": {**base_details, "entry_price": 0.90, "entry_bid": 0.90, "best_ask": 0.92},
+                }
+            )
+        ]
+    )
+    repository.save_orderbooks(
+        [
+            OrderBookSnapshot(
+                token_id=token_id,
+                market_id="m-candidate-autopsy",
+                bids=[BookLevel(price=0.88, size=10)],
+                asks=[BookLevel(price=0.89, size=8)],
+                updated_at=observed_at + timedelta(seconds=20),
+            )
+        ]
+    )
+
+    events = repository.candidate_autopsy_events(limit=5)
+    report = repository.candidate_autopsy_report(limit=5)
+    first_observation = next(row for row in report["rows"] if float(row["entry_price"]) == 0.89)
+
+    assert len(events) == 2
+    assert events[0]["candidate_autopsy_id"].startswith("oa_")
+    assert first_observation["fillability"] == "likely_fill"
+    assert first_observation["candidate_quality"] == "would_profit"
+    assert first_observation["did_bought_outcome_win"] is True
+    assert round(float(first_observation["hypothetical_hold_pnl"]), 6) == 0.55

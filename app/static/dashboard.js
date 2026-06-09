@@ -58,6 +58,7 @@ const TEXT = {
   waitingSync: "\u5c1a\u672a\u540c\u6b65",
   noData: "\u5c1a\u672a\u5efa\u7acb\u8cc7\u6599",
   noOpportunities: "\u76ee\u524d\u6c92\u6709\u7b26\u5408\u689d\u4ef6\u7684\u5019\u9078\u6a5f\u6703\u3002",
+  noCandidateAutopsy: "\u5c1a\u672a\u5efa\u7acb\u7b2c\u516b\u95dc\u5019\u9078\u7d00\u9304\u3002",
   noStrategies: "\u5c1a\u672a\u6709\u7b56\u7565\u7d71\u8a08\u8cc7\u6599\u3002",
   noAlerts: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u8b66\u793a\u3002",
   noExecutions: "\u5c1a\u672a\u6709\u57f7\u884c\u4e8b\u4ef6\u3002",
@@ -849,45 +850,81 @@ function renderStrategies(strategies) {
     .join("");
 }
 
-function renderOpportunities(opportunities) {
-  if (!opportunities?.length) {
-    opportunityRows.innerHTML = `<tr><td colspan="6" class="empty-cell">${TEXT.noOpportunities}</td></tr>`;
+function candidateQualityLabel(value) {
+  const mapping = {
+    would_profit: "\u82e5\u9032\u5834\u6703\u8cfa",
+    would_loss: "\u82e5\u9032\u5834\u6703\u8667",
+    flat: "\u6301\u5e73",
+    pending_settlement: "\u7b49\u5f85\u7d50\u7b97",
+  };
+  return mapping[value] || value || "-";
+}
+
+function renderCandidateAutopsyTable(report) {
+  const rows = Array.isArray(report?.rows) ? report.rows : Array.isArray(report) ? report : [];
+  if (!rows.length) {
+    opportunityRows.innerHTML = `<tr><td colspan="6" class="empty-cell">${TEXT.noCandidateAutopsy}</td></tr>`;
     return;
   }
 
-  opportunityRows.innerHTML = opportunities
+  opportunityRows.innerHTML = rows
     .slice(0, pageSize)
     .map((item) => {
-      const links = (item.market_slugs || [])
-        .map(
-          (slug) =>
-            `<a class="link-chip" href="${marketLink(slug)}" target="_blank" rel="noreferrer">${escapeHtml(slug)}</a>`,
-        )
-        .join("");
-      const label = qualificationLabel(item);
-      const summary = item.summary || cleanOpportunityTitle(item);
-      const action = item.details?.suggested_action || item.details?.action || "\u8acb\u5148\u4eba\u5de5\u8986\u6838\u3002";
+      const marketSlug = item.market_slug || "";
+      const title = item.market_title || marketSlug || "-";
+      const entry = item.entry_price === null || item.entry_price === undefined ? null : Number(item.entry_price);
+      const size = item.size === null || item.size === undefined ? null : Number(item.size);
+      const pnl =
+        item.hypothetical_hold_pnl === null || item.hypothetical_hold_pnl === undefined
+          ? null
+          : Number(item.hypothetical_hold_pnl);
+      const weighted =
+        item.fillability_weighted_hold_pnl === null || item.fillability_weighted_hold_pnl === undefined
+          ? null
+          : Number(item.fillability_weighted_hold_pnl);
+      const pnlClass = pnl === null ? "neutral" : pnl > 0 ? "stat-positive" : pnl < 0 ? "stat-negative" : "neutral";
+      const fillability = item.fillability || "unknown";
+      const fillabilityClass = cancelFillabilityClass(fillability);
+      const win =
+        item.did_bought_outcome_win === null || item.did_bought_outcome_win === undefined
+          ? "-"
+          : item.did_bought_outcome_win
+            ? "\u8d0f"
+            : "\u8f38";
       return `
         <tr>
-          <td><span class="strategy-chip">${escapeHtml(strategyLabel(item.strategy_type))}</span></td>
           <td>
-            <div class="opportunity-title">[${escapeHtml(label)}] ${escapeHtml(cleanOpportunityTitle(item))}</div>
-            <div>${escapeHtml(summary)}</div>
-            <div class="opportunity-links">${links}</div>
+            <div class="stat-strong">${formatTime(item.observed_at)}</div>
+            <div><span class="strategy-chip">Gate ${escapeHtml(item.passed_gate || 8)}</span></div>
           </td>
           <td>
-            <div class="stat-strong stat-positive">${formatPercent(item.net_edge)}</div>
-            <div>\u6bdb\u908a\u969b ${formatPercent(item.gross_edge)}</div>
+            <div class="opportunity-title">${escapeHtml(title)}</div>
+            <div>${escapeHtml(item.outcome || "-")} · ${escapeHtml(item.selected_asset || "-")}</div>
+            <div class="opportunity-links">
+              <a class="link-chip" href="${marketLink(marketSlug)}" target="_blank" rel="noreferrer">${escapeHtml(marketSlug || "-")}</a>
+            </div>
           </td>
           <td>
-            <div class="stat-strong">${formatNumber(item.available_liquidity)}</div>
-            <div>\u5b89\u5168\u90e8\u4f4d ${formatNumber(item.max_safe_size)}</div>
+            <div class="stat-strong">${entry === null ? "-" : `BUY ${formatToken(size)} @ ${formatToken(entry)}`}</div>
+            <div>部位 ${item.notional === null || item.notional === undefined ? "-" : `${formatToken(item.notional)} pUSD`}</div>
+            <div>bucket ${escapeHtml(item.resolution_bucket_key || "-")}</div>
           </td>
           <td>
-            <div class="stat-strong">${formatPercent(item.confidence_score)}</div>
-            <div>${formatTime(item.created_at)}</div>
+            <div>bid / ask ${formatToken(item.best_bid)} / ${formatToken(item.best_ask)}</div>
+            <div>spread ${formatToken(item.spread)} · mid ${formatToken(item.midpoint)}</div>
+            <div>depth ${formatNumber(item.bid_depth_at_best)} / ${formatNumber(item.ask_depth_at_best)}</div>
+            <div>start ${formatToken(item.crypto_start_distance)}</div>
           </td>
-          <td><div class="suggestion">${escapeHtml(`${label}\uff1a${action}`)}</div></td>
+          <td>
+            <div><span class="feed-pill ${fillabilityClass}">${escapeHtml(cancelFillabilityLabel(fillability))}</span></div>
+            <div>weight ${item.fillability_weight === null || item.fillability_weight === undefined ? "-" : formatPercent(item.fillability_weight)}</div>
+            <div>${item.tradable_live ? "\u53ef live" : "\u89c0\u6e2c"}</div>
+          </td>
+          <td>
+            <div class="stat-strong ${pnlClass}">${pnl === null ? "-" : `${formatSignedToken(pnl)} pUSD`}</div>
+            <div>${escapeHtml(candidateQualityLabel(item.candidate_quality))} · ${escapeHtml(win)}</div>
+            <div>weighted ${weighted === null ? "-" : `${formatSignedToken(weighted)} pUSD`}</div>
+          </td>
         </tr>
       `;
     })
@@ -1628,7 +1665,7 @@ function applyDashboardPayload(payload) {
   renderSummary(payload.summary || {});
   renderCriteriaFunnel(payload.summary || {});
   renderStrategies(payload.strategies || []);
-  renderOpportunities(payload.opportunities || []);
+  renderCandidateAutopsyTable(payload.candidate_autopsy || {});
   renderAlerts(payload.alerts || []);
   renderLiveOrders(payload.live_orders || []);
   renderExecutionEvents(payload.execution_events || []);

@@ -1216,6 +1216,10 @@ body.armed-state .status-chip.hot .status-dot {
   color: var(--teal-deep);
 }
 
+.stat-negative {
+  color: var(--rose-deep);
+}
+
 .suggestion {
   max-width: 13rem;
   color: var(--ink-soft);
