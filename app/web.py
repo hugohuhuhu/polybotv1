@@ -22,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.config import Settings, get_settings
 from app.clients.clob_client import ClobClient
+from app.models.core import MarketRecord
 from app.models.runtime import TradingControls
 from app.orchestration import execute_scan_cycle, persist_scan_cycle
 from app.scanners.liquidity_filter import LiquidityFilter
@@ -37,6 +38,8 @@ from app.strategy.post_fill_profit_take import execute_post_fill_profit_takes
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, create_authenticated_clob_v2_client
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
+from app.utils.math_utils import parse_jsonish_list, safe_float
+from app.utils.time_utils import parse_datetime
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,7 +49,9 @@ WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
 WATCH_SUPERVISOR_PID_FILE = RUNTIME_LOG_DIR / "watch-supervisor.pid"
 WATCH_SCRIPT_PATH = BASE_DIR.parent / "scripts" / "watch-supervisor.ps1"
 DASHBOARD_COMPONENT_TIMEOUT_SEC = 2.5
-DASHBOARD_DB_TIMEOUT_SEC = 4.0
+DASHBOARD_DB_TIMEOUT_SEC = 9.0
+AUTOPSY_SETTLEMENT_REFRESH_LIMIT = 3
+AUTOPSY_SETTLEMENT_GAMMA_TIMEOUT_SEC = 1.5
 EMBEDDED_WATCH_LIVE_TIMEOUT_SEC = 25.0
 EMBEDDED_WATCH_CYCLE_TIMEOUT_SEC = 60.0
 LIVE_FILL_SYNC_INTERVAL_SEC = 5.0
@@ -86,6 +91,77 @@ async def _fetch_orderbooks_for_tokens(settings: Settings, token_ids: list[str])
         return await clob.get_order_books(token_ids)
     finally:
         await clob.close()
+
+
+def _gamma_market_payload_for_slug(payload: Any, slug: str) -> dict[str, Any] | None:
+    if isinstance(payload, list):
+        for item in payload:
+            market = _gamma_market_payload_for_slug(item, slug)
+            if market is not None:
+                return market
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("slug") or "") == slug and payload.get("outcomes") is not None:
+        return payload
+    for item in payload.get("markets") or []:
+        if isinstance(item, dict) and str(item.get("slug") or "") == slug:
+            return item
+    return None
+
+
+def _gamma_market_record(payload: dict[str, Any]) -> MarketRecord:
+    outcome_prices: list[float] = []
+    for value in parse_jsonish_list(payload.get("outcomePrices")):
+        numeric = safe_float(value)
+        if numeric is not None:
+            outcome_prices.append(float(numeric))
+    return MarketRecord(
+        market_id=str(payload.get("id") or payload.get("conditionId") or payload.get("slug")),
+        event_id=str(payload.get("eventId") or payload.get("event_id") or "") or None,
+        question=str(payload.get("question") or payload.get("title") or payload.get("slug") or ""),
+        slug=str(payload.get("slug") or payload.get("id") or ""),
+        condition_id=payload.get("conditionId"),
+        resolution_source=payload.get("resolutionSource"),
+        end_date=parse_datetime(payload.get("endDate")),
+        start_date=parse_datetime(payload.get("startDate")),
+        outcome_labels=[str(value) for value in parse_jsonish_list(payload.get("outcomes"))],
+        outcome_prices=outcome_prices,
+        token_ids=[str(value) for value in parse_jsonish_list(payload.get("clobTokenIds"))],
+        category=payload.get("category"),
+        active=bool(payload.get("active", True)),
+        closed=bool(payload.get("closed", False)),
+        restricted=bool(payload.get("restricted", False)),
+        liquidity=safe_float(payload.get("liquidity")) or safe_float(payload.get("liquidityClob")),
+        volume=safe_float(payload.get("volume")) or safe_float(payload.get("volumeClob")),
+        spread=safe_float(payload.get("spread")),
+        best_bid=safe_float(payload.get("bestBid")),
+        best_ask=safe_float(payload.get("bestAsk")),
+        last_trade_price=safe_float(payload.get("lastTradePrice")),
+        raw=payload,
+    )
+
+
+def refresh_autopsy_settlement_markets(repository: ScannerRepository, settings: Settings) -> dict[str, Any]:
+    slugs = repository.autopsy_market_slugs_needing_settlement_refresh(limit=AUTOPSY_SETTLEMENT_REFRESH_LIMIT)
+    if not slugs:
+        return {"attempted": 0, "refreshed": 0, "errors": []}
+    refreshed = 0
+    errors: list[str] = []
+    timeout = min(float(settings.gamma_timeout_sec), AUTOPSY_SETTLEMENT_GAMMA_TIMEOUT_SEC)
+    with httpx.Client(base_url=settings.gamma_base_url.rstrip("/"), timeout=timeout) as client:
+        for slug in slugs:
+            try:
+                response = client.get(f"/markets/slug/{slug}")
+                response.raise_for_status()
+                market_payload = _gamma_market_payload_for_slug(response.json(), slug)
+                if market_payload is None:
+                    continue
+                repository.save_markets([], [_gamma_market_record(market_payload)])
+                refreshed += 1
+            except Exception as exc:
+                errors.append(f"{slug}: {exc}")
+    return {"attempted": len(slugs), "refreshed": refreshed, "errors": errors[:3]}
 
 
 def refresh_open_position_orderbooks(repository: ScannerRepository, settings: Settings) -> int:
@@ -903,6 +979,7 @@ async def build_dashboard_payload(
     sqlite_warning = path_sync_warning(settings.sqlite_path) if settings.persistence_backend == "sqlite" else None
     persistence_warning = bool(sqlite_warning) or (settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE")))
     repository.expire_open_orders_for_ended_markets()
+    autopsy_settlement_refresh = refresh_autopsy_settlement_markets(repository, settings)
     summary = repository.dashboard_summary()
     strategy_variant = _dashboard_strategy_variant(settings)
     watch_heartbeats = repository.recent_watch_heartbeats(limit=6)
@@ -933,6 +1010,7 @@ async def build_dashboard_payload(
         "trade_autopsy": repository.trade_autopsy_report(limit=8),
         "candidate_autopsy": repository.candidate_autopsy_report(limit=12),
         "cancel_autopsy": repository.cancel_autopsy_report(limit=8),
+        "autopsy_settlement_refresh": autopsy_settlement_refresh,
         "refresh_sec": settings.dashboard_refresh_sec,
         "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
         "risk": {
@@ -1825,6 +1903,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 current_settings.persistence_backend == "sqlite" and bool(os.getenv("K_SERVICE"))
             )
             summary = repo.dashboard_summary()
+            autopsy_settlement_refresh = refresh_autopsy_settlement_markets(repo, current_settings)
             strategy_variant = _dashboard_strategy_variant(current_settings)
             watch_heartbeats = repo.recent_watch_heartbeats(limit=6)
             risk_summary = repo.trading_risk_summary()
@@ -1854,6 +1933,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "trade_autopsy": repo.trade_autopsy_report(limit=8),
                 "candidate_autopsy": repo.candidate_autopsy_report(limit=12),
                 "cancel_autopsy": repo.cancel_autopsy_report(limit=8),
+                "autopsy_settlement_refresh": autopsy_settlement_refresh,
                 "refresh_sec": current_settings.dashboard_refresh_sec,
                 "trading": {**controls.as_payload(), "market_mode": market_mode_payload},
                 "risk": {

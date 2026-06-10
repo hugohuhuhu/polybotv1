@@ -58,7 +58,7 @@ const TEXT = {
   waitingSync: "\u5c1a\u672a\u540c\u6b65",
   noData: "\u5c1a\u672a\u5efa\u7acb\u8cc7\u6599",
   noOpportunities: "\u76ee\u524d\u6c92\u6709\u7b26\u5408\u689d\u4ef6\u7684\u5019\u9078\u6a5f\u6703\u3002",
-  noCandidateAutopsy: "\u5c1a\u672a\u5efa\u7acb\u7b2c\u516b\u95dc\u5019\u9078\u7d00\u9304\u3002",
+  noCandidateAutopsy: "\u5c1a\u672a\u5efa\u7acb\u9032\u5834\u5019\u9078\u9a57\u5c4d\u7d00\u9304\u3002",
   noStrategies: "\u5c1a\u672a\u6709\u7b56\u7565\u7d71\u8a08\u8cc7\u6599\u3002",
   noAlerts: "\u5c1a\u672a\u9001\u51fa\u4efb\u4f55\u8b66\u793a\u3002",
   noExecutions: "\u5c1a\u672a\u6709\u57f7\u884c\u4e8b\u4ef6\u3002",
@@ -850,7 +850,10 @@ function renderStrategies(strategies) {
     .join("");
 }
 
-function candidateQualityLabel(value) {
+function candidateQualityLabel(value, item = {}) {
+  if (item.market_metadata_missing && item.market_ended) {
+    return "\u7f3a\u5e02\u5834\u7d50\u7b97\u8cc7\u6599";
+  }
   const mapping = {
     would_profit: "\u82e5\u9032\u5834\u6703\u8cfa",
     would_loss: "\u82e5\u9032\u5834\u6703\u8667",
@@ -858,6 +861,16 @@ function candidateQualityLabel(value) {
     pending_settlement: "\u7b49\u5f85\u7d50\u7b97",
   };
   return mapping[value] || value || "-";
+}
+
+function candidateGateLabel(item) {
+  if (item.passed_gate_label === "entry_price_liquidity_post_only") {
+    return "\u6838\u5fc3\u689d\u4ef6\u901a\u904e";
+  }
+  if (item.passed_gate) {
+    return `\u689d\u4ef6 ${item.passed_gate}`;
+  }
+  return "\u6838\u5fc3\u689d\u4ef6\u901a\u904e";
 }
 
 function renderCandidateAutopsyTable(report) {
@@ -895,7 +908,7 @@ function renderCandidateAutopsyTable(report) {
         <tr>
           <td>
             <div class="stat-strong">${formatTime(item.observed_at)}</div>
-            <div><span class="strategy-chip">Gate ${escapeHtml(item.passed_gate || 8)}</span></div>
+            <div><span class="strategy-chip">${escapeHtml(candidateGateLabel(item))}</span></div>
           </td>
           <td>
             <div class="opportunity-title">${escapeHtml(title)}</div>
@@ -922,7 +935,7 @@ function renderCandidateAutopsyTable(report) {
           </td>
           <td>
             <div class="stat-strong ${pnlClass}">${pnl === null ? "-" : `${formatSignedToken(pnl)} pUSD`}</div>
-            <div>${escapeHtml(candidateQualityLabel(item.candidate_quality))} · ${escapeHtml(win)}</div>
+            <div>${escapeHtml(candidateQualityLabel(item.candidate_quality, item))} · ${escapeHtml(win)}</div>
             <div>weighted ${weighted === null ? "-" : `${formatSignedToken(weighted)} pUSD`}</div>
           </td>
         </tr>
@@ -1286,6 +1299,12 @@ function renderCancelAutopsy(report) {
         item.fillability_weighted_hold_pnl === null || item.fillability_weighted_hold_pnl === undefined
           ? null
           : Number(item.fillability_weighted_hold_pnl);
+      const qualityLabel =
+        item.market_metadata_missing && item.market_ended
+          ? "\u7f3a\u5e02\u5834\u7d50\u7b97\u8cc7\u6599"
+          : cancelQualityLabel(item.cancel_quality);
+      const finalLabel =
+        item.market_metadata_missing && item.market_ended ? "\u7f3a metadata" : String(item.final_outcome || win);
       return `
         <article class="trade-autopsy-card cancel-autopsy-card">
           <header>
@@ -1315,8 +1334,8 @@ function renderCancelAutopsy(report) {
           </div>
           <div class="trade-group__summary">
             <span>${escapeHtml(notOpenReasonLabel(item.cancel_reason || "unknown"))}</span>
-            <span>${escapeHtml(cancelQualityLabel(item.cancel_quality))}</span>
-            <span>final ${escapeHtml(String(item.final_outcome || win))}</span>
+            <span>${escapeHtml(qualityLabel)}</span>
+            <span>final ${escapeHtml(finalLabel)}</span>
           </div>
           <time>${formatTime(item.cancelled_at)}</time>
         </article>

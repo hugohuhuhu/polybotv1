@@ -2032,3 +2032,60 @@ def test_candidate_autopsy_records_each_near_close_observation_and_reports_hold_
     assert first_observation["candidate_quality"] == "would_profit"
     assert first_observation["did_bought_outcome_win"] is True
     assert round(float(first_observation["hypothetical_hold_pnl"]), 6) == 0.55
+
+
+def test_candidate_autopsy_marks_missing_settlement_metadata(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "candidate-autopsy-missing-market.db"))
+    market_slug = "eth-updown-5m-1700000000"
+    token_id = "eth-down"
+    observed_at = datetime(2023, 11, 14, 22, 12, 40, tzinfo=timezone.utc)
+    opportunity = Opportunity(
+        opportunity_id="candidate-autopsy-missing-market",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="ETH Up/Down | near-close maker Down",
+        summary="Near-close maker bid 0.900 on Down.",
+        market_slugs=[market_slug],
+        market_ids=["missing-market"],
+        token_ids=[token_id],
+        prices={"entry_bid": 0.90, "entry_ask": 0.93},
+        gross_edge=0.10,
+        estimated_fees=0.0,
+        slippage_estimate=0.0,
+        net_edge=0.09,
+        max_safe_size=5.0,
+        available_liquidity=30.0,
+        confidence_score=0.9,
+        timestamp=observed_at,
+        suggested_action="Paper observe",
+        details={
+            "strategy_variant": "near_close_maker",
+            "outcome_label": "Down",
+            "market_slug": market_slug,
+            "token_id": token_id,
+            "time_to_resolution_sec": 34,
+            "entry_price": 0.90,
+            "entry_bid": 0.90,
+            "best_bid": 0.92,
+            "best_ask": 0.93,
+            "spread": 0.01,
+            "midpoint": 0.925,
+            "bid_depth_at_best": 30,
+            "ask_depth_at_best": 20,
+            "crypto_start_distance": 0.0012,
+            "crypto_winning_outcome": "Down",
+            "tradable_live": True,
+            "effective_order_size": 5,
+        },
+    )
+    repository.save_opportunities([opportunity])
+
+    report = repository.candidate_autopsy_report(limit=5)
+    row = report["rows"][0]
+
+    assert row["market_ended"] is True
+    assert row["market_metadata_missing"] is True
+    assert row["settlement_source"] is None
+    assert row["final_outcome"] is None
+    assert row["candidate_quality"] == "pending_settlement"
+    assert repository.autopsy_market_slugs_needing_settlement_refresh(limit=5) == [market_slug]

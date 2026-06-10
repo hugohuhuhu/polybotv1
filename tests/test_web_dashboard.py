@@ -13,7 +13,7 @@ from app.config import Settings
 from app.models.core import EventRecord, MarketRecord, Opportunity, OrderBookSnapshot, SignalDirection, StrategyType
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
-from app.web import create_app
+from app.web import create_app, refresh_autopsy_settlement_markets
 
 
 class FakePreflightReport:
@@ -242,6 +242,95 @@ def test_dashboard_timeout_reuses_last_successful_payload(tmp_path, monkeypatch)
     assert second_payload["trade_journal"]["trade_count_total"] == 1
     assert len(second_payload["trade_groups"]) == 1
     assert second_payload["trade_groups"][0]["market_slug"] == "will-something-happen"
+
+
+def test_refresh_autopsy_settlement_markets_backfills_gamma_outcome(tmp_path, monkeypatch) -> None:
+    class FakeGammaResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "id": "2477700",
+                "question": "Ethereum Up or Down",
+                "slug": "eth-updown-5m-1700000000",
+                "endDate": "2023-11-14T22:13:20Z",
+                "outcomes": '["Up", "Down"]',
+                "outcomePrices": '["0", "1"]',
+                "clobTokenIds": '["eth-up", "eth-down"]',
+                "active": True,
+                "closed": True,
+            }
+
+    class FakeGammaClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.requests: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def get(self, path: str):
+            self.requests.append(path)
+            return FakeGammaResponse()
+
+    monkeypatch.setattr("app.web.httpx.Client", FakeGammaClient)
+    repository = ScannerRepository(connect_db(tmp_path / "autopsy-gamma-refresh.db"))
+    market_slug = "eth-updown-5m-1700000000"
+    opportunity = Opportunity(
+        opportunity_id="candidate-autopsy-gamma-refresh",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="ETH Up/Down | near-close maker Down",
+        summary="Near-close maker bid 0.900 on Down.",
+        market_slugs=[market_slug],
+        market_ids=["missing-market"],
+        token_ids=["eth-down"],
+        prices={"entry_bid": 0.90, "entry_ask": 0.93},
+        gross_edge=0.10,
+        estimated_fees=0.0,
+        slippage_estimate=0.0,
+        net_edge=0.09,
+        max_safe_size=5.0,
+        available_liquidity=30.0,
+        confidence_score=0.9,
+        timestamp=datetime(2023, 11, 14, 22, 12, 40, tzinfo=timezone.utc),
+        suggested_action="Paper observe",
+        details={
+            "strategy_variant": "near_close_maker",
+            "outcome_label": "Down",
+            "market_slug": market_slug,
+            "token_id": "eth-down",
+            "time_to_resolution_sec": 34,
+            "entry_price": 0.90,
+            "best_bid": 0.92,
+            "best_ask": 0.93,
+            "spread": 0.01,
+            "midpoint": 0.925,
+            "bid_depth_at_best": 30,
+            "ask_depth_at_best": 20,
+            "crypto_start_distance": 0.0012,
+            "tradable_live": True,
+            "effective_order_size": 5,
+        },
+    )
+    repository.save_opportunities([opportunity])
+
+    result = refresh_autopsy_settlement_markets(
+        repository,
+        Settings(SQLITE_PATH=str(tmp_path / "unused.db"), GAMMA_BASE_URL="https://gamma.example"),
+    )
+    report = repository.candidate_autopsy_report(limit=5)
+    row = report["rows"][0]
+
+    assert result["refreshed"] == 1
+    assert row["final_outcome"] == "Down"
+    assert row["market_metadata_missing"] is False
+    assert row["settlement_source"] == "markets.raw_json"
+    assert row["candidate_quality"] == "would_profit"
+    assert round(float(row["hypothetical_hold_pnl"]), 6) == 0.5
 
 
 def test_dashboard_throttles_open_position_orderbook_refresh(tmp_path, monkeypatch) -> None:

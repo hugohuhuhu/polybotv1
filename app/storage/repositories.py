@@ -3858,7 +3858,12 @@ class ScannerRepository:
             tuple(market_slugs),
         )
         now_ts = self._now().timestamp()
-        statuses = {str(row["slug"]): self._market_status(row, now_ts=now_ts) for row in rows}
+        statuses: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            status = self._market_status(row, now_ts=now_ts)
+            status["market_metadata_missing"] = False
+            status["settlement_source"] = "markets.raw_json" if status.get("winning_outcome") else None
+            statuses[str(row["slug"])] = status
         for slug in market_slugs:
             statuses.setdefault(
                 slug,
@@ -3871,9 +3876,31 @@ class ScannerRepository:
                         now_ts=now_ts,
                     ),
                     "winning_outcome": None,
+                    "market_metadata_missing": True,
+                    "settlement_source": None,
                 },
             )
         return statuses
+
+    def autopsy_market_slugs_needing_settlement_refresh(self, *, limit: int = 60) -> list[str]:
+        events = [
+            *self.candidate_autopsy_events(limit=limit),
+            *self.cancel_autopsy_events(limit=limit),
+        ]
+        slugs = sorted(
+            {
+                str(event.get("details", {}).get("market_slug") or "").strip()
+                for event in events
+                if isinstance(event.get("details"), dict)
+            }
+        )
+        slugs = [slug for slug in slugs if slug]
+        statuses = self._cancel_autopsy_market_statuses(slugs)
+        return [
+            slug
+            for slug in slugs
+            if statuses.get(slug, {}).get("ended") and not statuses.get(slug, {}).get("winning_outcome")
+        ][: max(int(limit), 1)]
 
     def candidate_autopsy_report(self, limit: int = 20) -> dict[str, Any]:
         events = self.candidate_autopsy_events(limit=max(int(limit), 1))
@@ -3968,6 +3995,8 @@ class ScannerRepository:
                 "fillability_evidence": evidence,
                 "market_ended": status.get("ended"),
                 "final_outcome": status.get("winning_outcome"),
+                "settlement_source": status.get("settlement_source"),
+                "market_metadata_missing": bool(status.get("market_metadata_missing")),
                 "did_bought_outcome_win": did_win,
                 "hypothetical_hold_pnl": hypothetical_hold_pnl,
                 "fillability_weighted_hold_pnl": weighted_pnl,
@@ -4073,6 +4102,8 @@ class ScannerRepository:
                 "fillability_evidence": evidence,
                 "market_ended": status.get("ended"),
                 "final_outcome": status.get("winning_outcome"),
+                "settlement_source": status.get("settlement_source"),
+                "market_metadata_missing": bool(status.get("market_metadata_missing")),
                 "did_bought_outcome_win": did_win,
                 "hypothetical_hold_pnl": hypothetical_hold_pnl,
                 "fillability_weighted_hold_pnl": weighted_pnl,
