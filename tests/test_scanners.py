@@ -67,6 +67,8 @@ def test_settings_defaults_to_sixty_to_thirty_second_entry_experiment() -> None:
     assert settings.near_close_entry_seconds_allowed(61.0) is False
     assert settings.near_close_crypto_updown_min_entry_price == 0.86
     assert settings.near_close_crypto_updown_max_entry_price == 0.90
+    assert settings.near_close_crypto_updown_prewarm_seconds == 60.0
+    assert settings.near_close_crypto_updown_fast_scan_sec == 2.0
 
 
 def test_settings_switches_light_mode_when_us_equity_market_is_closed() -> None:

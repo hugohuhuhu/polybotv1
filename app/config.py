@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     near_close_live_max_minutes_to_end: float = Field(default=7.0, alias="NEAR_CLOSE_LIVE_MAX_MINUTES_TO_END")
     near_close_entry_max_seconds: float = Field(default=60.0, alias="NEAR_CLOSE_ENTRY_MAX_SECONDS")
     near_close_entry_min_seconds: float = Field(default=30.0, alias="NEAR_CLOSE_ENTRY_MIN_SECONDS")
+    near_close_crypto_updown_prewarm_seconds: float = Field(
+        default=60.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_PREWARM_SECONDS",
+    )
+    near_close_crypto_updown_fast_scan_sec: float = Field(
+        default=2.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_FAST_SCAN_SEC",
+    )
     near_close_final_seconds_allow_entry: bool = Field(
         default=True,
         alias="NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY",

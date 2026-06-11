@@ -177,6 +177,27 @@ def _crypto_updown_symbol(market: MarketRecord) -> str | None:
     return updown[0].upper()
 
 
+def _seconds_to_resolution(market: MarketRecord, now: datetime | None = None) -> float | None:
+    minutes_left = _minutes_to_resolution(market, now)
+    if minutes_left is None:
+        return None
+    return float(minutes_left) * 60.0
+
+
+def _is_crypto_updown_entry_prewarm_candidate(settings: Settings, market: MarketRecord, now: datetime) -> bool:
+    decision = classify_near_close_market(market)
+    if decision.variant != "crypto_updown":
+        return False
+    seconds_left = _seconds_to_resolution(market, now)
+    if seconds_left is None:
+        return False
+    _entry_min_seconds, entry_max_seconds = settings.near_close_entry_window_seconds()
+    prewarm_seconds = max(float(settings.near_close_crypto_updown_prewarm_seconds), 0.0)
+    if prewarm_seconds <= 0:
+        return False
+    return entry_max_seconds < seconds_left <= entry_max_seconds + prewarm_seconds
+
+
 async def enrich_crypto_near_close_markets(settings: Settings, markets: list[MarketRecord]) -> None:
     if not settings.near_close_crypto_enabled:
         return
@@ -272,10 +293,17 @@ def _is_near_close_pool_candidate(settings: Settings, market: MarketRecord, now:
     decision = classify_near_close_market(market)
     if not decision.allowed:
         return False
-    if not settings.near_close_entry_minutes_allowed(minutes_left):
+    if not settings.near_close_entry_minutes_allowed(minutes_left) and not _is_crypto_updown_entry_prewarm_candidate(
+        settings,
+        market,
+        now,
+    ):
         return False
     _min_minutes, max_minutes = _near_close_time_window(settings, decision.variant)
-    if minutes_left > min(settings.near_close_scan_lookahead_minutes, max_minutes):
+    prewarm_minutes = 0.0
+    if decision.variant == "crypto_updown":
+        prewarm_minutes = max(float(settings.near_close_crypto_updown_prewarm_seconds), 0.0) / 60.0
+    if minutes_left > min(settings.near_close_scan_lookahead_minutes, max_minutes + prewarm_minutes):
         return False
     if not market.resolution_source:
         return False
@@ -318,6 +346,7 @@ def build_near_close_funnel(
     ]
     typed = [market for market in sourced if classify_near_close_market(market).allowed]
     in_window: list[MarketRecord] = []
+    prewarm: list[MarketRecord] = []
     for market in typed:
         minutes_left = _minutes_to_resolution(market, current)
         decision = classify_near_close_market(market)
@@ -328,6 +357,8 @@ def build_near_close_funnel(
             and settings.near_close_entry_minutes_allowed(minutes_left)
         ):
             in_window.append(market)
+        elif _is_crypto_updown_entry_prewarm_candidate(settings, market, current):
+            prewarm.append(market)
 
     shortlisted_markets = shortlisted if shortlisted is not None else in_window[: settings.near_close_scan_pool_limit]
     book_ready_count = 0
@@ -365,6 +396,14 @@ def build_near_close_funnel(
             "label": "\u7b26\u5408\u7b56\u7565\u985e\u578b",
             "count": len(typed),
             "description": "\u5b98\u65b9/\u5ba2\u89c0\u4f86\u6e90\u3001crypto above/below \u56fa\u5b9a strike\u3001\u6216 crypto Up/Down proxy fair value\u3002",
+        },
+        {
+            "label": "crypto Up/Down \u9810\u71b1",
+            "count": len(prewarm),
+            "description": (
+                f"\u8ddd\u96e2\u9032\u5834\u7a97\u53e3\u524d {settings.near_close_crypto_updown_prewarm_seconds:g} "
+                "\u79d2\u5167\u7684 BTC/ETH/SOL/BNB bucket\uff1b\u53ea\u9810\u5148\u76e3\u770b\uff0c\u672a\u9032\u5834\u7a97\u524d\u4e0d\u9001\u55ae\u3002"
+            ),
         },
         {
             "label": "\u843d\u5728\u6642\u9593\u7a97",
@@ -440,6 +479,8 @@ def shortlist_near_close_markets(
     def shortlisted_entry(market: MarketRecord) -> dict[str, object]:
         decision = classify_near_close_market(market)
         reasons = ["near_close_pool", "binary", "resolution_source", decision.reason]
+        if _is_crypto_updown_entry_prewarm_candidate(settings, market, now):
+            reasons.append("entry_prewarm")
         if market.restricted:
             reasons.append("restricted_market")
         return {

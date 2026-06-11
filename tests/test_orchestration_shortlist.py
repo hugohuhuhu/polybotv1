@@ -466,6 +466,50 @@ def test_near_close_pool_crypto_updown_only_keeps_one_market_per_core_symbol() -
     assert diagnostics["crypto_updown_selected_symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
 
+def test_near_close_pool_prewarms_crypto_updown_before_entry_window() -> None:
+    settings = Settings(
+        NEAR_CLOSE_SCAN_POOL_LIMIT=4,
+        NEAR_CLOSE_SCAN_CRYPTO_UPDOWN_ONLY=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_SYMBOLS="ETHUSDT",
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=30,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=60,
+        NEAR_CLOSE_CRYPTO_UPDOWN_PREWARM_SECONDS=60,
+    )
+    now = datetime.now(timezone.utc)
+    eth = make_market(
+        "eth-prewarm",
+        event_id="crypto",
+        slug="eth-updown-prewarm",
+        question="Ethereum Up or Down - May 2, 5:55AM-6:00AM ET",
+        yes_price=0.68,
+        liquidity=9000,
+    ).model_copy(
+        update={
+            "event_title": "Ethereum Up or Down - May 2, 5:55AM-6:00AM ET",
+            "outcome_labels": ["Up", "Down"],
+            "token_ids": ["eth-up", "eth-down"],
+            "end_date": now + timedelta(seconds=75),
+            "resolution_source": "https://data.chain.link/streams/eth-usd",
+            "raw": {
+                "eventStartTime": (now - timedelta(minutes=4)).isoformat(),
+                "near_close_crypto_variant": "updown_proxy",
+                "near_close_crypto_spot_price": 3010.0,
+                "near_close_crypto_start_price": 3000.0,
+                "near_close_crypto_start_distance": 0.003333,
+                "near_close_crypto_winning_outcome": "Up",
+            },
+        }
+    )
+
+    shortlisted, diagnostics = shortlist_near_close_markets([eth], settings=settings)
+
+    assert [market.slug for market in shortlisted] == ["eth-updown-prewarm"]
+    assert diagnostics["shortlisted_markets"][0]["reasons"][-1] == "entry_prewarm"
+    funnel_by_label = {stage["label"]: stage["count"] for stage in diagnostics["near_close_funnel"]}
+    assert funnel_by_label["crypto Up/Down 預熱"] == 1
+    assert funnel_by_label["落在時間窗"] == 0
+
+
 def test_near_close_pool_crypto_updown_only_excludes_non_core_symbols() -> None:
     settings = Settings(
         NEAR_CLOSE_SCAN_POOL_LIMIT=5,

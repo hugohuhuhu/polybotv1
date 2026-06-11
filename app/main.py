@@ -140,6 +140,38 @@ def _monitored_markets_expired(monitored_markets: list[Any] | None, *, now: date
     return bool(end_dates) and all(end_date <= checked_at for end_date in end_dates)
 
 
+def _watch_delay_sec_for_near_close_pacing(
+    settings: Settings,
+    monitored_markets: list[Any] | None,
+    *,
+    now: datetime | None = None,
+) -> float:
+    base_delay = max(float(settings.scan_interval_sec), 0.0)
+    if not monitored_markets or not settings.near_close_scan_crypto_updown_only:
+        return base_delay
+    checked_at = now or datetime.now(timezone.utc)
+    entry_min_seconds, entry_max_seconds = settings.near_close_entry_window_seconds()
+    prewarm_seconds = max(float(settings.near_close_crypto_updown_prewarm_seconds), 0.0)
+    fast_delay = max(float(settings.near_close_crypto_updown_fast_scan_sec), 0.5)
+    best_delay = base_delay
+    for market in monitored_markets:
+        end_date = getattr(market, "end_date", None)
+        if not isinstance(end_date, datetime):
+            continue
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        seconds_left = (end_date.astimezone(timezone.utc) - checked_at).total_seconds()
+        if seconds_left <= 0 or seconds_left < entry_min_seconds:
+            continue
+        if entry_min_seconds <= seconds_left <= entry_max_seconds:
+            best_delay = min(best_delay, fast_delay)
+            continue
+        if entry_max_seconds < seconds_left <= entry_max_seconds + prewarm_seconds:
+            seconds_until_window = max(seconds_left - entry_max_seconds, 0.5)
+            best_delay = min(best_delay, fast_delay, seconds_until_window)
+    return best_delay
+
+
 def _save_watch_heartbeat(
     settings: Settings,
     *,
@@ -1088,7 +1120,12 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         monitored_markets = list(initial.shortlisted_markets)
         monitored_shortlist_diagnostics = dict(initial.shortlist_diagnostics)
         while True:
-            await _watch_delay(settings, delay_sec=settings.scan_interval_sec)
+            current_delay_sec = _watch_delay_sec_for_near_close_pacing(settings, monitored_markets)
+            await _watch_delay(
+                settings,
+                delay_sec=current_delay_sec,
+                details={"near_close_pacing_delay_sec": current_delay_sec},
+            )
             _touch_watch_liveness()
             scan_started_at = datetime.now(timezone.utc)
             loop_started_at = asyncio.get_running_loop().time()
@@ -1102,7 +1139,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                     "phase": "scanning",
                     "scan_started_at": scan_started_at.isoformat(),
                     "timeout_sec": settings.watch_scan_timeout_sec,
-                    "delay_sec": settings.scan_interval_sec,
+                    "delay_sec": current_delay_sec,
                     "refresh_discovery": refresh_monitored_markets,
                 },
             )
@@ -1184,7 +1221,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             "phase": "completed",
                             "scan_started_at": scan_started_at.isoformat(),
                             "scan_completed_at": cycle.executed_at.isoformat(),
-                            "delay_sec": settings.scan_interval_sec,
+                            "delay_sec": current_delay_sec,
                             "scan_timeout_sec": settings.watch_scan_timeout_sec,
                             "refresh_discovery": refresh_monitored_markets,
                             "monitored_markets": len(cycle.shortlisted_markets),
