@@ -52,6 +52,7 @@ WATCH_PID_FILE = RUNTIME_LOG_DIR / "watch.pid"
 WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
 LIVE_FILL_ACTIVITY_LIMIT = 50
 WATCH_AUXILIARY_TIMEOUT_SEC = 12.0
+CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC = 300.0
 
 
 def _read_pid(pid_file: Path) -> int | None:
@@ -140,6 +141,36 @@ def _monitored_markets_expired(monitored_markets: list[Any] | None, *, now: date
     return bool(end_dates) and all(end_date <= checked_at for end_date in end_dates)
 
 
+def _crypto_updown_bucket_seconds_to_resolution(now: datetime | None = None) -> float:
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    timestamp = checked_at.astimezone(timezone.utc).timestamp()
+    elapsed = timestamp % CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC
+    return CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC - elapsed
+
+
+def _watch_initial_scan_delay_sec(settings: Settings, *, now: datetime | None = None) -> float:
+    if not (
+        settings.near_close_maker_enabled
+        and settings.near_close_scan_pool_enabled
+        and settings.near_close_scan_crypto_updown_only
+    ):
+        return 0.0
+    seconds_left = _crypto_updown_bucket_seconds_to_resolution(now)
+    entry_min_seconds, entry_max_seconds = settings.near_close_entry_window_seconds()
+    prewarm_seconds = max(float(settings.near_close_crypto_updown_prewarm_seconds), 0.0)
+    prewarm_horizon = min(
+        entry_max_seconds + prewarm_seconds,
+        CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC,
+    )
+    if entry_min_seconds <= seconds_left <= prewarm_horizon:
+        return 0.0
+    if seconds_left > prewarm_horizon:
+        return seconds_left - prewarm_horizon
+    return seconds_left + CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC - prewarm_horizon
+
+
 def _watch_delay_sec_for_near_close_pacing(
     settings: Settings,
     monitored_markets: list[Any] | None,
@@ -147,12 +178,28 @@ def _watch_delay_sec_for_near_close_pacing(
     now: datetime | None = None,
 ) -> float:
     base_delay = max(float(settings.scan_interval_sec), 0.0)
-    if not monitored_markets or not settings.near_close_scan_crypto_updown_only:
+    if not (
+        settings.near_close_maker_enabled
+        and settings.near_close_scan_pool_enabled
+        and settings.near_close_scan_crypto_updown_only
+    ):
         return base_delay
     checked_at = now or datetime.now(timezone.utc)
     entry_min_seconds, entry_max_seconds = settings.near_close_entry_window_seconds()
     prewarm_seconds = max(float(settings.near_close_crypto_updown_prewarm_seconds), 0.0)
     fast_delay = max(float(settings.near_close_crypto_updown_fast_scan_sec), 0.5)
+    if not monitored_markets:
+        seconds_left = _crypto_updown_bucket_seconds_to_resolution(checked_at)
+        prewarm_horizon = min(
+            entry_max_seconds + prewarm_seconds,
+            CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC,
+        )
+        if seconds_left > prewarm_horizon:
+            return seconds_left - prewarm_horizon
+        if seconds_left < entry_min_seconds:
+            return seconds_left + CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC - prewarm_horizon
+        next_boundary = entry_max_seconds if seconds_left > entry_max_seconds else entry_min_seconds
+        return min(base_delay, max(seconds_left - next_boundary, 0.5))
     best_delay = base_delay
     for market in monitored_markets:
         end_date = getattr(market, "end_date", None)
@@ -982,6 +1029,20 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             if not task.done():
                 task.cancel()
 
+    initial_schedule_delay_sec = _watch_initial_scan_delay_sec(settings)
+    if initial_schedule_delay_sec > 0:
+        await _watch_delay(
+            settings,
+            delay_sec=initial_schedule_delay_sec,
+            message="watch waiting for next crypto Up/Down bucket prewarm",
+            details={
+                "phase": "bucket_idle",
+                "near_close_bucket_aligned": True,
+                "next_scan_delay_sec": initial_schedule_delay_sec,
+            },
+            monitor_callback=monitor_open_positions_once,
+        )
+
     while True:
         _touch_watch_liveness()
         scan_started_at = datetime.now(timezone.utc)
@@ -1124,7 +1185,11 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             await _watch_delay(
                 settings,
                 delay_sec=current_delay_sec,
-                details={"near_close_pacing_delay_sec": current_delay_sec},
+                details={
+                    "near_close_pacing_delay_sec": current_delay_sec,
+                    "near_close_bucket_aligned": settings.near_close_scan_crypto_updown_only,
+                },
+                monitor_callback=monitor_open_positions_once,
             )
             _touch_watch_liveness()
             scan_started_at = datetime.now(timezone.utc)
