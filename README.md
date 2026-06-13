@@ -213,6 +213,7 @@ Relevant settings:
 - `NEAR_CLOSE_SCAN_POOL_LIMIT=4` keeps the watch shortlist focused on one active Up/Down market per core symbol when possible.
 - `WATCH_SCAN_TIMEOUT_SEC=10` and `SCAN_INTERVAL_SEC=8` keep each watch scan on a 10-second budget with an 8-second normal refresh cadence.
 - `NEAR_CLOSE_ENTRY_MAX_SECONDS=60` and `NEAR_CLOSE_ENTRY_MIN_SECONDS=30` make near-close maker new entries a 60-to-30-second experiment across all near-close variants.
+- `NEAR_CLOSE_EXISTING_ORDER_HARD_CANCEL_SECONDS=12` keeps an already submitted maker order alive below the new-entry window when time is its only failed criterion, then forces cancellation at 12 seconds to resolution.
 - `NEAR_CLOSE_FINAL_SECONDS_ALLOW_ENTRY=true` keeps the final 30 seconds open when spread/depth/post-only/risk checks still pass.
 - `NEAR_CLOSE_LOG_ENTRY_TELEMETRY=true` stores entry-time seconds, bid/ask, spread, midpoint, depth, token, slug, and crypto start distance in opportunity/live-order JSON.
 - `NEAR_CLOSE_CRYPTO_UPDOWN_NO_NEW_ENTRY_LAST_SECONDS=0` is retained only as legacy compatibility; it no longer blocks the final 90 seconds.

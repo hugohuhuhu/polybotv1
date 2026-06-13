@@ -390,6 +390,7 @@ function liveOrderStatusClass(status) {
 function notOpenReasonLabel(reason) {
   const mapping = {
     entry_after_window: "\u5df2\u904e\u9032\u5834\u6642\u9593\u7a97",
+    existing_order_hard_cancel: "\u5df2\u5230\u65e2\u6709\u639b\u55ae\u5f37\u5236\u64a4\u55ae\u6642\u9593",
     entry_before_window: "\u5c1a\u672a\u9032\u5165\u9032\u5834\u6642\u9593\u7a97",
     final_seconds_entry_disabled: "\u6700\u5f8c\u79d2\u6578\u9032\u5834\u672a\u958b\u653e",
     missing_time_to_resolution: "\u7f3a\u5c11\u7d50\u7b97\u5012\u6578",

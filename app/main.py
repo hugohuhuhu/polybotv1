@@ -369,6 +369,10 @@ def _near_close_order_cancel_reason(
         "time_to_resolution_sec": seconds_left,
         "qualified_pair": (market_slug, token_id) in qualified_pairs,
     }
+    hard_cancel_seconds = max(float(settings.near_close_existing_order_hard_cancel_seconds), 0.0)
+    context["existing_order_hard_cancel_seconds"] = hard_cancel_seconds
+    if seconds_left is not None and seconds_left <= hard_cancel_seconds:
+        reasons.append("existing_order_hard_cancel")
     if book is None:
         reasons.append("missing_orderbook")
     else:
@@ -665,14 +669,24 @@ async def _cancel_unqualified_near_close_orders(
             continue
         if (market_slug, token_id) in qualified_pairs:
             continue
-        cancel_ids.append(order_id)
-        cancel_reason_by_order[order_id] = _near_close_order_cancel_reason(
+        cancel_reason = _near_close_order_cancel_reason(
             order=order,
             books=books,
             qualified_pairs=qualified_pairs,
             settings=settings,
             trigger="qualification_cancel",
         )
+        reasons = set(cancel_reason.get("not_open_reasons") or [])
+        seconds_left = cancel_reason.get("cancel_reason_context", {}).get("time_to_resolution_sec")
+        hard_cancel_seconds = max(float(settings.near_close_existing_order_hard_cancel_seconds), 0.0)
+        if (
+            reasons == {"entry_after_window"}
+            and seconds_left is not None
+            and hard_cancel_seconds < float(seconds_left) < float(settings.near_close_entry_min_seconds)
+        ):
+            continue
+        cancel_ids.append(order_id)
+        cancel_reason_by_order[order_id] = cancel_reason
 
     if not cancel_ids:
         return

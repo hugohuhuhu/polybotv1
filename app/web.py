@@ -613,6 +613,11 @@ def _trading_parameters_payload(
                     {"label": "最大部位", "value": settings.effective_near_close_max_position_size(), "unit": "股"},
                     {"label": "Live 進場時間", "value": settings.near_close_live_max_minutes_to_end, "unit": "分"},
                     {"label": "掃描時間窗", "value": f"{settings.near_close_min_minutes_to_end:g}-{settings.near_close_max_minutes_to_end:g} 分"},
+                    {
+                        "label": "既有掛單硬撤",
+                        "value": settings.near_close_existing_order_hard_cancel_seconds,
+                        "unit": "秒",
+                    },
                     {"label": "最高 bid", "value": settings.near_close_max_bid_price},
                     {"label": "最低 ask", "value": settings.near_close_min_best_ask},
                     {"label": "最低 midpoint", "value": settings.near_close_min_midpoint},
