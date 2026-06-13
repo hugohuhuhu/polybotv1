@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     near_close_emergency_slippage: float = Field(default=0.01, alias="NEAR_CLOSE_EMERGENCY_SLIPPAGE")
     near_close_emergency_max_loss: float = Field(default=0.05, alias="NEAR_CLOSE_EMERGENCY_MAX_LOSS")
     near_close_stop_exit_max_spread: float = Field(default=0.08, alias="NEAR_CLOSE_STOP_EXIT_MAX_SPREAD")
+    near_close_stop_exit_settlement_grace_sec: float = Field(
+        default=90.0,
+        alias="NEAR_CLOSE_STOP_EXIT_SETTLEMENT_GRACE_SEC",
+    )
     near_close_crypto_updown_resolution_bucket_max_live_orders: int = Field(
         default=1,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_RESOLUTION_BUCKET_MAX_LIVE_ORDERS",

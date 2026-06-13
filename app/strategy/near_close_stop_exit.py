@@ -143,6 +143,20 @@ def _time_to_resolution_sec(market_slug: str) -> float | None:
     return max(end_ts - datetime.now(timezone.utc).timestamp(), 0.0)
 
 
+def stop_exit_monitor_required(
+    market_slug: str,
+    settings: Settings,
+    *,
+    at: datetime | None = None,
+) -> bool:
+    end_ts = ScannerRepository._parse_slug_end_timestamp(str(market_slug or ""))
+    if end_ts is None:
+        return True
+    checked_at = at or datetime.now(timezone.utc)
+    grace_sec = max(float(settings.near_close_stop_exit_settlement_grace_sec), 0.0)
+    return checked_at.timestamp() <= end_ts + grace_sec
+
+
 def _direction_still_valid(details: dict[str, object]) -> bool | None:
     if "crypto_direction_broken" in details:
         return not bool(details.get("crypto_direction_broken"))
@@ -429,6 +443,8 @@ async def execute_near_close_taker_exits(
             token_id = str(group.get("token_id") or "")
             market_slug = str(group.get("market_slug") or "")
             if "updown" not in market_slug:
+                continue
+            if not stop_exit_monitor_required(market_slug, settings):
                 continue
             book = watch_books.get(token_id)
             book_source = "watch"

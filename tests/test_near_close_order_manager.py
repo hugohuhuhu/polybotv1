@@ -10,7 +10,7 @@ from app.models.core import BookLevel, LiveExecutionLegResult, LiveExecutionResu
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.near_close_order_manager import NearCloseOrderManager
-from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
+from app.strategy.near_close_stop_exit import execute_near_close_taker_exits, stop_exit_monitor_required
 
 
 _execute_near_close_taker_exits = execute_near_close_taker_exits
@@ -1243,6 +1243,73 @@ def test_near_close_stop_check_records_autopsy_when_not_triggered(tmp_path) -> N
     assert stop_event["details"]["stop_reason"] == "stop_not_triggered"
     assert stop_event["details"]["observed_best_bid"] == 0.86
     assert stop_event["details"]["trade_autopsy_id"].startswith("ta_")
+
+
+def test_stop_exit_monitor_stops_after_settlement_grace() -> None:
+    checked_at = datetime(2026, 6, 13, 1, 10, tzinfo=timezone.utc)
+    settings = Settings(NEAR_CLOSE_STOP_EXIT_SETTLEMENT_GRACE_SEC=90)
+    expired_start = int(checked_at.timestamp()) - 600
+    grace_start = int(checked_at.timestamp()) - 360
+
+    assert stop_exit_monitor_required(
+        f"btc-updown-5m-{expired_start}",
+        settings,
+        at=checked_at,
+    ) is False
+    assert stop_exit_monitor_required(
+        f"btc-updown-5m-{grace_start}",
+        settings,
+        at=checked_at,
+    ) is True
+    assert stop_exit_monitor_required("btc-updown-5m-test", settings, at=checked_at) is True
+
+
+def test_expired_near_close_position_skips_stop_check_autopsy(tmp_path) -> None:
+    class FakeTrader:
+        async def execute(self, _plan):
+            raise AssertionError("expired position must not execute stop exit")
+
+    repository = ScannerRepository(connect_db(tmp_path / "expired-stop-check.db"))
+    expired_start = int(datetime.now(timezone.utc).timestamp()) - 600
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="expired-stop-check-entry",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="token-expired",
+                    market_slug=f"btc-updown-5m-{expired_start}",
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="0xexpired-stop-check",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                )
+            ],
+        )
+    )
+
+    exits = asyncio.run(
+        _execute_near_close_taker_exits(
+            repository=repository,
+            live_trader=FakeTrader(),
+            settings=Settings(NEAR_CLOSE_STOP_EXIT_SETTLEMENT_GRACE_SEC=90),
+            watch_books={},
+        )
+    )
+    stop_events = [
+        event
+        for event in repository.trade_autopsy_events(limit=10)
+        if event["status"] == "trade_autopsy_stop_check"
+    ]
+
+    assert exits == []
+    assert stop_events == []
 
 
 def test_near_close_taker_exit_cancels_active_profit_take_before_stop(tmp_path) -> None:

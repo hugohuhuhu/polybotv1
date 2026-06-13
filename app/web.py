@@ -703,6 +703,11 @@ def _trading_parameters_payload(
                     {"label": "進場價跌幅觸發", "value": settings.near_close_hard_stop_offset},
                     {"label": "FAK 最大 spread", "value": settings.near_close_stop_exit_max_spread},
                     {
+                        "label": "結束後監控緩衝",
+                        "value": settings.near_close_stop_exit_settlement_grace_sec,
+                        "unit": "秒",
+                    },
+                    {
                         "label": "Crypto 方向確認",
                         "value": "開" if settings.near_close_crypto_updown_stop_requires_direction_break else "關",
                     },

@@ -37,7 +37,7 @@ from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner, PaperTradeSimulator
 from app.strategy.near_close_order_manager import NearCloseOrderManager
-from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
+from app.strategy.near_close_stop_exit import execute_near_close_taker_exits, stop_exit_monitor_required
 from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, resolve_funder_address
 from app.strategy.post_fill_hedge import execute_post_fill_hedges
 from app.strategy.post_fill_profit_take import execute_post_fill_profit_takes
@@ -475,10 +475,12 @@ async def _sync_live_fills_to_db(
 _execute_near_close_taker_exits = execute_near_close_taker_exits
 
 
-def _open_position_token_ids(repository: ScannerRepository) -> list[str]:
+def _open_position_token_ids(repository: ScannerRepository, settings: Settings) -> list[str]:
     token_ids: list[str] = []
     for group in repository.near_close_stop_exit_groups(limit=50):
         if float(group.get("open_size") or 0.0) <= 1e-9:
+            continue
+        if not stop_exit_monitor_required(str(group.get("market_slug") or ""), settings):
             continue
         token_id = str(group.get("token_id") or "").strip()
         if token_id:
@@ -495,7 +497,7 @@ async def _fetch_open_position_books(
 ) -> dict[str, object]:
     def load_token_ids() -> list[str]:
         with closing(connect_db(settings)) as connection:
-            return _open_position_token_ids(ScannerRepository(connection))
+            return _open_position_token_ids(ScannerRepository(connection), settings)
 
     token_ids = await asyncio.to_thread(load_token_ids)
     if not token_ids:
@@ -878,7 +880,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             if not controls.armed:
                 return
             runtime_settings = controls.apply(settings)
-            token_ids = _open_position_token_ids(repository)
+            token_ids = _open_position_token_ids(repository, runtime_settings)
         if not token_ids:
             return
 
