@@ -13,6 +13,9 @@ $serveStderrLog = Join-Path $logDir "serve.stderr.log"
 $watchSupervisorScript = Join-Path $PSScriptRoot "watch-supervisor.ps1"
 $watchSupervisorStdoutLog = Join-Path $logDir "watch-supervisor.start.stdout.log"
 $watchSupervisorStderrLog = Join-Path $logDir "watch-supervisor.start.stderr.log"
+$autopsyExcelUpdaterScript = Join-Path $PSScriptRoot "autopsy-excel-updater.py"
+$autopsyExcelUpdaterStdoutLog = Join-Path $logDir "autopsy-excel-updater.stdout.log"
+$autopsyExcelUpdaterStderrLog = Join-Path $logDir "autopsy-excel-updater.stderr.log"
 
 function Test-DashboardPortOpen {
     try {
@@ -28,7 +31,7 @@ function Test-DashboardPortOpen {
 }
 
 function Stop-WatchFromPidFiles {
-    foreach ($pidFileName in @("watch.pid", "watch-supervisor.pid")) {
+    foreach ($pidFileName in @("watch.pid", "watch-supervisor.pid", "autopsy-excel-updater.pid")) {
         $pidFile = Join-Path $logDir $pidFileName
         if (-not (Test-Path $pidFile)) {
             continue
@@ -214,7 +217,7 @@ $env:BOOK_FETCH_CONCURRENCY = "12"
 
 Enable-AutoExecuteIfPreflightReady
 
-Write-Host "[1/3] Starting dashboard..."
+Write-Host "[1/4] Starting dashboard..."
 Stop-WatchFromPidFiles
 $cleanupScript = Join-Path $PSScriptRoot "cleanup-near-close-orders.ps1"
 if (Test-Path $cleanupScript) {
@@ -229,7 +232,7 @@ if (-not (Test-DashboardPortOpen)) {
         -RedirectStandardError $serveStderrLog | Out-Null
 }
 
-Write-Host "[2/3] Starting watch supervisor..."
+Write-Host "[2/4] Starting watch supervisor..."
 if (Test-Path $watchSupervisorScript) {
     Start-Process -FilePath "powershell.exe" `
         -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$watchSupervisorScript`"" `
@@ -239,7 +242,17 @@ if (Test-Path $watchSupervisorScript) {
         -RedirectStandardError $watchSupervisorStderrLog | Out-Null
 }
 
-Write-Host "[3/3] Opening browser..."
+Write-Host "[3/4] Starting autopsy Excel updater..."
+if (Test-Path $autopsyExcelUpdaterScript) {
+    Start-Process -FilePath $python `
+        -ArgumentList "`"$autopsyExcelUpdaterScript`"", "--watch", "--interval", "30" `
+        -WorkingDirectory $repoRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $autopsyExcelUpdaterStdoutLog `
+        -RedirectStandardError $autopsyExcelUpdaterStderrLog | Out-Null
+}
+
+Write-Host "[4/4] Opening browser..."
 Start-Sleep -Milliseconds 800
 Start-Process $url
 Write-Host "Done. If the dashboard is still loading, refresh the browser in a few seconds."

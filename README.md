@@ -61,6 +61,20 @@ Open:
 http://localhost:8080
 ```
 
+### Desktop autopsy workbook
+
+`scripts/launch-dashboard.ps1` also starts a low-frequency background exporter for
+`C:\Users\hug0x\Desktop\交易機器人_驗屍資料.xlsx`. It checks every 30 seconds and
+rebuilds the workbook only when candidate, cancellation, trade, or related
+settlement data changes. If the workbook is open in Excel, the update is deferred
+until a later check after the file is closed.
+
+Run a one-time export manually:
+
+```bash
+python scripts/autopsy-excel-updater.py
+```
+
 ## Commands
 
 ```bash
