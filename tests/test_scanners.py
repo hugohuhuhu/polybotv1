@@ -69,6 +69,12 @@ def test_settings_defaults_to_sixty_to_thirty_second_entry_experiment() -> None:
     assert settings.near_close_crypto_updown_max_entry_price == 0.90
     assert settings.near_close_crypto_updown_prewarm_seconds == 60.0
     assert settings.near_close_crypto_updown_fast_scan_sec == 2.0
+    assert settings.near_close_crypto_updown_taker_fallback_enabled is False
+    assert settings.near_close_crypto_updown_taker_fallback_min_seconds == 30.0
+    assert settings.near_close_crypto_updown_taker_fallback_max_seconds == 45.0
+    assert settings.near_close_crypto_updown_taker_fallback_max_price == 0.90
+    assert settings.near_close_crypto_updown_taker_fallback_max_spread == 0.02
+    assert settings.near_close_crypto_updown_taker_fallback_min_start_distance_ratio == 2.0
 
 
 def test_settings_switches_light_mode_when_us_equity_market_is_closed() -> None:
@@ -712,6 +718,88 @@ def test_late_resolution_scanner_allows_final_30_seconds_when_configured() -> No
     assert round(opportunities[0].details["spread"], 6) == 0.02
     assert opportunities[0].details["bid_depth_at_best"] == 80
     assert opportunities[0].details["ask_depth_at_best"] == 80
+
+
+def test_late_resolution_scanner_uses_crypto_updown_taker_fallback_in_tight_window() -> None:
+    settings = Settings(
+        NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_SECONDS=30,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SECONDS=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_PRICE=0.90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SPREAD=0.02,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_ASK_DEPTH=5,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_START_DISTANCE_RATIO=2,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.00085,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=18,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=0.65, start_distance=0.002)
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.89, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    opportunity = opportunities[0]
+    assert opportunity.details["entry_execution_mode"] == "taker_fallback"
+    assert opportunity.details["post_only"] is False
+    assert opportunity.details["order_type"] == "FAK"
+    assert opportunity.details["entry_price"] == 0.90
+    assert opportunity.details["taker_fallback_price"] == 0.90
+    assert opportunity.details["taker_fallback_trigger"] == "tight_taker_window"
+    assert opportunity.details["taker_fallback_reasons"] == []
+    assert opportunity.prices["entry_bid"] == 0.90
+    assert opportunity.prices["taker_fallback_price"] == 0.90
+    assert opportunity.available_liquidity == 80
+
+
+def test_late_resolution_scanner_keeps_maker_when_taker_fallback_window_missed() -> None:
+    settings = Settings(
+        NEAR_CLOSE_MAKER_LIVE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SECONDS=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.00085,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=18,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=0.9, start_distance=0.002)
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.89, ask=0.90, size=80),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11, size=80),
+        },
+    )
+
+    assert len(opportunities) == 1
+    assert opportunities[0].details["entry_execution_mode"] == "maker_post_only"
+    assert opportunities[0].details["post_only"] is True
+    assert opportunities[0].details["order_type"] == "GTD"
+    assert "taker_fallback_before_window" in opportunities[0].details["taker_fallback_reasons"]
 
 
 def test_weekend_mode_lightens_crypto_updown_size_and_relaxes_spread() -> None:

@@ -865,7 +865,10 @@ function candidateQualityLabel(value, item = {}) {
 }
 
 function candidateGateLabel(item) {
-  if (item.passed_gate_label === "entry_price_liquidity_post_only") {
+  if (
+    item.passed_gate_label === "entry_price_liquidity_post_only" ||
+    item.passed_gate_label === "entry_price_liquidity_taker_fallback"
+  ) {
     return "\u6838\u5fc3\u689d\u4ef6\u901a\u904e";
   }
   if (item.passed_gate) {

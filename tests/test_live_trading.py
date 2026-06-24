@@ -284,3 +284,80 @@ def test_live_trader_submits_near_close_gtd_post_only(monkeypatch) -> None:
     assert submitted[1]["order_type"] == "GTD"
     assert submitted[1]["post_only"] is True
     assert result.leg_results[0].response["strategy_variant"] == "near_close_maker"
+
+
+def test_live_trader_submits_near_close_taker_fak(monkeypatch) -> None:
+    submitted: list[dict] = []
+
+    class FakeClobClient:
+        def __init__(self, host, chain_id=None, key=None, creds=None, signature_type=None, funder=None, **kwargs):
+            pass
+
+        def create_or_derive_api_key(self):
+            return SimpleNamespace(api_key="api-key", api_secret="secret", api_passphrase="passphrase")
+
+        def get_order_book(self, token_id):
+            return SimpleNamespace(tick_size="0.001", neg_risk=False)
+
+        def get_balance_allowance(self, _params=None):
+            return _allowance_payload()
+
+        def create_market_order(self, order_args, options=None):
+            submitted.append({"market_order_args": order_args})
+            return SimpleNamespace(
+                token_id=order_args.token_id,
+                price=order_args.price,
+                amount=order_args.amount,
+                makerAmount=str(int(order_args.amount * 10**6)),
+                takerAmount=str(int((order_args.amount / order_args.price) * 10**6)),
+            )
+
+        def post_order(self, order, order_type="GTC", post_only=False):
+            submitted.append({"order": order, "order_type": order_type, "post_only": post_only})
+            return {"orderID": "near-close-fak-1"}
+
+    monkeypatch.setattr("app.strategy.polymarket_live_trading._V2_SDK_IMPORT_ERROR", None)
+    monkeypatch.setattr("app.strategy.polymarket_live_trading.ClobClient", FakeClobClient)
+    plan = ExecutionPlan(
+        opportunity_id="near-close-fak",
+        summary="near close fak",
+        legs=[
+            ExecutionLeg(
+                action="BUY",
+                token_id="yes-token",
+                market_slug="market-a",
+                outcome_label="Yes",
+                target_price=0.90,
+                size=5.0,
+                order_type="FAK",
+                post_only=False,
+                metadata={
+                    "strategy_variant": "near_close_maker",
+                    "entry_execution_mode": "taker_fallback",
+                    "taker_fallback_trigger": "tight_taker_window",
+                },
+            )
+        ],
+        max_slippage_bps=0,
+        cancel_conditions=[],
+        live_trading_allowed=True,
+        strategy_type="late_resolution",
+        metadata={"strategy_variant": "near_close_maker"},
+    )
+    adapter = PolymarketLiveTradingAdapter(
+        Settings(
+            ENABLE_LIVE_TRADING=True,
+            POLYMARKET_PRIVATE_KEY="0x" + "1" * 64,
+            POLYMARKET_SIGNATURE_TYPE=0,
+        )
+    )
+
+    result = asyncio.run(adapter.execute(plan))
+
+    assert result.status == "submitted"
+    assert submitted[0]["market_order_args"].amount == pytest.approx(4.5)
+    assert submitted[0]["market_order_args"].price == pytest.approx(0.90)
+    assert submitted[1]["order_type"] == "FAK"
+    assert submitted[1]["post_only"] is False
+    assert result.leg_results[0].response["entry_execution_mode"] == "taker_fallback"
+    assert result.leg_results[0].response["size_mode"] == "market_collateral_buy_shares_sell"

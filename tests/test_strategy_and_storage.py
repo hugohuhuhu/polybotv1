@@ -267,6 +267,46 @@ def test_execution_planner_handles_late_resolution_single_leg() -> None:
     assert plan.live_trading_allowed is False
 
 
+def test_execution_planner_handles_near_close_taker_fallback_leg() -> None:
+    opportunity = Opportunity(
+        opportunity_id="late-fak",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="Late resolution taker",
+        summary="Late resolution taker summary",
+        market_slugs=["market-a"],
+        market_ids=["m1"],
+        token_ids=["yes"],
+        prices={"entry_bid": 0.90, "entry_ask": 0.90, "current_bid": 0.89, "target_exit_price": 1.0},
+        gross_edge=0.10,
+        estimated_fees=0.0,
+        slippage_estimate=0.001,
+        net_edge=0.094,
+        max_safe_size=5,
+        available_liquidity=50,
+        confidence_score=0.7,
+        suggested_action="Buy through strict FAK fallback",
+        details={
+            "strategy_variant": "near_close_maker",
+            "tradable_live": True,
+            "requires_exit_order": False,
+            "entry_execution_mode": "taker_fallback",
+            "post_only": False,
+            "order_type": "FAK",
+            "expiration_sec": None,
+        },
+    )
+
+    plan = ExecutionPlanner().build_plan(opportunity)
+
+    assert len(plan.legs) == 1
+    assert plan.legs[0].target_price == 0.90
+    assert plan.legs[0].post_only is False
+    assert plan.legs[0].order_type == "FAK"
+    assert plan.live_trading_allowed is True
+    assert plan.legs[0].metadata["entry_execution_mode"] == "taker_fallback"
+
+
 def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
     connection = connect_db(tmp_path / "scanner.db")
     repository = ScannerRepository(connection)

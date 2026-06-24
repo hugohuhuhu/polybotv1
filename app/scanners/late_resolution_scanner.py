@@ -114,6 +114,8 @@ class LateResolutionScanner:
             return None
 
         crypto_start_distance: float | None = None
+        required_start_distance: float | None = None
+        start_distance_rule: str | None = None
         if decision.variant == "crypto_updown":
             if not (self.settings.near_close_crypto_enabled and self.settings.near_close_crypto_updown_enabled):
                 reject("crypto_updown_disabled")
@@ -187,6 +189,11 @@ class LateResolutionScanner:
         if book.tick_size is not None and book.tick_size > 0.01:
             reject("tick_size_too_large")
             return None
+        bid_depth = book.depth_for_side("bid", best_bid)
+        if bid_depth < min_depth:
+            reject("bid_depth_below_min")
+            return None
+        ask_depth = book.depth_for_side("ask", best_ask)
 
         tick = book.tick_size or 0.001
         entry_candidate = best_bid + tick
@@ -201,20 +208,50 @@ class LateResolutionScanner:
             if passive_entry > 0 and passive_entry < best_ask:
                 entry_bid = passive_entry
                 entry_formula = f"{entry_formula}; fallback best_bid to avoid crossing"
-        if entry_bid < min_entry_price or entry_bid > max_bid_price:
-            reject("entry_price_out_of_range")
-            return None
-        if entry_bid <= 0 or entry_bid >= best_ask:
+        maker_entry_bid = entry_bid
+        maker_would_cross = entry_bid <= 0 or entry_bid >= best_ask
+        taker_fallback_reasons: list[str] = []
+        taker_fallback_thresholds: dict[str, float | bool] | None = None
+        taker_fallback_trigger: str | None = None
+        if decision.variant == "crypto_updown":
+            taker_fallback_thresholds = self._crypto_updown_taker_fallback_thresholds(
+                order_size=order_size,
+                required_start_distance=required_start_distance,
+            )
+            taker_fallback_reasons = self._crypto_updown_taker_fallback_reasons(
+                seconds_left=seconds_left,
+                best_ask=best_ask,
+                spread=spread,
+                ask_depth=ask_depth,
+                order_size=order_size,
+                crypto_start_distance=crypto_start_distance,
+                required_start_distance=required_start_distance,
+            )
+        taker_fallback_eligible = decision.variant == "crypto_updown" and not taker_fallback_reasons
+        entry_price = entry_bid
+        entry_execution_mode = "maker_post_only"
+        order_type = "GTD"
+        post_only = True
+        expiration_sec: int | None = self.settings.near_close_gtd_seconds
+        execution_depth = bid_depth
+        if taker_fallback_eligible:
+            entry_price = best_ask
+            entry_bid = best_ask
+            entry_execution_mode = "taker_fallback"
+            taker_fallback_trigger = "would_cross_post_only" if maker_would_cross else "tight_taker_window"
+            order_type = "FAK"
+            post_only = False
+            expiration_sec = None
+            execution_depth = ask_depth
+            entry_formula = f"{entry_formula}; taker fallback best_ask"
+        elif maker_would_cross:
             reject("would_cross_post_only")
             return None
-
-        bid_depth = book.depth_for_side("bid", best_bid)
-        if bid_depth < min_depth:
-            reject("bid_depth_below_min")
+        if entry_price < min_entry_price or entry_price > max_bid_price:
+            reject("entry_price_out_of_range")
             return None
-        ask_depth = book.depth_for_side("ask", best_ask)
 
-        gross_edge = 1.0 - entry_bid
+        gross_edge = 1.0 - entry_price
         risk_penalty = self.settings.estimated_cost_per_leg + 0.005
         net_edge = gross_edge - risk_penalty
         if net_edge <= self.settings.candidate_min_net_edge:
@@ -231,11 +268,11 @@ class LateResolutionScanner:
         max_safe_size = min(
             order_size,
             self.settings.live_max_order_size,
-            max(bid_depth, min_depth),
+            execution_depth,
         )
         emergency_worst_price = max(
             best_bid - self.settings.near_close_emergency_slippage,
-            entry_bid - self.settings.near_close_emergency_max_loss,
+            entry_price - self.settings.near_close_emergency_max_loss,
         )
         live_distance_allowed = not (
             decision.variant == "crypto_updown"
@@ -246,7 +283,7 @@ class LateResolutionScanner:
             "strategy_variant": "near_close_maker",
             "outcome_label": outcome_label,
             "time_to_resolution_sec": round(seconds_left, 3),
-            "entry_price": entry_bid,
+            "entry_price": entry_price,
             "best_bid": best_bid,
             "best_ask": best_ask,
             "spread": spread,
@@ -255,9 +292,11 @@ class LateResolutionScanner:
             "ask_depth_at_best": ask_depth,
             "market_slug": market.slug,
             "token_id": book.token_id,
-            "entry_bid": entry_bid,
+            "entry_bid": entry_price,
+            "maker_entry_bid": maker_entry_bid,
             "entry_ask": best_ask,
             "entry_formula": entry_formula,
+            "entry_execution_mode": entry_execution_mode,
             "min_entry_price": min_entry_price,
             "max_entry_price": max_bid_price,
             "max_bid_price": max_bid_price,
@@ -297,20 +336,28 @@ class LateResolutionScanner:
                 else None
             ),
             "crypto_winning_outcome": market.raw.get("near_close_crypto_winning_outcome"),
+            "taker_fallback_enabled": bool(self.settings.near_close_crypto_updown_taker_fallback_enabled)
+            if decision.variant == "crypto_updown"
+            else None,
+            "taker_fallback_eligible": taker_fallback_eligible if decision.variant == "crypto_updown" else None,
+            "taker_fallback_trigger": taker_fallback_trigger,
+            "taker_fallback_reasons": taker_fallback_reasons if decision.variant == "crypto_updown" else None,
+            "taker_fallback_thresholds": taker_fallback_thresholds,
+            "taker_fallback_price": best_ask if taker_fallback_eligible else None,
             "tradable_live": bool(
                 self.settings.near_close_maker_live_enabled
                 and live_distance_allowed
                 and self.settings.near_close_entry_seconds_allowed(seconds_left)
             ),
             "requires_exit_order": False,
-            "post_only": True,
-            "order_type": "GTD",
-            "expiration_sec": self.settings.near_close_gtd_seconds,
+            "post_only": post_only,
+            "order_type": order_type,
+            "expiration_sec": expiration_sec,
             "gtd_safety_buffer_sec": self.settings.near_close_gtd_safety_buffer_sec,
             "max_market_exposure": self.settings.effective_near_close_max_market_exposure(),
             "max_total_exposure": self.settings.effective_near_close_max_total_exposure(),
-            "soft_stop_price": round(entry_bid - self.settings.near_close_soft_stop_offset, 6),
-            "hard_stop_midpoint": round(entry_bid - self.settings.near_close_hard_stop_offset, 6),
+            "soft_stop_price": round(entry_price - self.settings.near_close_soft_stop_offset, 6),
+            "hard_stop_midpoint": round(entry_price - self.settings.near_close_hard_stop_offset, 6),
             "hard_stop_bid": self.settings.near_close_hard_stop_bid,
             "emergency_worst_price": round(emergency_worst_price, 6),
             "cancel_if": {
@@ -329,22 +376,40 @@ class LateResolutionScanner:
             },
             "paper_observation_required": self.settings.near_close_min_paper_signals_for_live,
         }
-        summary = (
-            f"Near-close maker bid {entry_bid:.3f} on {outcome_label}; "
-            f"{minutes_left:.1f} minutes to close; post-only GTD entry only."
-        )
+        if entry_execution_mode == "taker_fallback":
+            summary = (
+                f"Near-close taker FAK buy {entry_price:.3f} on {outcome_label}; "
+                f"{minutes_left:.1f} minutes to close; strict crypto Up/Down fallback."
+            )
+            title_suffix = "near-close taker fallback"
+            suggested_action = (
+                f"Submit FAK taker buy {entry_price:.3f} on {outcome_label}; "
+                "strict fallback is live-eligible only inside the 30-45 second window."
+            )
+        else:
+            summary = (
+                f"Near-close maker bid {entry_price:.3f} on {outcome_label}; "
+                f"{minutes_left:.1f} minutes to close; post-only GTD entry only."
+            )
+            title_suffix = "near-close maker"
+            suggested_action = (
+                f"Paper observe post-only GTD bid {entry_price:.3f} on {outcome_label}; "
+                "live remains gated until the near-close paper signal requirement is met."
+            )
         return Opportunity(
             opportunity_id=self._make_id(market.slug, book.token_id),
             strategy_type=StrategyType.LATE_RESOLUTION,
             direction=SignalDirection.BUY_BASKET,
-            title=f"{market.question} | near-close maker {outcome_label}",
+            title=f"{market.question} | {title_suffix} {outcome_label}",
             summary=summary,
             market_slugs=[market.slug],
             market_ids=[market.market_id],
             token_ids=[book.token_id],
             prices={
-                "entry_bid": entry_bid,
+                "entry_bid": entry_price,
                 "entry_ask": best_ask,
+                "maker_entry_bid": maker_entry_bid,
+                "taker_fallback_price": best_ask if taker_fallback_eligible else None,
                 "current_bid": best_bid,
                 "current_midpoint": midpoint,
                 "target_exit_price": 1.0,
@@ -354,16 +419,74 @@ class LateResolutionScanner:
             slippage_estimate=self.settings.slippage_bps / 10_000,
             net_edge=net_edge,
             max_safe_size=max_safe_size,
-            available_liquidity=bid_depth,
+            available_liquidity=execution_depth,
             confidence_score=confidence,
             timestamp=utc_now(),
-            suggested_action=(
-                f"Paper observe post-only GTD bid {entry_bid:.3f} on {outcome_label}; "
-                "live remains gated until the near-close paper signal requirement is met."
-            ),
+            suggested_action=suggested_action,
             link_slugs=[market.slug],
             details=details,
         )
+
+    def _crypto_updown_taker_fallback_thresholds(
+        self,
+        *,
+        order_size: float,
+        required_start_distance: float | None,
+    ) -> dict[str, float | bool]:
+        min_seconds = max(float(self.settings.near_close_crypto_updown_taker_fallback_min_seconds), 0.0)
+        max_seconds = max(float(self.settings.near_close_crypto_updown_taker_fallback_max_seconds), min_seconds)
+        min_start_ratio = max(
+            float(self.settings.near_close_crypto_updown_taker_fallback_min_start_distance_ratio),
+            0.0,
+        )
+        required_distance = max(float(required_start_distance or 0.0), 0.0)
+        return {
+            "enabled": bool(self.settings.near_close_crypto_updown_taker_fallback_enabled),
+            "min_seconds": min_seconds,
+            "max_seconds": max_seconds,
+            "max_price": float(self.settings.near_close_crypto_updown_taker_fallback_max_price),
+            "max_spread": float(self.settings.near_close_crypto_updown_taker_fallback_max_spread),
+            "min_ask_depth": max(
+                float(self.settings.near_close_crypto_updown_taker_fallback_min_ask_depth),
+                float(order_size),
+            ),
+            "min_start_distance_ratio": min_start_ratio,
+            "min_start_distance": required_distance * min_start_ratio,
+        }
+
+    def _crypto_updown_taker_fallback_reasons(
+        self,
+        *,
+        seconds_left: float,
+        best_ask: float,
+        spread: float,
+        ask_depth: float,
+        order_size: float,
+        crypto_start_distance: float | None,
+        required_start_distance: float | None,
+    ) -> list[str]:
+        thresholds = self._crypto_updown_taker_fallback_thresholds(
+            order_size=order_size,
+            required_start_distance=required_start_distance,
+        )
+        reasons: list[str] = []
+        if not thresholds["enabled"]:
+            reasons.append("taker_fallback_disabled")
+        if seconds_left < float(thresholds["min_seconds"]):
+            reasons.append("taker_fallback_after_window")
+        if seconds_left > float(thresholds["max_seconds"]):
+            reasons.append("taker_fallback_before_window")
+        if best_ask > float(thresholds["max_price"]):
+            reasons.append("taker_fallback_ask_above_max")
+        if spread > float(thresholds["max_spread"]):
+            reasons.append("taker_fallback_spread_above_max")
+        if ask_depth < float(thresholds["min_ask_depth"]):
+            reasons.append("taker_fallback_ask_depth_below_min")
+        required_distance = float(thresholds["min_start_distance"])
+        observed_distance = float(crypto_start_distance or 0.0)
+        if required_distance > 0 and observed_distance < required_distance:
+            reasons.append("taker_fallback_start_distance_below_ratio")
+        return reasons
 
     @staticmethod
     def _make_id(slug: str, token_id: str) -> str:

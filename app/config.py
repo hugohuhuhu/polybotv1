@@ -318,6 +318,34 @@ class Settings(BaseSettings):
         default=0.003,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIDPOINT_DISCOUNT",
     )
+    near_close_crypto_updown_taker_fallback_enabled: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_ENABLED",
+    )
+    near_close_crypto_updown_taker_fallback_min_seconds: float = Field(
+        default=30.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_SECONDS",
+    )
+    near_close_crypto_updown_taker_fallback_max_seconds: float = Field(
+        default=45.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SECONDS",
+    )
+    near_close_crypto_updown_taker_fallback_max_price: float = Field(
+        default=0.90,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_PRICE",
+    )
+    near_close_crypto_updown_taker_fallback_max_spread: float = Field(
+        default=0.02,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SPREAD",
+    )
+    near_close_crypto_updown_taker_fallback_min_ask_depth: float = Field(
+        default=5.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_ASK_DEPTH",
+    )
+    near_close_crypto_updown_taker_fallback_min_start_distance_ratio: float = Field(
+        default=2.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_START_DISTANCE_RATIO",
+    )
     near_close_post_fill_hedge_enabled: bool = Field(
         default=False,
         alias="NEAR_CLOSE_POST_FILL_HEDGE_ENABLED",

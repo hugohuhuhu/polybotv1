@@ -188,7 +188,11 @@ class ScannerRepository:
             ),
             "event_type": "candidate_observed",
             "passed_gate": 8,
-            "passed_gate_label": "entry_price_liquidity_post_only",
+            "passed_gate_label": (
+                "entry_price_liquidity_taker_fallback"
+                if details.get("entry_execution_mode") == "taker_fallback"
+                else "entry_price_liquidity_post_only"
+            ),
             "opportunity_id": opportunity.opportunity_id,
             "market_slug": market_slug,
             "market_title": opportunity.title,
@@ -218,8 +222,16 @@ class ScannerRepository:
             "qualification_label": details.get("qualification_label"),
             "alert_eligible": bool(details.get("alert_eligible", False)),
             "tradable_live": bool(details.get("tradable_live", False)),
+            "entry_execution_mode": details.get("entry_execution_mode"),
             "post_only": bool(details.get("post_only", True)),
             "order_type": details.get("order_type") or "GTD",
+            "maker_entry_bid": self._json_float(details, "maker_entry_bid"),
+            "taker_fallback_enabled": details.get("taker_fallback_enabled"),
+            "taker_fallback_eligible": details.get("taker_fallback_eligible"),
+            "taker_fallback_trigger": details.get("taker_fallback_trigger"),
+            "taker_fallback_price": self._json_float(details, "taker_fallback_price"),
+            "taker_fallback_reasons": details.get("taker_fallback_reasons"),
+            "taker_fallback_thresholds": details.get("taker_fallback_thresholds"),
             "entry_price_bucket": self._entry_price_bucket(entry_price),
             "spread_bucket": self._spread_bucket(spread),
             "start_distance_bucket": self._start_distance_bucket(start_distance),

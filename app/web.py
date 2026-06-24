@@ -646,6 +646,24 @@ def _trading_parameters_payload(
                     {"label": "進場價上限", "value": settings.near_close_crypto_updown_max_entry_price},
                     {"label": "最低 depth", "value": settings.near_close_crypto_updown_min_depth},
                     {"label": "midpoint discount", "value": settings.near_close_crypto_updown_midpoint_discount},
+                    {
+                        "label": "taker fallback",
+                        "value": "開" if settings.near_close_crypto_updown_taker_fallback_enabled else "關",
+                    },
+                    {
+                        "label": "fallback 秒窗",
+                        "value": (
+                            f"{settings.near_close_crypto_updown_taker_fallback_min_seconds:g}-"
+                            f"{settings.near_close_crypto_updown_taker_fallback_max_seconds:g}"
+                        ),
+                        "unit": "秒",
+                    },
+                    {"label": "fallback 最高價", "value": settings.near_close_crypto_updown_taker_fallback_max_price},
+                    {"label": "fallback spread", "value": settings.near_close_crypto_updown_taker_fallback_max_spread},
+                    {
+                        "label": "fallback start ratio",
+                        "value": settings.near_close_crypto_updown_taker_fallback_min_start_distance_ratio,
+                    },
                 ],
             },
             *_scan_rejection_parameter_groups(summary),
