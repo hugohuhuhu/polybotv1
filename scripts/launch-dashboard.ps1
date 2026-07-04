@@ -36,7 +36,12 @@ function Stop-WatchFromPidFiles {
         if (-not (Test-Path $pidFile)) {
             continue
         }
-        $raw = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+        $raw = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($null -eq $raw) {
+            Remove-Item $pidFile -ErrorAction SilentlyContinue
+            continue
+        }
+        $raw = $raw.Trim()
         if ($raw -match '^\d+$') {
             try {
                 Stop-Process -Id ([int]$raw) -Force -ErrorAction SilentlyContinue
@@ -184,6 +189,7 @@ $env:NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_ENABLED = "true"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_SECONDS = "10"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_BID = "0.50"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_MIDPOINT = "0.50"
+$env:NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_LAST_TRADE_MAX_AGE_SEC = "2"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK = "0.84"
 $env:NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT = "0.84"
 $env:NEAR_CLOSE_WEEKEND_CRYPTO_UPDOWN_MIN_BEST_ASK = "0.78"

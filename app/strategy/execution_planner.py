@@ -13,6 +13,8 @@ class ExecutionPlanner:
 
     def build_plan(self, opportunity: Opportunity) -> ExecutionPlan:
         legs: list[ExecutionLeg] = []
+        execution_metadata = dict(opportunity.details)
+        execution_metadata.setdefault("signal_created_at", opportunity.timestamp.isoformat())
         size = max(opportunity.max_safe_size, 0.0)
         if self.max_leg_size is not None:
             size = min(size, max(self.max_leg_size, 0.0))
@@ -35,7 +37,7 @@ class ExecutionPlanner:
                         order_type=str(opportunity.details.get("order_type") or "GTD"),
                         post_only=bool(opportunity.details.get("post_only", True)),
                         expiration_sec=int(opportunity.details.get("expiration_sec") or 20),
-                        metadata=dict(opportunity.details),
+                        metadata=dict(execution_metadata),
                     )
                 ]
             elif "yes_ask" in prices and "no_ask" in prices and len(opportunity.token_ids) >= 2:
@@ -113,7 +115,7 @@ class ExecutionPlanner:
             requires_manual_approval=True,
             live_trading_allowed=live_trading_allowed,
             strategy_type=opportunity.strategy_type.value,
-            metadata=dict(opportunity.details),
+            metadata=execution_metadata,
         )
 
 

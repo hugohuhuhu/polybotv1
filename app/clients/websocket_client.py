@@ -100,6 +100,7 @@ class OrderBookState:
             bids=normalise_book_levels(payload.get("bids", []), "bid"),
             asks=normalise_book_levels(payload.get("asks", []), "ask"),
             last_trade_price=current.last_trade_price if current else None,
+            last_trade_at=current.last_trade_at if current else None,
             updated_at=datetime.now(timezone.utc),
             source="ws",
         )
@@ -163,6 +164,20 @@ class OrderBookState:
         token_id = str(payload.get("asset_id"))
         current = self.books.get(token_id) or OrderBookSnapshot(token_id=token_id, market_id=payload.get("market"))
         current.last_trade_price = safe_float(payload.get("price"))
+        current.last_trade_at = self._event_timestamp(payload.get("timestamp"))
         current.updated_at = datetime.now(timezone.utc)
         current.source = "ws"
         self.books[token_id] = current
+
+    @staticmethod
+    def _event_timestamp(value: object) -> datetime | None:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None

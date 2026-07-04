@@ -38,6 +38,7 @@ def test_settings_use_chainlink_price_source_by_default() -> None:
 
 def test_chainlink_latest_price_decodes_rpc_round_data() -> None:
     feed = "0x0000000000000000000000000000000000000001"
+    updated_at = int(time.time())
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode("utf-8"))
@@ -45,7 +46,7 @@ def test_chainlink_latest_price_decodes_rpc_round_data() -> None:
         if data == "0x313ce567":
             result = "0x" + _slot(8)
         elif data == "0xfeaf968c":
-            result = _round_response(round_id=(1 << 64) + 7, answer=105_250_000_000, updated_at=int(time.time()))
+            result = _round_response(round_id=(1 << 64) + 7, answer=105_250_000_000, updated_at=updated_at)
         else:
             raise AssertionError(f"unexpected eth_call data {data}")
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
@@ -57,11 +58,12 @@ def test_chainlink_latest_price_decodes_rpc_round_data() -> None:
         transport=httpx.MockTransport(handler),
     )
     try:
-        prices = asyncio.run(client.get_prices({"BTCUSDT"}))
+        observations = asyncio.run(client.get_price_observations({"BTCUSDT"}))
     finally:
         asyncio.run(client.close())
 
-    assert prices == {"BTCUSDT": 1052.5}
+    assert observations["BTCUSDT"].price == 1052.5
+    assert observations["BTCUSDT"].updated_at == updated_at
 
 
 def test_chainlink_open_price_uses_round_at_or_before_start_time() -> None:
@@ -99,3 +101,29 @@ def test_chainlink_open_price_uses_round_at_or_before_start_time() -> None:
         asyncio.run(client.close())
 
     assert prices == {"market-1": 1010.0}
+
+
+def test_recent_range_observation_uses_binance_one_second_klines() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/klines"
+        payload = [
+            [1_000, "100.0", "100.2", "99.9", "100.1"],
+            [2_000, "100.1", "100.5", "100.0", "100.4"],
+            [3_000, "100.4", "100.4", "99.8", "99.9"],
+        ]
+        return httpx.Response(200, json=payload)
+
+    client = CryptoPriceClient(source="chainlink", transport=httpx.MockTransport(handler))
+    try:
+        observations = asyncio.run(
+            client.get_recent_range_observations(
+                {"market-1": ("BTCUSDT", 3_000)},
+                window_sec=3,
+                min_samples=3,
+            )
+        )
+    finally:
+        asyncio.run(client.close())
+
+    assert observations["market-1"].sample_count == 3
+    assert round(observations["market-1"].range_bps, 6) == 70.0

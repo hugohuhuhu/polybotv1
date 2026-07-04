@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.clients.crypto_price_client import CryptoPriceClient, binance_symbol_for_asset
+from app.clients.crypto_price_client import CryptoPriceClient, CryptoPriceObservation, binance_symbol_for_asset
 from app.config import Settings
 from app.models.core import ExecutionLeg, ExecutionPlan, LiveExecutionLegResult
 from app.storage.repositories import ScannerRepository
@@ -53,6 +53,10 @@ def _book_telemetry(book: Any | None) -> dict[str, object]:
         return {}
     best_bid = getattr(book, "best_bid", None)
     best_ask = getattr(book, "best_ask", None)
+    last_trade_at = getattr(book, "last_trade_at", None)
+    last_trade_age_sec = None
+    if isinstance(last_trade_at, datetime):
+        last_trade_age_sec = max((datetime.now(timezone.utc) - last_trade_at.astimezone(timezone.utc)).total_seconds(), 0.0)
     return {
         "observed_best_bid": best_bid,
         "observed_best_ask": best_ask,
@@ -60,6 +64,9 @@ def _book_telemetry(book: Any | None) -> dict[str, object]:
         "observed_spread": getattr(book, "spread", None),
         "observed_top_bid_size": book.depth_for_side("bid", best_bid) if best_bid is not None else None,
         "observed_top_ask_size": book.depth_for_side("ask", best_ask) if best_ask is not None else None,
+        "observed_last_trade_price": getattr(book, "last_trade_price", None),
+        "observed_last_trade_at": last_trade_at.isoformat() if isinstance(last_trade_at, datetime) else None,
+        "observed_last_trade_age_sec": last_trade_age_sec,
     }
 
 
@@ -168,13 +175,13 @@ def _direction_still_valid(details: dict[str, object]) -> bool | None:
     return None
 
 
-async def _crypto_price(
+async def _crypto_price_observation(
     *,
     settings: Settings,
     symbol: str,
-    cache: dict[str, float | None],
+    cache: dict[str, CryptoPriceObservation | None],
     client_holder: dict[str, CryptoPriceClient | None],
-) -> float | None:
+) -> CryptoPriceObservation | None:
     if symbol in cache:
         return cache[symbol]
     client = client_holder.get("client")
@@ -187,10 +194,10 @@ async def _crypto_price(
             chainlink_stale_after_sec=settings.chainlink_price_stale_sec,
         )
         client_holder["client"] = client
-    prices = await client.get_prices({symbol})
-    price = prices.get(symbol)
-    cache[symbol] = price
-    return price
+    observations = await client.get_price_observations({symbol})
+    observation = observations.get(symbol)
+    cache[symbol] = observation
+    return observation
 
 
 async def _crypto_updown_direction_guard(
@@ -199,8 +206,9 @@ async def _crypto_updown_direction_guard(
     market_slug: str,
     outcome_label: str,
     entry_metadata: dict[str, Any],
-    price_cache: dict[str, float | None],
+    price_cache: dict[str, CryptoPriceObservation | None],
     client_holder: dict[str, CryptoPriceClient | None],
+    time_to_resolution_sec: float | None = None,
 ) -> tuple[bool, dict[str, object]]:
     details: dict[str, object] = {
         "crypto_direction_guard_enabled": settings.near_close_crypto_updown_stop_requires_direction_break,
@@ -226,26 +234,135 @@ async def _crypto_updown_direction_guard(
     if symbol is None:
         details["crypto_direction_guard_reason"] = "missing_symbol"
         return False, details
-    spot = await _crypto_price(settings=settings, symbol=symbol, cache=price_cache, client_holder=client_holder)
+    observation = await _crypto_price_observation(
+        settings=settings,
+        symbol=symbol,
+        cache=price_cache,
+        client_holder=client_holder,
+    )
+    spot = observation.price if observation is not None else None
     details["crypto_stop_spot_price"] = spot
     if spot is None:
         details["crypto_direction_guard_reason"] = "spot_unavailable"
         return False, details
     distance = abs(spot - start_price) / start_price
+    price_age_sec = max(datetime.now(timezone.utc).timestamp() - observation.updated_at, 0.0)
+    max_price_age_sec = max(float(settings.near_close_crypto_updown_stop_price_max_age_sec), 0.0)
+    price_fresh = max_price_age_sec <= 0 or price_age_sec <= max_price_age_sec
     break_buffer = max(float(settings.near_close_crypto_updown_stop_direction_break_buffer), 0.0)
-    if outcome == "up":
-        direction_broken = spot < start_price * (1.0 - break_buffer)
-    else:
-        direction_broken = spot > start_price * (1.0 + break_buffer)
+    final_seconds_zero_buffer = bool(
+        settings.near_close_crypto_updown_stop_hard_override_enabled
+        and time_to_resolution_sec is not None
+        and time_to_resolution_sec <= max(
+            float(settings.near_close_crypto_updown_stop_hard_override_max_seconds),
+            0.0,
+        )
+    )
+    effective_break_buffer = 0.0 if final_seconds_zero_buffer else break_buffer
     details.update(
         {
             "crypto_stop_start_distance": distance,
+            "crypto_stop_price_updated_at": datetime.fromtimestamp(observation.updated_at, timezone.utc).isoformat(),
+            "crypto_stop_price_age_sec": price_age_sec,
+            "crypto_stop_price_max_age_sec": max_price_age_sec,
+            "crypto_stop_price_fresh": price_fresh,
             "crypto_direction_break_buffer": break_buffer,
+            "crypto_direction_effective_break_buffer": effective_break_buffer,
+            "crypto_direction_final_seconds_zero_buffer": final_seconds_zero_buffer,
+        }
+    )
+    if not price_fresh:
+        details["crypto_direction_guard_reason"] = "spot_stale"
+        return False, details
+    if outcome == "up":
+        direction_broken = spot < start_price * (1.0 - effective_break_buffer)
+    else:
+        direction_broken = spot > start_price * (1.0 + effective_break_buffer)
+    details.update(
+        {
             "crypto_direction_broken": direction_broken,
             "crypto_direction_guard_reason": "direction_broken" if direction_broken else "direction_still_valid",
         }
     )
     return direction_broken, details
+
+
+def _crypto_updown_stop_neutral_override(
+    *,
+    settings: Settings,
+    market_slug: str,
+    time_to_resolution_sec: float | None,
+    direction_details: dict[str, object],
+    orderbook_telemetry: dict[str, object],
+    size: float,
+) -> tuple[bool, dict[str, object]]:
+    enabled = bool(settings.near_close_crypto_updown_stop_neutral_override_enabled)
+    min_seconds = max(float(settings.near_close_crypto_updown_stop_neutral_override_min_seconds), 0.0)
+    max_seconds = max(float(settings.near_close_crypto_updown_stop_neutral_override_max_seconds), 0.0)
+    max_distance = max(float(settings.near_close_crypto_updown_stop_neutral_override_max_distance), 0.0)
+    max_bid = max(float(settings.near_close_crypto_updown_stop_neutral_override_max_bid), 0.0)
+    max_midpoint = max(float(settings.near_close_crypto_updown_stop_neutral_override_max_midpoint), 0.0)
+    max_spread = max(float(settings.near_close_crypto_updown_stop_neutral_override_max_spread), 0.0)
+    best_bid = _float_or_none(orderbook_telemetry.get("observed_best_bid"))
+    midpoint = _float_or_none(orderbook_telemetry.get("observed_midpoint"))
+    spread = _float_or_none(orderbook_telemetry.get("observed_spread"))
+    bid_depth = _float_or_none(orderbook_telemetry.get("observed_top_bid_size"))
+    start_distance = _float_or_none(direction_details.get("crypto_stop_start_distance"))
+    guard_reason = str(direction_details.get("crypto_direction_guard_reason") or "")
+    within_time_window = bool(
+        enabled
+        and "updown" in str(market_slug).lower()
+        and max_seconds > min_seconds
+        and time_to_resolution_sec is not None
+        and min_seconds < time_to_resolution_sec <= max_seconds
+    )
+    chainlink_neutral = bool(start_distance is not None and start_distance <= max_distance)
+    chainlink_unavailable = guard_reason in {"spot_stale", "spot_unavailable"}
+    bid_collapsed = bool(max_bid > 0 and best_bid is not None and best_bid <= max_bid)
+    midpoint_collapsed = bool(max_midpoint > 0 and midpoint is not None and midpoint <= max_midpoint)
+    spread_tradeable = bool(max_spread > 0 and spread is not None and spread <= max_spread)
+    depth_sufficient = bool(bid_depth is not None and bid_depth + 1e-9 >= max(size, 0.0))
+    active = bool(
+        within_time_window
+        and (chainlink_neutral or chainlink_unavailable)
+        and bid_collapsed
+        and midpoint_collapsed
+        and spread_tradeable
+        and depth_sufficient
+    )
+    reasons: list[str] = []
+    if within_time_window:
+        reasons.append("neutral_window")
+    if chainlink_neutral:
+        reasons.append("chainlink_near_start")
+    elif chainlink_unavailable:
+        reasons.append("chainlink_stale_or_unavailable")
+    if bid_collapsed:
+        reasons.append("best_bid_collapse")
+    if midpoint_collapsed:
+        reasons.append("midpoint_collapse")
+    if spread_tradeable:
+        reasons.append("spread_tradeable")
+    if depth_sufficient:
+        reasons.append("bid_depth_sufficient")
+    return active, {
+        "crypto_direction_neutral_override_enabled": enabled,
+        "crypto_direction_neutral_override_active": active,
+        "crypto_direction_neutral_override_reasons": reasons,
+        "crypto_direction_neutral_override_time_to_resolution_sec": time_to_resolution_sec,
+        "crypto_direction_neutral_override_min_seconds": min_seconds,
+        "crypto_direction_neutral_override_max_seconds": max_seconds,
+        "crypto_direction_neutral_override_max_distance": max_distance,
+        "crypto_direction_neutral_override_start_distance": start_distance,
+        "crypto_direction_neutral_override_max_bid": max_bid,
+        "crypto_direction_neutral_override_max_midpoint": max_midpoint,
+        "crypto_direction_neutral_override_max_spread": max_spread,
+        "crypto_direction_neutral_override_best_bid": best_bid,
+        "crypto_direction_neutral_override_midpoint": midpoint,
+        "crypto_direction_neutral_override_spread": spread,
+        "crypto_direction_neutral_override_bid_depth": bid_depth,
+        "crypto_direction_neutral_override_required_depth": max(size, 0.0),
+    }
 
 
 def _crypto_updown_stop_hard_override(
@@ -259,27 +376,67 @@ def _crypto_updown_stop_hard_override(
     max_seconds = max(float(settings.near_close_crypto_updown_stop_hard_override_max_seconds), 0.0)
     max_bid = max(float(settings.near_close_crypto_updown_stop_hard_override_max_bid), 0.0)
     max_midpoint = max(float(settings.near_close_crypto_updown_stop_hard_override_max_midpoint), 0.0)
+    last_trade_max_age_sec = max(
+        float(settings.near_close_crypto_updown_stop_hard_override_last_trade_max_age_sec),
+        0.0,
+    )
     best_bid = _float_or_none(orderbook_telemetry.get("observed_best_bid"))
     midpoint = _float_or_none(orderbook_telemetry.get("observed_midpoint"))
+    last_trade_price = _float_or_none(orderbook_telemetry.get("observed_last_trade_price"))
+    last_trade_age_sec = _float_or_none(orderbook_telemetry.get("observed_last_trade_age_sec"))
+    within_time_window = bool(
+        enabled
+        and max_seconds > 0
+        and time_to_resolution_sec is not None
+        and time_to_resolution_sec <= max_seconds
+    )
+    bid_collapsed = bool(max_bid > 0 and best_bid is not None and best_bid <= max_bid)
+    midpoint_collapsed = bool(max_midpoint > 0 and midpoint is not None and midpoint <= max_midpoint)
+    last_trade_threshold = max(max_bid, max_midpoint)
+    last_trade_fresh = bool(
+        last_trade_age_sec is not None
+        and (last_trade_max_age_sec <= 0 or last_trade_age_sec <= last_trade_max_age_sec)
+    )
+    last_trade_collapsed = bool(
+        last_trade_threshold > 0
+        and last_trade_price is not None
+        and last_trade_price <= last_trade_threshold
+    )
     reasons: list[str] = []
-    if enabled and "updown" in str(market_slug).lower():
-        if max_seconds > 0 and time_to_resolution_sec is not None and time_to_resolution_sec <= max_seconds:
-            reasons.append("final_seconds")
-        if max_bid > 0 and best_bid is not None and best_bid <= max_bid:
+    if within_time_window and "updown" in str(market_slug).lower():
+        reasons.append("final_seconds")
+        if bid_collapsed:
             reasons.append("best_bid_collapse")
-        if max_midpoint > 0 and midpoint is not None and midpoint <= max_midpoint:
+        if midpoint_collapsed:
             reasons.append("midpoint_collapse")
-    active = bool(reasons)
+        if last_trade_fresh:
+            reasons.append("last_trade_fresh")
+        if last_trade_collapsed:
+            reasons.append("last_trade_collapse")
+    active = bool(
+        within_time_window
+        and "updown" in str(market_slug).lower()
+        and (bid_collapsed or midpoint_collapsed)
+        and last_trade_fresh
+        and last_trade_collapsed
+    )
     return active, {
         "crypto_direction_hard_override_enabled": enabled,
         "crypto_direction_hard_override_active": active,
         "crypto_direction_hard_override_reasons": reasons,
         "crypto_direction_hard_override_time_to_resolution_sec": time_to_resolution_sec,
         "crypto_direction_hard_override_max_seconds": max_seconds,
+        "crypto_direction_hard_override_within_time_window": within_time_window,
         "crypto_direction_hard_override_max_bid": max_bid,
         "crypto_direction_hard_override_max_midpoint": max_midpoint,
         "crypto_direction_hard_override_best_bid": best_bid,
         "crypto_direction_hard_override_midpoint": midpoint,
+        "crypto_direction_hard_override_last_trade_price": last_trade_price,
+        "crypto_direction_hard_override_last_trade_age_sec": last_trade_age_sec,
+        "crypto_direction_hard_override_last_trade_max_age_sec": last_trade_max_age_sec,
+        "crypto_direction_hard_override_last_trade_threshold": last_trade_threshold,
+        "crypto_direction_hard_override_last_trade_fresh": last_trade_fresh,
+        "crypto_direction_hard_override_last_trade_collapsed": last_trade_collapsed,
     }
 
 
@@ -434,7 +591,7 @@ async def execute_near_close_taker_exits(
 ) -> list[dict[str, object]]:
     manager = NearCloseOrderManager(settings)
     exits: list[dict[str, object]] = []
-    price_cache: dict[str, float | None] = {}
+    price_cache: dict[str, CryptoPriceObservation | None] = {}
     client_holder: dict[str, CryptoPriceClient | None] = {"client": None}
     try:
         for group in repository.near_close_stop_exit_groups(limit=50):
@@ -470,6 +627,7 @@ async def execute_near_close_taker_exits(
                     opportunity_id=str(group.get("opportunity_id") or ""),
                     created_at=str(group.get("latest_at") or ""),
                 )
+            time_to_resolution_sec = _time_to_resolution_sec(market_slug)
             direction_allows_exit, direction_details = await _crypto_updown_direction_guard(
                 settings=settings,
                 market_slug=market_slug,
@@ -477,6 +635,7 @@ async def execute_near_close_taker_exits(
                 entry_metadata=entry_metadata,
                 price_cache=price_cache,
                 client_holder=client_holder,
+                time_to_resolution_sec=time_to_resolution_sec,
             )
             reference_price = manager.taker_exit_reference_price(book=book) if book is not None else None
             orderbook_telemetry = _book_telemetry(book)
@@ -488,15 +647,24 @@ async def execute_near_close_taker_exits(
                     "panic_exit_wide_spread": bool(spread is not None and max_stop_spread > 0 and spread > max_stop_spread),
                 }
             )
-            time_to_resolution_sec = _time_to_resolution_sec(market_slug)
             hard_override_allows_exit, hard_override_details = _crypto_updown_stop_hard_override(
                 settings=settings,
                 market_slug=market_slug,
                 time_to_resolution_sec=time_to_resolution_sec,
                 orderbook_telemetry=orderbook_telemetry,
             )
-            effective_direction_allows_exit = direction_allows_exit or hard_override_allows_exit
-            stop_details = {**direction_details, **hard_override_details}
+            neutral_override_allows_exit, neutral_override_details = _crypto_updown_stop_neutral_override(
+                settings=settings,
+                market_slug=market_slug,
+                time_to_resolution_sec=time_to_resolution_sec,
+                direction_details=direction_details,
+                orderbook_telemetry=orderbook_telemetry,
+                size=size,
+            )
+            effective_direction_allows_exit = (
+                direction_allows_exit or neutral_override_allows_exit or hard_override_allows_exit
+            )
+            stop_details = {**direction_details, **neutral_override_details, **hard_override_details}
             if book is None:
                 _record_stop_exit_check(
                     repository=repository,
@@ -580,6 +748,26 @@ async def execute_near_close_taker_exits(
                     opportunity_id=opportunity_id,
                     status="stop_exit_crypto_direction_hard_override",
                     message="Panic FAK stop-exit bypassed crypto direction guard because hard risk override fired.",
+                    details={
+                        "market_slug": market_slug,
+                        "token_id": token_id,
+                        "reference_price": reference_price,
+                        "target_price": target_price,
+                        "entry_price": entry_price,
+                        "size": size,
+                        "trade_autopsy_id": trade_autopsy_id,
+                        "stop_orderbook_source": book_source,
+                        **stop_details,
+                        **orderbook_telemetry,
+                    },
+                )
+            if neutral_override_allows_exit and not direction_allows_exit:
+                repository.save_execution_event(
+                    source="watch",
+                    mode="live",
+                    opportunity_id=opportunity_id,
+                    status="stop_exit_crypto_direction_neutral_override",
+                    message="Panic FAK stop-exit used the near-tie Chainlink and liquid-book risk override.",
                     details={
                         "market_slug": market_slug,
                         "token_id": token_id,

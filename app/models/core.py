@@ -98,6 +98,7 @@ class OrderBookSnapshot(BaseModel):
     bids: list[BookLevel] = Field(default_factory=list)
     asks: list[BookLevel] = Field(default_factory=list)
     last_trade_price: float | None = None
+    last_trade_at: datetime | None = None
     tick_size: float | None = None
     min_order_size: float | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

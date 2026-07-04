@@ -335,6 +335,20 @@ class LateResolutionScanner:
                 if decision.variant == "crypto_updown"
                 else None
             ),
+            "volatility_shadow_enabled": market.raw.get("near_close_volatility_shadow_enabled"),
+            "volatility_shadow_ratio_threshold": market.raw.get(
+                "near_close_volatility_shadow_ratio_threshold"
+            ),
+            "volatility_shadow_window_sec": market.raw.get("near_close_volatility_shadow_window_sec"),
+            "volatility_shadow_source": market.raw.get("near_close_volatility_shadow_source"),
+            "volatility_shadow_measured_at": market.raw.get("near_close_volatility_shadow_measured_at"),
+            "volatility_shadow_data_available": market.raw.get(
+                "near_close_volatility_shadow_data_available"
+            ),
+            "volatility_shadow_range_bps": market.raw.get("near_close_volatility_shadow_range_bps"),
+            "volatility_shadow_sample_count": market.raw.get("near_close_volatility_shadow_sample_count"),
+            "volatility_shadow_ratio": market.raw.get("near_close_volatility_shadow_ratio"),
+            "volatility_shadow_would_block": market.raw.get("near_close_volatility_shadow_would_block"),
             "crypto_winning_outcome": market.raw.get("near_close_crypto_winning_outcome"),
             "taker_fallback_enabled": bool(self.settings.near_close_crypto_updown_taker_fallback_enabled)
             if decision.variant == "crypto_updown"

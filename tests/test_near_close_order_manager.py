@@ -2,26 +2,53 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from app.clients.crypto_price_client import CryptoPriceObservation
 from app.config import Settings
-from app.main import _cancel_unqualified_near_close_orders, _sync_live_fills_to_db
+from app.main import (
+    _cancel_unqualified_near_close_orders,
+    _hard_cancel_expiring_near_close_orders,
+    _sync_live_fills_to_db,
+)
 from app.models.core import BookLevel, LiveExecutionLegResult, LiveExecutionResult, OrderBookSnapshot
 from app.storage.db import connect_db
 from app.storage.repositories import ScannerRepository
 from app.strategy.near_close_order_manager import NearCloseOrderManager
-from app.strategy.near_close_stop_exit import execute_near_close_taker_exits, stop_exit_monitor_required
+from app.strategy.near_close_stop_exit import (
+    _crypto_updown_direction_guard,
+    _crypto_updown_stop_hard_override,
+    _crypto_updown_stop_neutral_override,
+    execute_near_close_taker_exits,
+    stop_exit_monitor_required,
+)
 
 
 _execute_near_close_taker_exits = execute_near_close_taker_exits
 
 
-def make_book(*, bid: float, ask: float) -> OrderBookSnapshot:
+def make_book(
+    *,
+    bid: float,
+    ask: float,
+    last_trade_price: float | None = None,
+    last_trade_age_sec: float = 0.0,
+) -> OrderBookSnapshot:
     return OrderBookSnapshot(
         token_id="yes",
         bids=[BookLevel(price=bid, size=100)],
         asks=[BookLevel(price=ask, size=100)],
+        last_trade_price=last_trade_price,
+        last_trade_at=(
+            datetime.now(timezone.utc) - timedelta(seconds=max(last_trade_age_sec, 0.0))
+            if last_trade_price is not None
+            else None
+        ),
     )
+
+
+def fresh_price_observation(price: float) -> CryptoPriceObservation:
+    return CryptoPriceObservation(price=price, updated_at=int(datetime.now(timezone.utc).timestamp()))
 
 
 def test_near_close_manager_cancels_when_order_would_cross_or_is_too_late() -> None:
@@ -158,6 +185,116 @@ def test_cancel_unqualified_order_records_not_open_reason(tmp_path) -> None:
     assert order["not_open_reason"] == "existing_order_hard_cancel"
     assert "existing_order_hard_cancel" in order["not_open_reasons"]
     assert "entry_after_window" in order["not_open_reasons"]
+
+
+def test_independent_hard_cancel_cancels_without_scan_cycle(tmp_path) -> None:
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.cancelled = []
+
+        async def cancel_orders(self, order_ids):
+            self.cancelled.extend(order_ids)
+            return {"canceled": order_ids}
+
+    repository = ScannerRepository(connect_db(tmp_path / "independent-hard-cancel.db"))
+    checked_at = datetime(2026, 7, 3, 6, 19, 48, tzinfo=timezone.utc)
+    start_epoch = int(checked_at.timestamp()) - 288
+    market_slug = f"bnb-updown-5m-{start_epoch}"
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "independent-hard-cancel",
+                1,
+                "BUY",
+                "token-bnb",
+                market_slug,
+                "Up",
+                0.86,
+                5.0,
+                "0xindependenthardcancel",
+                "SUBMITTED",
+                json.dumps({"strategy_variant": "near_close_maker", "near_close_variant": "crypto_updown"}),
+                checked_at.isoformat(),
+            ),
+        )
+    trader = FakeTrader()
+
+    updated = asyncio.run(
+        _hard_cancel_expiring_near_close_orders(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_EXISTING_ORDER_HARD_CANCEL_SECONDS=12),
+            at=checked_at,
+        )
+    )
+
+    row = repository.connection.fetchone(
+        "SELECT status, response_json FROM live_trades WHERE order_id = ?",
+        ("0xindependenthardcancel",),
+    )
+    response = json.loads(row["response_json"])
+    assert updated == 1
+    assert trader.cancelled == ["0xindependenthardcancel"]
+    assert row["status"].upper() == "QUALIFICATION_CANCELLED"
+    assert response["not_open_reason"] == "existing_order_hard_cancel"
+    assert response["cancel_reason_context"]["trigger"] == "independent_hard_cancel"
+    assert response["cancel_reason_context"]["time_to_resolution_sec"] == 12
+
+
+def test_independent_hard_cancel_waits_before_cutoff(tmp_path) -> None:
+    class FakeTrader:
+        def __init__(self) -> None:
+            self.cancelled = []
+
+        async def cancel_orders(self, order_ids):
+            self.cancelled.extend(order_ids)
+            return {"canceled": order_ids}
+
+    repository = ScannerRepository(connect_db(tmp_path / "independent-hard-cancel-wait.db"))
+    checked_at = datetime(2026, 7, 3, 6, 19, 47, tzinfo=timezone.utc)
+    start_epoch = int(checked_at.timestamp()) - 287
+    with repository.connection.transaction():
+        repository.connection.execute(
+            """
+            INSERT INTO live_trades (
+                opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                target_price, requested_size, order_id, status, response_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "independent-hard-cancel-wait",
+                1,
+                "BUY",
+                "token-bnb",
+                f"bnb-updown-5m-{start_epoch}",
+                "Up",
+                0.86,
+                5.0,
+                "0xindependenthardcancelwait",
+                "SUBMITTED",
+                json.dumps({"strategy_variant": "near_close_maker"}),
+                checked_at.isoformat(),
+            ),
+        )
+    trader = FakeTrader()
+
+    updated = asyncio.run(
+        _hard_cancel_expiring_near_close_orders(
+            repository=repository,
+            live_trader=trader,
+            settings=Settings(NEAR_CLOSE_EXISTING_ORDER_HARD_CANCEL_SECONDS=12),
+            at=checked_at,
+        )
+    )
+
+    assert updated == 0
+    assert trader.cancelled == []
 
 
 def test_cancel_unqualified_order_keeps_time_only_failure_until_hard_cutoff(tmp_path) -> None:
@@ -355,8 +492,8 @@ def test_near_close_taker_exit_skips_when_crypto_direction_still_valid(tmp_path,
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def get_prices(self, symbols):
-            return {"BTCUSDT": 99.0}
+        async def get_price_observations(self, symbols):
+            return {"BTCUSDT": fresh_price_observation(99.0)}
 
         async def close(self) -> None:
             return None
@@ -376,6 +513,7 @@ def test_near_close_taker_exit_skips_when_crypto_direction_still_valid(tmp_path,
             )
 
     monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    monkeypatch.setattr("app.strategy.near_close_stop_exit._time_to_resolution_sec", lambda _: 40.0)
     repository = ScannerRepository(connect_db(tmp_path / "stop-direction-valid.db"))
     with repository.connection.transaction():
         repository.connection.execute(
@@ -413,7 +551,7 @@ def test_near_close_taker_exit_skips_when_crypto_direction_still_valid(tmp_path,
             repository=repository,
             live_trader=trader,
             settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
-            watch_books={"token-btc": make_book(bid=0.71, ask=0.72)},
+            watch_books={"token-btc": make_book(bid=0.37, ask=0.38)},
         )
     )
 
@@ -421,6 +559,9 @@ def test_near_close_taker_exit_skips_when_crypto_direction_still_valid(tmp_path,
     assert exits[0]["status"] == "stop_exit_skipped_crypto_direction_intact"
     assert exits[0]["crypto_stop_spot_price"] == 99.0
     assert exits[0]["crypto_direction_broken"] is False
+    assert exits[0]["crypto_direction_hard_override_active"] is False
+    assert exits[0]["crypto_direction_hard_override_reasons"] == []
+    assert exits[0]["crypto_direction_hard_override_within_time_window"] is False
 
 
 def test_near_close_taker_exit_skips_down_proxy_tie_at_start(tmp_path, monkeypatch) -> None:
@@ -428,8 +569,8 @@ def test_near_close_taker_exit_skips_down_proxy_tie_at_start(tmp_path, monkeypat
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def get_prices(self, symbols):
-            return {"SOLUSDT": 100.0}
+        async def get_price_observations(self, symbols):
+            return {"SOLUSDT": fresh_price_observation(100.0)}
 
         async def close(self) -> None:
             return None
@@ -506,8 +647,8 @@ def test_near_close_taker_exit_hard_override_bypasses_intact_crypto_direction(tm
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def get_prices(self, symbols):
-            return {"BTCUSDT": 99.0}
+        async def get_price_observations(self, symbols):
+            return {"BTCUSDT": fresh_price_observation(99.0)}
 
         async def close(self) -> None:
             return None
@@ -527,6 +668,7 @@ def test_near_close_taker_exit_hard_override_bypasses_intact_crypto_direction(tm
             )
 
     monkeypatch.setattr("app.strategy.near_close_stop_exit.CryptoPriceClient", FakePriceClient)
+    monkeypatch.setattr("app.strategy.near_close_stop_exit._time_to_resolution_sec", lambda _: 8.0)
     repository = ScannerRepository(connect_db(tmp_path / "stop-direction-hard-override.db"))
     with repository.connection.transaction():
         repository.connection.execute(
@@ -564,7 +706,13 @@ def test_near_close_taker_exit_hard_override_bypasses_intact_crypto_direction(tm
             repository=repository,
             live_trader=trader,
             settings=Settings(NEAR_CLOSE_TAKER_EXIT_PRICE=0.52, NEAR_CLOSE_HARD_STOP_OFFSET=0.2),
-            watch_books={"token-btc": make_book(bid=0.37, ask=0.38)},
+            watch_books={
+                "token-btc": make_book(
+                    bid=0.37,
+                    ask=0.38,
+                    last_trade_price=0.39,
+                )
+            },
         )
     )
 
@@ -573,7 +721,210 @@ def test_near_close_taker_exit_hard_override_bypasses_intact_crypto_direction(tm
     assert trader.plan.legs[0].order_type == "FAK"
     assert trader.plan.legs[0].metadata["crypto_direction_broken"] is False
     assert trader.plan.legs[0].metadata["crypto_direction_hard_override_active"] is True
+    assert trader.plan.legs[0].metadata["crypto_direction_hard_override_within_time_window"] is True
+    assert "final_seconds" in trader.plan.legs[0].metadata["crypto_direction_hard_override_reasons"]
     assert "best_bid_collapse" in trader.plan.legs[0].metadata["crypto_direction_hard_override_reasons"]
+    assert "last_trade_fresh" in trader.plan.legs[0].metadata["crypto_direction_hard_override_reasons"]
+    assert "last_trade_collapse" in trader.plan.legs[0].metadata["crypto_direction_hard_override_reasons"]
+
+
+def test_near_close_hard_override_requires_fresh_low_last_trade() -> None:
+    settings = Settings(NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_LAST_TRADE_MAX_AGE_SEC=2.0)
+    base_book = {
+        "observed_best_bid": 0.5,
+        "observed_midpoint": 0.5,
+    }
+
+    high_trade_allowed, high_trade_details = _crypto_updown_stop_hard_override(
+        settings=settings,
+        market_slug="btc-updown-5m-test",
+        time_to_resolution_sec=4.0,
+        orderbook_telemetry={
+            **base_book,
+            "observed_last_trade_price": 0.99,
+            "observed_last_trade_age_sec": 0.5,
+        },
+    )
+    stale_trade_allowed, stale_trade_details = _crypto_updown_stop_hard_override(
+        settings=settings,
+        market_slug="btc-updown-5m-test",
+        time_to_resolution_sec=4.0,
+        orderbook_telemetry={
+            **base_book,
+            "observed_last_trade_price": 0.48,
+            "observed_last_trade_age_sec": 2.1,
+        },
+    )
+    low_trade_allowed, low_trade_details = _crypto_updown_stop_hard_override(
+        settings=settings,
+        market_slug="btc-updown-5m-test",
+        time_to_resolution_sec=4.0,
+        orderbook_telemetry={
+            **base_book,
+            "observed_last_trade_price": 0.48,
+            "observed_last_trade_age_sec": 0.5,
+        },
+    )
+
+    assert high_trade_allowed is False
+    assert high_trade_details["crypto_direction_hard_override_last_trade_fresh"] is True
+    assert high_trade_details["crypto_direction_hard_override_last_trade_collapsed"] is False
+    assert stale_trade_allowed is False
+    assert stale_trade_details["crypto_direction_hard_override_last_trade_fresh"] is False
+    assert low_trade_allowed is True
+    assert low_trade_details["crypto_direction_hard_override_last_trade_fresh"] is True
+    assert low_trade_details["crypto_direction_hard_override_last_trade_collapsed"] is True
+
+
+def test_near_close_neutral_override_allows_liquid_exit_near_chainlink_tie() -> None:
+    allowed, details = _crypto_updown_stop_neutral_override(
+        settings=Settings(),
+        market_slug="sol-updown-5m-test",
+        time_to_resolution_sec=18.5,
+        direction_details={
+            "crypto_stop_start_distance": 0.0000068,
+            "crypto_direction_guard_reason": "direction_still_valid",
+        },
+        orderbook_telemetry={
+            "observed_best_bid": 0.52,
+            "observed_midpoint": 0.525,
+            "observed_spread": 0.01,
+            "observed_top_bid_size": 20.0,
+        },
+        size=5.0,
+    )
+
+    assert allowed is True
+    assert details["crypto_direction_neutral_override_active"] is True
+    assert "chainlink_near_start" in details["crypto_direction_neutral_override_reasons"]
+    assert "bid_depth_sufficient" in details["crypto_direction_neutral_override_reasons"]
+
+
+def test_near_close_neutral_override_rejects_decisive_direction_or_thin_depth() -> None:
+    base_book = {
+        "observed_best_bid": 0.52,
+        "observed_midpoint": 0.525,
+        "observed_spread": 0.01,
+        "observed_top_bid_size": 20.0,
+    }
+    decisive_allowed, _ = _crypto_updown_stop_neutral_override(
+        settings=Settings(),
+        market_slug="sol-updown-5m-test",
+        time_to_resolution_sec=18.5,
+        direction_details={
+            "crypto_stop_start_distance": 0.00067,
+            "crypto_direction_guard_reason": "direction_still_valid",
+        },
+        orderbook_telemetry=base_book,
+        size=5.0,
+    )
+    thin_allowed, thin_details = _crypto_updown_stop_neutral_override(
+        settings=Settings(),
+        market_slug="sol-updown-5m-test",
+        time_to_resolution_sec=18.5,
+        direction_details={
+            "crypto_stop_start_distance": 0.0000068,
+            "crypto_direction_guard_reason": "direction_still_valid",
+        },
+        orderbook_telemetry={**base_book, "observed_top_bid_size": 4.99},
+        size=5.0,
+    )
+
+    assert decisive_allowed is False
+    assert thin_allowed is False
+    assert "bid_depth_sufficient" not in thin_details["crypto_direction_neutral_override_reasons"]
+
+
+def test_near_close_neutral_override_can_use_stale_chainlink_with_strict_book_checks() -> None:
+    allowed, details = _crypto_updown_stop_neutral_override(
+        settings=Settings(),
+        market_slug="btc-updown-5m-test",
+        time_to_resolution_sec=15.0,
+        direction_details={
+            "crypto_stop_start_distance": 0.001,
+            "crypto_direction_guard_reason": "spot_stale",
+        },
+        orderbook_telemetry={
+            "observed_best_bid": 0.4,
+            "observed_midpoint": 0.41,
+            "observed_spread": 0.02,
+            "observed_top_bid_size": 10.0,
+        },
+        size=5.0,
+    )
+
+    assert allowed is True
+    assert "chainlink_stale_or_unavailable" in details["crypto_direction_neutral_override_reasons"]
+
+
+def test_near_close_direction_guard_marks_old_chainlink_round_stale() -> None:
+    class FakePriceClient:
+        async def get_price_observations(self, symbols):
+            return {
+                "SOLUSDT": CryptoPriceObservation(
+                    price=99.0,
+                    updated_at=int(datetime.now(timezone.utc).timestamp()) - 30,
+                )
+            }
+
+    allows_exit, details = asyncio.run(
+        _crypto_updown_direction_guard(
+            settings=Settings(NEAR_CLOSE_CRYPTO_UPDOWN_STOP_PRICE_MAX_AGE_SEC=5.0),
+            market_slug="sol-updown-5m-test",
+            outcome_label="Down",
+            entry_metadata={"crypto_start_price": 100.0, "crypto_symbol": "SOLUSDT"},
+            price_cache={},
+            client_holder={"client": FakePriceClient()},
+        )
+    )
+
+    assert allows_exit is False
+    assert details["crypto_direction_guard_reason"] == "spot_stale"
+    assert details["crypto_stop_price_fresh"] is False
+    assert details["crypto_stop_price_age_sec"] >= 29.0
+
+
+def test_near_close_direction_guard_uses_zero_buffer_in_final_seconds() -> None:
+    class FakePriceClient:
+        async def get_price_observations(self, symbols):
+            return {"ETHUSDT": fresh_price_observation(100.03)}
+
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_UPDOWN_STOP_DIRECTION_BREAK_BUFFER=0.00075,
+        NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_SECONDS=10.0,
+    )
+    entry_metadata = {"crypto_start_price": 100.0, "crypto_symbol": "ETHUSDT"}
+
+    final_allows_exit, final_details = asyncio.run(
+        _crypto_updown_direction_guard(
+            settings=settings,
+            market_slug="eth-updown-5m-test",
+            outcome_label="Down",
+            entry_metadata=entry_metadata,
+            price_cache={},
+            client_holder={"client": FakePriceClient()},
+            time_to_resolution_sec=6.5,
+        )
+    )
+    earlier_allows_exit, earlier_details = asyncio.run(
+        _crypto_updown_direction_guard(
+            settings=settings,
+            market_slug="eth-updown-5m-test",
+            outcome_label="Down",
+            entry_metadata=entry_metadata,
+            price_cache={},
+            client_holder={"client": FakePriceClient()},
+            time_to_resolution_sec=12.0,
+        )
+    )
+
+    assert final_allows_exit is True
+    assert final_details["crypto_direction_guard_reason"] == "direction_broken"
+    assert final_details["crypto_direction_effective_break_buffer"] == 0.0
+    assert final_details["crypto_direction_final_seconds_zero_buffer"] is True
+    assert earlier_allows_exit is False
+    assert earlier_details["crypto_direction_guard_reason"] == "direction_still_valid"
+    assert earlier_details["crypto_direction_effective_break_buffer"] == 0.00075
 
 
 def test_near_close_taker_exit_allows_when_crypto_direction_breaks(tmp_path, monkeypatch) -> None:
@@ -581,8 +932,8 @@ def test_near_close_taker_exit_allows_when_crypto_direction_breaks(tmp_path, mon
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def get_prices(self, symbols):
-            return {"BTCUSDT": 100.5}
+        async def get_price_observations(self, symbols):
+            return {"BTCUSDT": fresh_price_observation(100.5)}
 
         async def close(self) -> None:
             return None

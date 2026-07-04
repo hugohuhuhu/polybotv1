@@ -297,7 +297,12 @@ def test_live_trader_submits_near_close_taker_fak(monkeypatch) -> None:
             return SimpleNamespace(api_key="api-key", api_secret="secret", api_passphrase="passphrase")
 
         def get_order_book(self, token_id):
-            return SimpleNamespace(tick_size="0.001", neg_risk=False)
+            return SimpleNamespace(
+                tick_size="0.001",
+                neg_risk=False,
+                bids=[SimpleNamespace(price="0.89", size="20")],
+                asks=[SimpleNamespace(price="0.90", size="20")],
+            )
 
         def get_balance_allowance(self, _params=None):
             return _allowance_payload()

@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Polymarket 錯價監看台</title>
+    <title>Polymarket 錯價監看台｜動盪影子 1.25・待回測</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;800&family=Noto+Serif+TC:wght@600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v33" />
+    <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}?v=dashboard-ui-v41" />
   </head>
   <body data-refresh-sec="{{ refresh_sec }}" data-page-size="{{ page_size }}">
     <div class="ambient ambient-a"></div>
@@ -20,7 +20,10 @@
     <header class="topbar">
       <div class="brand">
         <p class="eyebrow">POLYMARKET MISPRICING MONITOR</p>
-        <h1>Polymarket 錯價監看台</h1>
+        <h1>
+          <span>Polymarket 錯價監看台</span>
+          <span class="research-mode-label">動盪影子 1.25 · 待回測</span>
+        </h1>
         <p class="subtitle">集中查看掃描結果、交易前置檢查、已成交紀錄與目前風控狀態。</p>
       </div>
 
@@ -182,6 +185,22 @@
             <div class="feed-list execution-list" id="executionFeed">
               <p class="empty-block">尚未有執行事件。</p>
             </div>
+            <section class="strategy-edge" aria-labelledby="strategyEdgeTitle">
+              <header class="strategy-edge__header">
+                <div>
+                  <span class="strategy-edge__eyebrow">STRATEGY EDGE</span>
+                  <h4 id="strategyEdgeTitle">實盤 EV 與尾端風險</h4>
+                </div>
+                <div class="strategy-edge__periods" role="group" aria-label="績效統計期間">
+                  <button type="button" data-performance-period="week" aria-pressed="true">本週</button>
+                  <button type="button" data-performance-period="today" aria-pressed="false">今天</button>
+                  <button type="button" data-performance-period="all" aria-pressed="false">全部</button>
+                </div>
+              </header>
+              <div id="strategyEdgeContent" aria-live="polite">
+                <p class="strategy-edge__empty">等待真實成交統計。</p>
+              </div>
+            </section>
           </article>
         </div>
       </section>
@@ -369,7 +388,7 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v33" defer></script>
+    <script src="{{ url_for('static', path='/dashboard.js') }}?v=dashboard-ui-v41" defer></script>
   </body>
 </html>
 

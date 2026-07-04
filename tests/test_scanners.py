@@ -977,6 +977,10 @@ def test_weekend_mode_accepts_crypto_updown_spread_after_relaxing() -> None:
     assert len(opportunities) == 1
     assert rejection_counts == {}
     assert round(opportunities[0].details["effective_max_spread"], 6) == 0.06
+    assert opportunities[0].details["volatility_shadow_enabled"] is True
+    assert opportunities[0].details["volatility_shadow_ratio_threshold"] == 1.25
+    assert opportunities[0].details["volatility_shadow_ratio"] == 0.9
+    assert opportunities[0].details["volatility_shadow_would_block"] is True
 
 
 def _make_crypto_updown_market(*, minutes_left: float, start_distance: float) -> MarketRecord:
@@ -998,6 +1002,15 @@ def _make_crypto_updown_market(*, minutes_left: float, start_distance: float) ->
             "near_close_crypto_start_price": 3000.0,
             "near_close_crypto_start_distance": start_distance,
             "near_close_crypto_winning_outcome": "Up",
+            "near_close_volatility_shadow_enabled": True,
+            "near_close_volatility_shadow_ratio_threshold": 1.25,
+            "near_close_volatility_shadow_window_sec": 60,
+            "near_close_volatility_shadow_source": "binance_1s_range",
+            "near_close_volatility_shadow_data_available": True,
+            "near_close_volatility_shadow_range_bps": 12.0,
+            "near_close_volatility_shadow_sample_count": 60,
+            "near_close_volatility_shadow_ratio": 0.9,
+            "near_close_volatility_shadow_would_block": True,
         },
     )
 

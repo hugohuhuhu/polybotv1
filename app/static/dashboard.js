@@ -1,6 +1,6 @@
 ﻿const body = document.body;
 const refreshSec = Number(body.dataset.refreshSec || 15);
-const DASHBOARD_FETCH_TIMEOUT_MS = 12000;
+const DASHBOARD_FETCH_TIMEOUT_MS = 45000;
 const ACTION_FETCH_TIMEOUT_MS = 90000;
 const LIVE_ORDER_SYNC_SEC = 5;
 const pageSize = Number(body.dataset.pageSize || 18);
@@ -46,6 +46,8 @@ const strategyStack = document.getElementById("strategyStack");
 const alertFeed = document.getElementById("alertFeed");
 const executionFeed = document.getElementById("executionFeed");
 const executionOrderFeed = document.getElementById("executionOrderFeed");
+const strategyEdgeContent = document.getElementById("strategyEdgeContent");
+const performancePeriodButtons = document.querySelectorAll("[data-performance-period]");
 const positionFeed = document.getElementById("positionFeed");
 const tradeAutopsyFeed = document.getElementById("tradeAutopsyFeed");
 const cancelAutopsyFeed = document.getElementById("cancelAutopsyFeed");
@@ -160,6 +162,11 @@ let latestWatchState = {
 let nextDashboardSyncAt = Date.now() + refreshSec * 1000;
 let dashboardLoadInFlight = false;
 let dashboardSyncTimer = null;
+let latestDashboardPayload = null;
+let latestNearClosePerformance = null;
+let selectedPerformancePeriod = "week";
+let performanceLoadInFlight = false;
+let nextPerformanceRefreshAt = 0;
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = DASHBOARD_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -348,6 +355,7 @@ function strategyLabel(strategyType) {
 
 function executionStatusLabel(status) {
   const mapping = {
+    submission_pending: "待交易所確認",
     submitted: "\u5df2\u9001\u51fa",
     open: "open",
     matched: "matched",
@@ -357,6 +365,8 @@ function executionStatusLabel(status) {
     risk_blocked: "\u98a8\u63a7\u963b\u64cb",
     preflight_blocked: "\u524d\u6aa2\u963b\u64cb",
     controls_restored: "\u5df2\u6062\u5fa9",
+    submission_reconciliation_required: "待對帳，已暫停自動下單",
+    reconciled: "已由交易所補回",
     rearmed: "\u5df2\u91cd\u65b0\u6b66\u88dd",
     partial_failure: "\u90e8\u5206\u5931\u6557",
     failed: "\u5931\u6557",
@@ -1009,6 +1019,8 @@ function renderLiveOrders(orders) {
     .map((order) => {
       const status = String(order.status || "unknown").toLowerCase();
       const statusClass = liveOrderStatusClass(status);
+      const executionRole = liveOrderExecutionRole(order);
+      const executionRoleClass = executionRole === "taker" ? "order-taker" : executionRole === "maker" ? "order-maker" : "neutral";
       const action = String(order.action || "").toUpperCase();
       const hasNetPnl = order.net_pnl !== null && order.net_pnl !== undefined;
       const displayValue = hasNetPnl
@@ -1025,6 +1037,20 @@ function renderLiveOrders(orders) {
       const pnlLabel =
         displayPnl === null || displayPnl === undefined ? "-" : `${formatSignedToken(displayPnl)} pUSD`;
       const isMatched = ["matched", "settlement_pending", "finished"].includes(status);
+      const executionPrice = Number(order.execution_price);
+      const targetPrice = Number(order.target_price);
+      const hasExecutionPrice = isMatched && Number.isFinite(executionPrice) && executionPrice > 0;
+      const orderPriceLabel = hasExecutionPrice
+        ? `${escapeHtml(action || "-")} ${formatToken(order.requested_size)} 股 · 成交 @ ${formatToken(executionPrice)}`
+        : `${escapeHtml(action || "-")} ${formatToken(order.requested_size)} 股 @ ${formatToken(order.target_price)}`;
+      const fakLimitLabel =
+        hasExecutionPrice &&
+        executionRole === "taker" &&
+        Number.isFinite(targetPrice) &&
+        targetPrice > 0 &&
+        Math.abs(executionPrice - targetPrice) > 1e-9
+          ? `<p>FAK 下限 ${formatToken(targetPrice)}</p>`
+          : "";
       const title = escapeHtml(readableMarketName(order.market_slug));
       const marketTitle =
         isMatched && order.market_url
@@ -1036,9 +1062,13 @@ function renderLiveOrders(orders) {
           <header>
             <div>
               <strong>${marketTitle}</strong>
-              <p>${escapeHtml(order.outcome_label || "-")} · ${escapeHtml(action || "-")} ${formatToken(order.requested_size)} 股 @ ${formatToken(order.target_price)}</p>
+              <p>${escapeHtml(order.outcome_label || "-")} · ${orderPriceLabel}</p>
+              ${fakLimitLabel}
             </div>
-            <span class="feed-pill ${statusClass}">${escapeHtml(executionStatusLabel(status))}</span>
+            <div class="order-card__badges">
+              <span class="feed-pill ${executionRoleClass}">${escapeHtml(executionRole)}</span>
+              <span class="feed-pill ${statusClass}">${escapeHtml(executionStatusLabel(status))}</span>
+            </div>
           </header>
           <div class="order-card__metrics">
             <span>部位 ${formatToken(displayNotional)} pUSD</span>
@@ -1051,6 +1081,126 @@ function renderLiveOrders(orders) {
       `;
     })
     .join("");
+}
+
+function performanceTone(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || Math.abs(numeric) < 1e-9) {
+    return "neutral";
+  }
+  return numeric > 0 ? "positive" : "negative";
+}
+
+function formatSignedPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  const numeric = Number(value) * 100;
+  return `${numeric > 0 ? "+" : ""}${numeric.toFixed(2)}%`;
+}
+
+function renderNearClosePerformance(report) {
+  if (!strategyEdgeContent) {
+    return;
+  }
+  latestNearClosePerformance = report || null;
+  performancePeriodButtons.forEach((button) => {
+    const active = button.dataset.performancePeriod === selectedPerformancePeriod;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  const period = report?.periods?.[selectedPerformancePeriod];
+  const summary = period?.summary;
+  if (!summary || Number(summary.count || 0) <= 0) {
+    strategyEdgeContent.innerHTML = `
+      <p class="strategy-edge__empty">這個期間尚無已完成的 near-close 真實部位。</p>
+    `;
+    return;
+  }
+
+  const count = Number(summary.count || 0);
+  const ciLabel =
+    summary.ci95_low === null || summary.ci95_low === undefined
+      ? "樣本不足"
+      : `${formatSignedPercent(summary.ci95_low)} ～ ${formatSignedPercent(summary.ci95_high)}`;
+  const modeRows = [
+    ["Maker", period.modes?.maker || {}],
+    ["Taker", period.modes?.taker || {}],
+    ["未辨識", period.modes?.unknown || {}],
+  ]
+    .filter(([label, item]) => label !== "未辨識" || Number(item.count || 0) > 0)
+    .map(([label, item]) => {
+      const itemCount = Number(item.count || 0);
+      return `
+        <div class="strategy-edge__mode-row">
+          <strong>${label}</strong>
+          <span>${formatNumber(itemCount)} 筆</span>
+          <span class="${performanceTone(item.ev)}">${formatSignedPercent(item.ev)}</span>
+          <span class="${performanceTone(item.net_pnl)}">${formatSignedToken(item.net_pnl || 0)} pUSD</span>
+        </div>
+      `;
+    })
+    .join("");
+  const bucketLabels = {
+    "0.86-0.87": "0.86–0.87",
+    "0.88": "0.88",
+    "0.89-0.90": "0.89–0.90",
+    other: "其他",
+  };
+  const bucketRows = (period.price_buckets || [])
+    .filter((item) => item.key !== "other" || Number(item.count || 0) > 0)
+    .map(
+      (item) => `
+        <div class="strategy-edge__bucket-row">
+          <span>${escapeHtml(bucketLabels[item.key] || item.key || "-")}</span>
+          <span>${formatNumber(item.count || 0)} 筆</span>
+          <strong class="${performanceTone(item.ev)}">${formatSignedPercent(item.ev)}</strong>
+        </div>
+      `,
+    )
+    .join("");
+
+  strategyEdgeContent.innerHTML = `
+    <div class="strategy-edge__headline">
+      <div>
+        <span>扣費後 EV／筆</span>
+        <strong class="${performanceTone(summary.ev)}">${formatSignedPercent(summary.ev)}</strong>
+        <small>n=${formatNumber(count)} · 淨損益 ${formatSignedToken(summary.net_pnl || 0)} pUSD</small>
+      </div>
+      <dl>
+        <div><dt>95% 信賴區間</dt><dd>${ciLabel}</dd></div>
+        <div><dt>完全歸零</dt><dd>${formatNumber(summary.zero_loss_count || 0)}／${formatNumber(count)} · ${formatPercent(summary.zero_loss_rate)}</dd></div>
+        <div><dt>風控退出</dt><dd>${formatNumber(summary.risk_exit_count || 0)}／${formatNumber(count)} · ${formatPercent(summary.risk_exit_rate)}</dd></div>
+        <div><dt>退出挽回</dt><dd>${formatToken(summary.risk_recovered || 0)} pUSD</dd></div>
+      </dl>
+    </div>
+    <div class="strategy-edge__section">
+      <div class="strategy-edge__section-title"><span>執行方式</span><small>筆數 · EV · 淨損益</small></div>
+      <div class="strategy-edge__modes">${modeRows}</div>
+    </div>
+    <div class="strategy-edge__section">
+      <div class="strategy-edge__section-title"><span>入場價 bucket</span><small>筆數 · EV</small></div>
+      <div class="strategy-edge__buckets">${bucketRows}</div>
+    </div>
+    <p class="strategy-edge__note">Taker fee 依目前費率曲線估算；Maker rebate 與 Polygon gas 未列入。</p>
+  `;
+}
+
+function liveOrderExecutionRole(order) {
+  const role = String(order?.execution_role || "").toLowerCase();
+  if (role === "taker" || role === "maker") {
+    return role;
+  }
+  const orderType = String(order?.order_type || "").toUpperCase();
+  const submissionKind = String(order?.submission_kind || "").toLowerCase();
+  const mode = String(order?.entry_execution_mode || "").toLowerCase();
+  if (["FAK", "FOK"].includes(orderType) || order?.post_only === false || submissionKind === "market" || mode === "taker_fallback") {
+    return "taker";
+  }
+  if (["GTC", "GTD"].includes(orderType) || order?.post_only === true || submissionKind === "limit") {
+    return "maker";
+  }
+  return "unknown";
 }
 
 function renderTradeJournal(positions, tradeJournal) {
@@ -1692,6 +1842,9 @@ function applyDashboardPayload(payload) {
   renderAlerts(payload.alerts || []);
   renderLiveOrders(payload.live_orders || []);
   renderExecutionEvents(payload.execution_events || []);
+  if (payload.near_close_performance) {
+    renderNearClosePerformance(payload.near_close_performance);
+  }
   renderTradeJournal(payload.trade_groups || payload.positions || [], payload.trade_journal || payload.pnl || {});
   renderTradeAutopsy(payload.trade_autopsy || []);
   renderCancelAutopsy(payload.cancel_autopsy || {});
@@ -1749,6 +1902,74 @@ function tryApplyDashboardPayload(payload) {
   }
 }
 
+function lightweightDashboardWarning(payload) {
+  return payload?.warning || payload?.summary?.warning || payload?.persistence?.warning || "";
+}
+
+function isLightweightDashboardPayload(payload) {
+  if (!lightweightDashboardWarning(payload)) {
+    return false;
+  }
+  return (
+    !payload?.live_orders?.length &&
+    !payload?.execution_events?.length &&
+    !payload?.trade_groups?.length &&
+    !payload?.positions?.length
+  );
+}
+
+function payloadSnapshot(payload) {
+  if (typeof structuredClone === "function") {
+    return structuredClone(payload);
+  }
+  return JSON.parse(JSON.stringify(payload));
+}
+
+function preserveDashboardData(payload) {
+  if (!isLightweightDashboardPayload(payload) || !latestDashboardPayload) {
+    return payload;
+  }
+  const warning = lightweightDashboardWarning(payload);
+  return {
+    ...latestDashboardPayload,
+    trading: payload.trading || latestDashboardPayload.trading,
+    wallet: payload.wallet || latestDashboardPayload.wallet,
+    preflight: payload.preflight || latestDashboardPayload.preflight,
+    watch: payload.watch || latestDashboardPayload.watch,
+    watch_heartbeats: payload.watch_heartbeats?.length ? payload.watch_heartbeats : latestDashboardPayload.watch_heartbeats,
+    trading_parameters: payload.trading_parameters || latestDashboardPayload.trading_parameters,
+    refresh_sec: payload.refresh_sec || latestDashboardPayload.refresh_sec,
+    scan_in_progress: payload.scan_in_progress,
+    data_stale: true,
+    warning,
+    summary: { ...(latestDashboardPayload.summary || {}), warning },
+    persistence: { ...(latestDashboardPayload.persistence || {}), ...(payload.persistence || {}), warning },
+  };
+}
+
+async function loadNearClosePerformance() {
+  if (performanceLoadInFlight || Date.now() < nextPerformanceRefreshAt) {
+    return;
+  }
+  performanceLoadInFlight = true;
+  try {
+    const response = await fetchWithTimeout(
+      "/api/near-close-performance",
+      { cache: "no-store" },
+      DASHBOARD_FETCH_TIMEOUT_MS,
+    );
+    if (!response.ok) {
+      throw new Error("near_close_performance_fetch_failed");
+    }
+    renderNearClosePerformance(await response.json());
+    nextPerformanceRefreshAt = Date.now() + 60000;
+  } catch (_error) {
+    nextPerformanceRefreshAt = Date.now() + 15000;
+  } finally {
+    performanceLoadInFlight = false;
+  }
+}
+
 async function loadDashboard() {
   dashboardLoadInFlight = true;
   try {
@@ -1756,10 +1977,16 @@ async function loadDashboard() {
     if (!response.ok) {
       throw new Error("dashboard_fetch_failed");
     }
-    const payload = await response.json();
+    const rawPayload = await response.json();
+    const payload = preserveDashboardData(rawPayload);
     if (!tryApplyDashboardPayload(payload)) {
       throw new Error("dashboard_render_failed");
     }
+    if (!isLightweightDashboardPayload(rawPayload)) {
+      latestDashboardPayload = payloadSnapshot(payload);
+    }
+    void loadNearClosePerformance();
+    scheduleDashboardSync(activeDashboardSyncSec() * 1000);
   } finally {
     dashboardLoadInFlight = false;
   }
@@ -1923,6 +2150,13 @@ finishWorkButton.addEventListener("click", () => {
 
 watchToggle.addEventListener("click", () => {
   void toggleWatch();
+});
+
+performancePeriodButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    selectedPerformancePeriod = button.dataset.performancePeriod || "week";
+    renderNearClosePerformance(latestNearClosePerformance);
+  });
 });
 
 resetDashboardSyncCountdown();

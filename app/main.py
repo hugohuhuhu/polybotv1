@@ -55,6 +55,21 @@ WATCH_AUXILIARY_TIMEOUT_SEC = 12.0
 CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC = 300.0
 
 
+def _merge_timestamped_last_trade_observations(
+    books: dict[str, Any],
+    observations: dict[str, tuple[float | None, datetime | None]],
+) -> None:
+    for token_id, (last_trade_price, last_trade_at) in observations.items():
+        book = books.get(token_id)
+        if book is None or last_trade_price is None or last_trade_at is None:
+            continue
+        current_last_trade_at = getattr(book, "last_trade_at", None)
+        if isinstance(current_last_trade_at, datetime) and current_last_trade_at > last_trade_at:
+            continue
+        book.last_trade_price = last_trade_price
+        book.last_trade_at = last_trade_at
+
+
 def _read_pid(pid_file: Path) -> int | None:
     try:
         raw = pid_file.read_text(encoding="ascii").strip()
@@ -414,6 +429,94 @@ def _near_close_order_cancel_reason(
         "not_open_reasons": clean_reasons,
         "cancel_reason_context": context,
     }
+
+
+async def _hard_cancel_expiring_near_close_orders(
+    *,
+    repository: ScannerRepository,
+    live_trader: PolymarketLiveTradingAdapter,
+    settings: Settings,
+    at: datetime | None = None,
+) -> int:
+    checked_at = at or datetime.now(timezone.utc)
+    hard_cancel_seconds = max(float(settings.near_close_existing_order_hard_cancel_seconds), 0.0)
+    due_orders: list[dict[str, Any]] = []
+    for order in repository.near_close_active_orders_for_market():
+        seconds_left = _slug_seconds_to_resolution(str(order.get("market_slug") or ""), at=checked_at)
+        if seconds_left is None or seconds_left > hard_cancel_seconds:
+            continue
+        if str(order.get("order_id") or "").strip():
+            due_orders.append(order)
+    if not due_orders:
+        return 0
+
+    order_ids = [str(order["order_id"]).strip() for order in due_orders]
+    cancel_reason_by_order: dict[str, dict[str, Any]] = {}
+    for order in due_orders:
+        order_id = str(order["order_id"]).strip()
+        seconds_left = _slug_seconds_to_resolution(str(order.get("market_slug") or ""), at=checked_at)
+        cancel_reason_by_order[order_id] = {
+            "not_open_reason": "existing_order_hard_cancel",
+            "not_open_reasons": ["existing_order_hard_cancel"],
+            "cancel_reason_context": {
+                "trigger": "independent_hard_cancel",
+                "market_slug": str(order.get("market_slug") or ""),
+                "token_id": str(order.get("token_id") or ""),
+                "order_id": order_id,
+                "time_to_resolution_sec": seconds_left,
+                "existing_order_hard_cancel_seconds": hard_cancel_seconds,
+                "cancel_reason_checked_at": checked_at.isoformat(),
+            },
+        }
+
+    try:
+        cancel_response = await live_trader.cancel_orders(order_ids)
+    except Exception as exc:
+        repository.save_execution_event(
+            source="watch",
+            mode="live",
+            opportunity_id=None,
+            status="hard_cancel_failed",
+            message=str(exc),
+            details={
+                "order_ids": order_ids,
+                "hard_cancel_seconds": hard_cancel_seconds,
+                "checked_at": checked_at.isoformat(),
+            },
+        )
+        raise
+
+    canceled_ids, uncertain_ids = _split_cancel_response(order_ids, cancel_response)
+    updated = repository.mark_live_orders_cancelled(
+        canceled_ids,
+        status="qualification_cancelled",
+        cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
+    )
+    uncertain_updated = repository.mark_live_orders_cancelled(
+        uncertain_ids,
+        status="cancel_unconfirmed",
+        cancel_response=cancel_response,
+        cancel_reason_by_order=cancel_reason_by_order,
+    )
+    repository.save_execution_event(
+        source="watch",
+        mode="live",
+        opportunity_id=None,
+        status="hard_cancelled",
+        message="Independent T-12 monitor cancelled expiring near-close maker orders.",
+        details={
+            "order_ids": order_ids,
+            "canceled_order_ids": canceled_ids,
+            "unconfirmed_order_ids": uncertain_ids,
+            "updated_rows": updated,
+            "unconfirmed_updated_rows": uncertain_updated,
+            "hard_cancel_seconds": hard_cancel_seconds,
+            "checked_at": checked_at.isoformat(),
+            "cancel_response": cancel_response,
+        },
+    )
+    return updated + uncertain_updated
 
 
 async def _sync_live_fills_to_db(
@@ -873,7 +976,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         websocket_client = MarketWebSocketClient(settings.ws_market_url, book_state.handle_message)
         websocket_task = asyncio.create_task(websocket_client.subscribe_forever(normalized_asset_ids))
 
-    async def run_fast_monitor_worker() -> None:
+    async def run_fast_monitor_worker(
+        last_trade_observations: dict[str, tuple[float | None, datetime | None]],
+    ) -> None:
         with closing(connect_db(settings)) as connection:
             repository = ScannerRepository(connection)
             controls = repository.get_trading_controls(default_controls)
@@ -896,6 +1001,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             await clob.close()
         if not open_position_books:
             return
+        _merge_timestamped_last_trade_observations(open_position_books, last_trade_observations)
 
         worker_live_trader = PolymarketLiveTradingAdapter(runtime_settings)
         with closing(connect_db(settings)) as connection:
@@ -907,11 +1013,13 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                 watch_books=open_position_books,
             )
 
-    def run_fast_monitor_worker_sync() -> None:
+    def run_fast_monitor_worker_sync(
+        last_trade_observations: dict[str, tuple[float | None, datetime | None]],
+    ) -> None:
         if not fast_monitor_lock.acquire(blocking=False):
             return
         try:
-            asyncio.run(run_fast_monitor_worker())
+            asyncio.run(run_fast_monitor_worker(last_trade_observations))
         except Exception as exc:
             logger.warning("Fast open-position monitor failed", context={"error": str(exc)})
             with contextlib.suppress(Exception):
@@ -934,7 +1042,14 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         _touch_watch_liveness()
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
-        task = asyncio.create_task(asyncio.to_thread(run_fast_monitor_worker_sync))
+        last_trade_observations = {
+            token_id: (snapshot.last_trade_price, snapshot.last_trade_at)
+            for token_id, snapshot in book_state.books.items()
+            if snapshot.last_trade_at is not None
+        }
+        task = asyncio.create_task(
+            asyncio.to_thread(run_fast_monitor_worker_sync, last_trade_observations)
+        )
         done, _pending = await asyncio.wait({task}, timeout=monitor_timeout)
         if not done:
             raise TimeoutError
@@ -981,6 +1096,27 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                             "trigger_price": settings.near_close_taker_exit_price,
                         },
                     )
+
+    async def run_independent_hard_cancel_loop() -> None:
+        poll_sec = min(max(float(settings.near_close_open_position_monitor_sec), 0.5), 1.0)
+        hard_cancel_trader = PolymarketLiveTradingAdapter(settings)
+        while True:
+            _touch_watch_liveness()
+            try:
+                with closing(connect_db(settings)) as connection:
+                    repository = ScannerRepository(connection)
+                    controls = repository.get_trading_controls(default_controls)
+                    hard_cancel_trader.settings = controls.apply(settings)
+                    await _hard_cancel_expiring_near_close_orders(
+                        repository=repository,
+                        live_trader=hard_cancel_trader,
+                        settings=hard_cancel_trader.settings,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Independent near-close hard cancel failed", context={"error": str(exc)})
+            await asyncio.sleep(poll_sec)
 
     async def run_scan_cycle_with_budget(
         *,
@@ -1045,6 +1181,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             if not task.done():
                 task.cancel()
 
+    hard_cancel_task = asyncio.create_task(run_independent_hard_cancel_loop())
     initial_schedule_delay_sec = _watch_initial_scan_delay_sec(settings)
     if initial_schedule_delay_sec > 0:
         await _watch_delay(
@@ -1352,6 +1489,41 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                                 "scan_started_at": scan_started_at.isoformat(),
                             },
                         )
+                expired_submissions = repository.expire_stale_live_submissions(older_than_sec=300.0)
+                if expired_submissions:
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="submission_reconciliation_failed",
+                        message=(
+                            f"Marked {expired_submissions} unresolved submission(s) failed after market end."
+                        ),
+                        details={"expired_count": expired_submissions},
+                    )
+                unresolved_submissions = repository.unresolved_live_submissions(older_than_sec=30.0)
+                if unresolved_submissions and controls.auto_execute_enabled:
+                    controls = repository.save_trading_controls(
+                        TradingControls(
+                            live_trading_enabled=controls.live_trading_enabled,
+                            auto_execute_enabled=False,
+                            kill_switch_enabled=controls.kill_switch_enabled,
+                        )
+                    )
+                    runtime_settings = controls.apply(settings)
+                    repository.save_execution_event(
+                        source="watch",
+                        mode="live",
+                        opportunity_id=None,
+                        status="submission_reconciliation_required",
+                        message="Unresolved live submission detected; auto execution was disabled.",
+                        details={
+                            "pending_count": len(unresolved_submissions),
+                            "opportunity_ids": [
+                                str(item.get("opportunity_id") or "") for item in unresolved_submissions
+                            ],
+                        },
+                    )
                 try:
                     open_position_books = await wait_for_watch_auxiliary(
                         _fetch_open_position_books(settings=runtime_settings, repository=repository)
@@ -1605,9 +1777,15 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         )
                         continue
 
+                    repository.save_live_submission_pending(
+                        plan,
+                        claim_key=claim_key,
+                        source="watch",
+                    )
                     try:
                         live_result = await live_trader.execute(plan)
                     except Exception as exc:
+                        repository.mark_live_submission_failed(opportunity.opportunity_id, str(exc))
                         repository.update_execution_claim(claim_key=claim_key, status="failed", message=str(exc))
                         repository.save_execution_event(
                             source="watch",
@@ -1632,7 +1810,10 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         status=live_result.status,
                         message=live_result.message,
                     )
-                    repository.save_live_execution(live_result)
+                    if live_result.leg_results:
+                        repository.save_live_execution(live_result)
+                    else:
+                        repository.mark_live_submission_failed(opportunity.opportunity_id, live_result.message)
                     repository.save_execution_event(
                         source="watch",
                         mode="live",
@@ -1673,6 +1854,9 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                                 await telegram.send_text(incident_message)
                         break
     finally:
+        hard_cancel_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hard_cancel_task
         await stop_websocket()
 
 

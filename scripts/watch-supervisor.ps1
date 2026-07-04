@@ -15,6 +15,7 @@ $supervisorPidFile = Join-Path $logDir "watch-supervisor.pid"
 $mutexName = "Global\PolymarketMispricingWatchSupervisor"
 $childStaleKillSec = 45
 $childStartupGraceSec = 10
+$childStartupLivenessGraceSec = 90
 $restartDelaySec = 5
 
 Add-Type @"
@@ -217,7 +218,7 @@ try {
                         Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
                         break
                     }
-                } elseif ($childAge -gt $childStaleKillSec) {
+                } elseif ($childAge -gt $childStartupLivenessGraceSec) {
                     Write-SupervisorLog "child produced no liveness for $([math]::Round($childAge, 1))s; killing pid=$($child.Id)"
                     Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
                     break

@@ -212,6 +212,38 @@ class Settings(BaseSettings):
         default=0.00075,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_DIRECTION_BREAK_BUFFER",
     )
+    near_close_crypto_updown_stop_price_max_age_sec: float = Field(
+        default=5.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_PRICE_MAX_AGE_SEC",
+    )
+    near_close_crypto_updown_stop_neutral_override_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_ENABLED",
+    )
+    near_close_crypto_updown_stop_neutral_override_min_seconds: float = Field(
+        default=10.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MIN_SECONDS",
+    )
+    near_close_crypto_updown_stop_neutral_override_max_seconds: float = Field(
+        default=20.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MAX_SECONDS",
+    )
+    near_close_crypto_updown_stop_neutral_override_max_distance: float = Field(
+        default=0.0001,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MAX_DISTANCE",
+    )
+    near_close_crypto_updown_stop_neutral_override_max_bid: float = Field(
+        default=0.52,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MAX_BID",
+    )
+    near_close_crypto_updown_stop_neutral_override_max_midpoint: float = Field(
+        default=0.55,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MAX_MIDPOINT",
+    )
+    near_close_crypto_updown_stop_neutral_override_max_spread: float = Field(
+        default=0.03,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_NEUTRAL_OVERRIDE_MAX_SPREAD",
+    )
     near_close_crypto_updown_stop_hard_override_enabled: bool = Field(
         default=True,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_ENABLED",
@@ -227,6 +259,10 @@ class Settings(BaseSettings):
     near_close_crypto_updown_stop_hard_override_max_midpoint: float = Field(
         default=0.5,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_MAX_MIDPOINT",
+    )
+    near_close_crypto_updown_stop_hard_override_last_trade_max_age_sec: float = Field(
+        default=2.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_STOP_HARD_OVERRIDE_LAST_TRADE_MAX_AGE_SEC",
     )
     near_close_assume_submitted_filled_stop_exit: bool = Field(
         default=True,
@@ -278,6 +314,26 @@ class Settings(BaseSettings):
     near_close_crypto_updown_min_start_distance: float = Field(
         default=0.00121,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE",
+    )
+    near_close_volatility_shadow_enabled: bool = Field(
+        default=True,
+        alias="NEAR_CLOSE_VOLATILITY_SHADOW_ENABLED",
+    )
+    near_close_volatility_shadow_ratio_threshold: float = Field(
+        default=1.25,
+        alias="NEAR_CLOSE_VOLATILITY_SHADOW_RATIO_THRESHOLD",
+    )
+    near_close_volatility_shadow_window_sec: int = Field(
+        default=60,
+        alias="NEAR_CLOSE_VOLATILITY_SHADOW_WINDOW_SEC",
+    )
+    near_close_volatility_shadow_min_samples: int = Field(
+        default=20,
+        alias="NEAR_CLOSE_VOLATILITY_SHADOW_MIN_SAMPLES",
+    )
+    near_close_volatility_shadow_timeout_sec: float = Field(
+        default=2.0,
+        alias="NEAR_CLOSE_VOLATILITY_SHADOW_TIMEOUT_SEC",
     )
     near_close_crypto_updown_dynamic_start_distance_enabled: bool = Field(
         default=False,

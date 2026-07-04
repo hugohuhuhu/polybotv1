@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -205,7 +206,9 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
     updown_by_market: dict[str, tuple[str, datetime]] = {}
     symbols: set[str] = set()
     start_price_requests: dict[str, tuple[str, int]] = {}
+    volatility_requests: dict[str, tuple[str, int]] = {}
     now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
     updown_max_minutes = min(
         settings.near_close_scan_lookahead_minutes,
         settings.near_close_crypto_updown_max_minutes_to_end,
@@ -234,12 +237,31 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
             )
             if in_updown_window and start_time <= now:
                 start_price_requests[market.market_id] = (symbol, int(start_time.timestamp() * 1000))
+                if settings.near_close_volatility_shadow_enabled:
+                    volatility_requests[market.market_id] = (symbol, now_ms)
     if not symbols:
         return
     client = crypto_price_client_from_settings(settings)
     try:
-        prices = await client.get_prices(symbols)
-        start_prices = await client.get_open_prices_for_requests(start_price_requests) if start_price_requests else {}
+        prices_task = client.get_prices(symbols)
+        start_prices_task = (
+            client.get_open_prices_for_requests(start_price_requests) if start_price_requests else asyncio.sleep(0, result={})
+        )
+        volatility_task = (
+            client.get_recent_range_observations(
+                volatility_requests,
+                window_sec=settings.near_close_volatility_shadow_window_sec,
+                min_samples=settings.near_close_volatility_shadow_min_samples,
+                timeout_sec=settings.near_close_volatility_shadow_timeout_sec,
+            )
+            if volatility_requests
+            else asyncio.sleep(0, result={})
+        )
+        prices, start_prices, volatility_observations = await asyncio.gather(
+            prices_task,
+            start_prices_task,
+            volatility_task,
+        )
     finally:
         await client.close()
     price_source = getattr(client, "source", "unknown")
@@ -264,6 +286,20 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         if updown is None:
             continue
         symbol, start_time = updown
+        volatility = volatility_observations.get(market.market_id)
+        market.raw["near_close_volatility_shadow_enabled"] = bool(settings.near_close_volatility_shadow_enabled)
+        market.raw["near_close_volatility_shadow_ratio_threshold"] = float(
+            settings.near_close_volatility_shadow_ratio_threshold
+        )
+        market.raw["near_close_volatility_shadow_window_sec"] = int(
+            settings.near_close_volatility_shadow_window_sec
+        )
+        market.raw["near_close_volatility_shadow_source"] = "binance_1s_range"
+        market.raw["near_close_volatility_shadow_measured_at"] = now.isoformat()
+        market.raw["near_close_volatility_shadow_data_available"] = volatility is not None
+        if volatility is not None:
+            market.raw["near_close_volatility_shadow_range_bps"] = volatility.range_bps
+            market.raw["near_close_volatility_shadow_sample_count"] = volatility.sample_count
         spot = prices.get(symbol)
         start_price = start_prices.get(market.market_id)
         if spot is None or start_price is None or start_price <= 0:
@@ -276,8 +312,15 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         market.raw["near_close_crypto_start_price"] = start_price
         market.raw["near_close_crypto_start_price_source"] = price_source
         market.raw["near_close_crypto_start_time"] = start_time.isoformat()
-        market.raw["near_close_crypto_start_distance"] = abs(spot - start_price) / start_price
+        start_distance = abs(spot - start_price) / start_price
+        market.raw["near_close_crypto_start_distance"] = start_distance
         market.raw["near_close_crypto_winning_outcome"] = "Up" if spot > start_price else "Down"
+        if volatility is not None and volatility.range_bps > 0:
+            ratio = (start_distance * 10_000.0) / volatility.range_bps
+            market.raw["near_close_volatility_shadow_ratio"] = ratio
+            market.raw["near_close_volatility_shadow_would_block"] = ratio < float(
+                settings.near_close_volatility_shadow_ratio_threshold
+            )
 
 
 def _is_near_close_pool_candidate(settings: Settings, market: MarketRecord, now: datetime) -> bool:

@@ -45,6 +45,20 @@ class ChainlinkRoundData:
     updated_at: int
 
 
+@dataclass(frozen=True, slots=True)
+class CryptoPriceObservation:
+    price: float
+    updated_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class CryptoRangeObservation:
+    range_bps: float
+    sample_count: int
+    window_start_ms: int
+    window_end_ms: int
+
+
 def _parse_chainlink_feeds(value: str | dict[str, str] | None) -> dict[str, str]:
     feeds = dict(_CHAINLINK_POLYGON_FEEDS)
     if isinstance(value, dict):
@@ -107,9 +121,18 @@ class CryptoPriceClient:
         await self._client.aclose()
 
     async def get_prices(self, symbols: set[str]) -> dict[str, float]:
+        observations = await self.get_price_observations(symbols)
+        return {symbol: observation.price for symbol, observation in observations.items()}
+
+    async def get_price_observations(self, symbols: set[str]) -> dict[str, CryptoPriceObservation]:
         if self.source == "chainlink":
-            return await self._get_chainlink_prices(symbols)
-        return await self._get_binance_prices(symbols)
+            return await self._get_chainlink_price_observations(symbols)
+        prices = await self._get_binance_prices(symbols)
+        updated_at = int(time.time())
+        return {
+            symbol: CryptoPriceObservation(price=price, updated_at=updated_at)
+            for symbol, price in prices.items()
+        }
 
     async def _get_binance_prices(self, symbols: set[str]) -> dict[str, float]:
         async def fetch_price(symbol: str) -> tuple[str, float | None]:
@@ -179,18 +202,81 @@ class CryptoPriceClient:
             if key in prices_by_key
         }
 
-    async def _get_chainlink_prices(self, symbols: set[str]) -> dict[str, float]:
-        async def fetch_price(symbol: str) -> tuple[str, float | None]:
+    async def get_recent_range_observations(
+        self,
+        requests: dict[str, tuple[str, int]],
+        *,
+        window_sec: int = 60,
+        min_samples: int = 20,
+        timeout_sec: float = 2.0,
+    ) -> dict[str, CryptoRangeObservation]:
+        window_ms = max(int(window_sec), 1) * 1000
+        unique_requests = sorted(set(requests.values()))
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_range(
+            symbol: str,
+            end_ms: int,
+        ) -> tuple[tuple[str, int], CryptoRangeObservation | None]:
+            start_ms = int(end_ms) - window_ms
+            async with semaphore:
+                try:
+                    response = await self._client.get(
+                        "https://api.binance.com/api/v3/klines",
+                        params={
+                            "symbol": symbol,
+                            "interval": "1s",
+                            "startTime": start_ms,
+                            "endTime": int(end_ms),
+                            "limit": min(max(int(window_sec) + 2, 20), 1000),
+                        },
+                        timeout=max(float(timeout_sec), 0.1),
+                    )
+                    response.raise_for_status()
+                    payload: list[list[Any]] = response.json()
+                    samples = [row for row in payload if len(row) >= 4 and int(row[0]) >= start_ms]
+                    if len(samples) < max(int(min_samples), 1):
+                        return (symbol, end_ms), None
+                    reference_price = float(samples[0][1])
+                    if reference_price <= 0:
+                        return (symbol, end_ms), None
+                    high = max(float(row[2]) for row in samples)
+                    low = min(float(row[3]) for row in samples)
+                    return (symbol, end_ms), CryptoRangeObservation(
+                        range_bps=((high - low) / reference_price) * 10_000.0,
+                        sample_count=len(samples),
+                        window_start_ms=start_ms,
+                        window_end_ms=int(end_ms),
+                    )
+                except (httpx.HTTPError, IndexError, TypeError, ValueError):
+                    return (symbol, end_ms), None
+
+        fetched = await asyncio.gather(*(fetch_range(symbol, end_ms) for symbol, end_ms in unique_requests))
+        observations_by_key = {key: observation for key, observation in fetched if observation is not None}
+        return {
+            request_id: observations_by_key[key]
+            for request_id, key in requests.items()
+            if key in observations_by_key
+        }
+
+    async def _get_chainlink_price_observations(
+        self,
+        symbols: set[str],
+    ) -> dict[str, CryptoPriceObservation]:
+        async def fetch_price(symbol: str) -> tuple[str, CryptoPriceObservation | None]:
             try:
                 round_data = await self._latest_chainlink_round(symbol)
                 if self._chainlink_round_is_stale(round_data):
                     return symbol, None
-                return symbol, round_data.answer
+                return symbol, CryptoPriceObservation(
+                    price=round_data.answer,
+                    updated_at=round_data.updated_at,
+                )
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 return symbol, None
 
         fetched = await asyncio.gather(*(fetch_price(symbol) for symbol in sorted(symbols)))
-        return {symbol: price for symbol, price in fetched if price is not None}
+        return {symbol: observation for symbol, observation in fetched if observation is not None}
 
     async def _get_chainlink_open_prices_at(self, symbols_by_start_ms: dict[str, int]) -> dict[str, float]:
         requests = {symbol: (symbol, start_ms) for symbol, start_ms in symbols_by_start_ms.items()}

@@ -35,7 +35,11 @@ from app.storage.repositories import ScannerRepository
 from app.strategy.execution_planner import ExecutionPlanner
 from app.strategy.near_close_stop_exit import execute_near_close_taker_exits
 from app.strategy.post_fill_profit_take import execute_post_fill_profit_takes
-from app.strategy.polymarket_live_trading import PolymarketLiveTradingAdapter, create_authenticated_clob_v2_client
+from app.strategy.polymarket_live_trading import (
+    PolymarketLiveTradingAdapter,
+    create_authenticated_clob_v2_client,
+    resolve_funder_address,
+)
 from app.strategy.risk_manager import RiskManager
 from app.utils.execution_utils import build_execution_claim_key
 from app.utils.math_utils import parse_jsonish_list, safe_float
@@ -1124,6 +1128,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:
                 pass
 
+    def load_preflight_payload_sync(force: bool) -> dict[str, Any]:
+        report = asyncio.run(load_preflight_report(current_settings, verify_clob_credentials=force))
+        return report.as_payload()
+
+    def load_wallet_status_sync() -> dict[str, Any]:
+        return asyncio.run(load_wallet_status(current_settings))
+
     async def live_preflight(*, force: bool = False) -> dict[str, Any]:
         loop_time = asyncio.get_running_loop().time()
         cached = app.state.preflight_cache
@@ -1131,8 +1142,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not force and cached is not None and cache_age < current_settings.preflight_cache_sec:
             return cached
 
-        report = await load_preflight_report(current_settings, verify_clob_credentials=force)
-        payload = report.as_payload()
+        payload = await asyncio.to_thread(load_preflight_payload_sync, force)
         app.state.preflight_cache = payload
         app.state.preflight_cache_at = loop_time
         return payload
@@ -1193,7 +1203,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if cached is not None and cache_age < current_settings.preflight_cache_sec:
             return cached
         try:
-            payload = await asyncio.wait_for(load_wallet_status(current_settings), timeout=DASHBOARD_COMPONENT_TIMEOUT_SEC)
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(load_wallet_status_sync),
+                timeout=DASHBOARD_COMPONENT_TIMEOUT_SEC,
+            )
         except TimeoutError:
             return timed_out_wallet_payload(cached)
         app.state.wallet_cache = payload
@@ -1227,30 +1240,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             fills: list[dict[str, Any]] = []
             activities: list[dict[str, Any]] = []
+            clob_error: str | None = None
+            activity_error: str | None = None
             if (current_settings.polymarket_private_key or "").strip():
-                live_trader: PolymarketLiveTradingAdapter | None = getattr(app.state, "live_trader", None)
-                if live_trader is not None:
-                    live_trader.settings = current_settings
-                    client = live_trader._get_authenticated_client()
-                else:
-                    client = create_authenticated_clob_v2_client(current_settings)
-                clob_fills = client.get_trades()
-                if isinstance(clob_fills, list):
-                    fills = [fill for fill in clob_fills if isinstance(fill, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+                try:
+                    live_trader: PolymarketLiveTradingAdapter | None = getattr(app.state, "live_trader", None)
+                    if live_trader is not None:
+                        live_trader.settings = current_settings
+                        client = live_trader._get_authenticated_client()
+                    else:
+                        client = create_authenticated_clob_v2_client(current_settings)
+                    clob_fills = client.get_trades()
+                    if isinstance(clob_fills, list):
+                        fills = [fill for fill in clob_fills if isinstance(fill, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+                except Exception as exc:
+                    clob_error = str(exc)
             funder_address = str(current_settings.polymarket_funder_address or "").strip()
-            if funder_address:
-                with httpx.Client(timeout=5.0) as client:
-                    response = client.get(
-                        f"{current_settings.polymarket_data_api_base_url.rstrip('/')}/activity",
-                        params={"user": funder_address, "limit": LIVE_FILL_ACTIVITY_LIMIT},
+            if not funder_address and (current_settings.polymarket_private_key or "").strip():
+                funder_address = str(
+                    resolve_funder_address(
+                        current_settings,
+                        current_settings.polymarket_private_key or "",
                     )
-                    response.raise_for_status()
-                    payload = response.json()
-                if isinstance(payload, list):
-                    activities = [item for item in payload if isinstance(item, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+                    or ""
+                ).strip()
+            if funder_address:
+                try:
+                    with httpx.Client(timeout=5.0) as client:
+                        response = client.get(
+                            f"{current_settings.polymarket_data_api_base_url.rstrip('/')}/activity",
+                            params={"user": funder_address, "limit": LIVE_FILL_ACTIVITY_LIMIT},
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                    if isinstance(payload, list):
+                        activities = [item for item in payload if isinstance(item, dict)][:LIVE_FILL_ACTIVITY_LIMIT]
+                except Exception as exc:
+                    activity_error = str(exc)
             with repository_scope() as repo:
                 inserted = repo.save_clob_fills(fills, wallet_address=funder_address)
                 inserted += repo.save_polymarket_activity_trades(activities, wallet_address=funder_address)
+                for source, error in (("clob", clob_error), ("data_api", activity_error)):
+                    if error:
+                        repo.save_execution_event(
+                            source="dashboard",
+                            mode="live",
+                            opportunity_id=None,
+                            status="fill_sync_source_failed",
+                            message=error,
+                            details={"source": source},
+                        )
                 return inserted
         finally:
             sync_lock.release()
@@ -1330,7 +1369,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return controls
 
     def current_runtime_controls() -> TradingControls:
-        return app.state.controls_override or app.state.default_controls
+        try:
+            with repository_scope() as repo:
+                return load_controls(repo, refresh=True)
+        except Exception:
+            return app.state.controls_override or app.state.default_controls
 
     async def live_preflight_quick() -> dict[str, Any]:
         try:
@@ -1883,7 +1926,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def load_dashboard_payload_from_db(preflight: dict[str, Any], wallet: dict[str, Any]) -> dict[str, Any]:
         with repository_scope() as repo:
-            controls = load_controls(repo)
+            controls = load_controls(repo, refresh=True)
             external_watch_running = (
                 current_settings.sqlite_path == get_settings().sqlite_path
                 and any(_pid_running(pid) for pid in _iter_watch_processes())
@@ -2178,9 +2221,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 continue
 
+            repo.save_live_submission_pending(
+                plan,
+                claim_key=claim_key,
+                source="dashboard",
+            )
             try:
                 live_result = await live_trader.execute(plan)
             except Exception as exc:
+                repo.mark_live_submission_failed(opportunity.opportunity_id, str(exc))
                 repo.update_execution_claim(claim_key=claim_key, status="failed", message=str(exc))
                 repo.save_execution_event(
                     source="dashboard",
@@ -2206,7 +2255,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status=live_result.status,
                 message=live_result.message,
             )
-            repo.save_live_execution(live_result)
+            if live_result.leg_results:
+                repo.save_live_execution(live_result)
+            else:
+                repo.mark_live_submission_failed(opportunity.opportunity_id, live_result.message)
             repo.save_execution_event(
                 source="dashboard",
                 mode="live",
@@ -2327,6 +2379,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/dashboard")
     async def api_dashboard() -> JSONResponse:
         return JSONResponse(await dashboard_payload())
+
+    @app.get("/api/near-close-performance")
+    async def api_near_close_performance() -> JSONResponse:
+        def load_performance() -> dict[str, Any]:
+            with repository_scope() as repo:
+                return repo.near_close_performance_report(
+                    taker_fee_rate=current_settings.near_close_profit_take_taker_fee_rate,
+                )
+
+        payload = await asyncio.wait_for(
+            asyncio.to_thread(load_performance),
+            timeout=45.0,
+        )
+        return JSONResponse(payload)
 
     @app.post("/api/actions/trading/live")
     async def api_toggle_live_trading() -> JSONResponse:

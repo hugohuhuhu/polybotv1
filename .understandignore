@@ -1,0 +1,50 @@
+# Secrets and local credentials
+.env
+.env.*
+auth.json
+.sandbox-secrets/
+
+# Generated Understand Anything output
+.understand-anything/
+
+# Runtime data, logs, and local process state
+runtime-logs/
+logs/
+*.log
+*.pid
+*.liveness
+
+# Databases and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.bak
+*.backup
+backups/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Build artifacts and dependency folders
+build/
+dist/
+*.egg-info/
+node_modules/
+
+# Tool and OS noise
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

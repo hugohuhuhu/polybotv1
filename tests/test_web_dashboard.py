@@ -228,6 +228,8 @@ def test_dashboard_timeout_reuses_last_successful_payload(tmp_path, monkeypatch)
     first_payload = client.get("/api/dashboard").json()
     assert first_payload["trade_journal"]["trade_count_total"] == 1
     assert len(first_payload["trade_groups"]) == 1
+    performance_payload = client.get("/api/near-close-performance").json()
+    assert set(performance_payload["periods"]) == {"today", "week", "all"}
 
     def slow_refresh_open_position_orderbooks(_repo, _settings):
         time.sleep(0.1)
@@ -707,11 +709,11 @@ def test_dashboard_live_orders_include_net_exit_pnl_for_closed_position(tmp_path
                 "yes",
                 "will-something-happen",
                 "Yes",
-                0.68,
+                0.47,
                 5.0,
                 "0xnetsell",
                 "CONFIRMED",
-                "{}",
+                json.dumps({"clob_fill": {"side": "SELL", "asset_id": "yes", "price": "0.68"}}),
                 (now + timedelta(seconds=10)).isoformat(),
             ),
         )
@@ -722,6 +724,7 @@ def test_dashboard_live_orders_include_net_exit_pnl_for_closed_position(tmp_path
     payload = client.get("/api/dashboard").json()
     group = next(group for group in payload["trade_groups"] if group["token_id"] == "yes")
     buy_order = next(order for order in payload["live_orders"] if order["order_id"] == "0xnetbuy")
+    sell_order = next(order for order in payload["live_orders"] if order["order_id"] == "0xnetsell")
 
     assert group["position_status"] == "closed"
     assert round(group["total_pnl"], 2) == -1.2
@@ -729,6 +732,9 @@ def test_dashboard_live_orders_include_net_exit_pnl_for_closed_position(tmp_path
     assert round(buy_order["net_pnl"], 2) == -1.2
     assert round(buy_order["net_exit_notional"], 2) == 3.4
     assert buy_order["net_position_status"] == "closed"
+    assert sell_order["target_price"] == 0.47
+    assert sell_order["execution_price"] == 0.68
+    assert round(sell_order["notional"], 2) == 3.4
 
 
 def test_dashboard_includes_wallet_only_unredeemed_position(tmp_path, monkeypatch) -> None:

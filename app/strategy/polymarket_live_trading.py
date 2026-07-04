@@ -292,6 +292,19 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
 
                 collateral_status = None
                 leg_order_type = self._leg_order_type(leg)
+                pre_submit_snapshot: dict[str, Any] = {}
+                if self._uses_market_order(leg_order_type):
+                    pre_submit_snapshot = self._validate_near_close_taker_snapshot(
+                        leg=leg,
+                        order_book=order_book,
+                        desired_shares=desired_shares,
+                    )
+                    if pre_submit_snapshot.get("best_ask") is not None and leg.action.upper() == "BUY":
+                        normalized_price = normalize_limit_order_price(
+                            leg.action,
+                            float(pre_submit_snapshot["best_ask"]),
+                            tick_size,
+                        )
                 if self._uses_market_order(leg_order_type):
                     submitted_size = normalize_market_order_amount(
                         leg.action,
@@ -370,6 +383,7 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
                     "post_only": bool(leg.post_only),
                     "expiration_sec": leg.expiration_sec,
                     "expiration": self._expiration_timestamp(leg),
+                    "pre_submit_snapshot": pre_submit_snapshot,
                     **(leg.metadata if isinstance(leg.metadata, dict) else {}),
                 }
                 leg_results.append(
@@ -468,6 +482,117 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
         if isinstance(order_book, dict):
             return order_book.get(field_name)
         return getattr(order_book, field_name, None)
+
+    @classmethod
+    def _book_levels(cls, order_book: object, field_name: str) -> list[Any]:
+        levels = cls._book_field(order_book, field_name)
+        return list(levels) if isinstance(levels, (list, tuple)) else []
+
+    @staticmethod
+    def _level_value(level: object, field_name: str) -> float | None:
+        raw = level.get(field_name) if isinstance(level, dict) else getattr(level, field_name, None)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_near_close_taker_snapshot(
+        self,
+        *,
+        leg: Any,
+        order_book: object,
+        desired_shares: float,
+    ) -> dict[str, Any]:
+        metadata = leg.metadata if isinstance(leg.metadata, dict) else {}
+        if (
+            leg.action.upper() != "BUY"
+            or str(metadata.get("strategy_variant") or "") != "near_close_maker"
+            or str(metadata.get("entry_execution_mode") or "") != "taker_fallback"
+        ):
+            return {}
+
+        asks = self._book_levels(order_book, "asks")
+        bids = self._book_levels(order_book, "bids")
+        ask_prices = [value for level in asks if (value := self._level_value(level, "price")) is not None]
+        bid_prices = [value for level in bids if (value := self._level_value(level, "price")) is not None]
+        best_ask = min(ask_prices, default=None)
+        best_bid = max(bid_prices, default=None)
+        if best_ask is None or best_bid is None:
+            raise LiveTradingError("Near-close taker pre-submit check has no current bid/ask.")
+
+        min_price = float(
+            metadata.get("min_entry_price")
+            or self.settings.effective_near_close_min_entry_price("crypto_updown")
+        )
+        max_price = min(
+            float(metadata.get("max_entry_price") or self.settings.near_close_crypto_updown_max_entry_price),
+            float(self.settings.near_close_crypto_updown_taker_fallback_max_price),
+        )
+        if best_ask < min_price or best_ask > max_price:
+            raise LiveTradingError(
+                f"Near-close taker blocked: current best ask {best_ask:.4f} is outside "
+                f"the allowed {min_price:.4f}-{max_price:.4f} range."
+            )
+
+        spread = max(best_ask - best_bid, 0.0)
+        thresholds = metadata.get("taker_fallback_thresholds")
+        max_spread = float(
+            thresholds.get("max_spread")
+            if isinstance(thresholds, dict) and thresholds.get("max_spread") is not None
+            else self.settings.near_close_crypto_updown_taker_fallback_max_spread
+        )
+        if spread > max_spread:
+            raise LiveTradingError(
+                f"Near-close taker blocked: current spread {spread:.4f} exceeds {max_spread:.4f}."
+            )
+
+        ask_depth = sum(
+            self._level_value(level, "size") or 0.0
+            for level in asks
+            if (self._level_value(level, "price") or 0.0) <= max_price
+        )
+        required_depth = max(
+            min(float(desired_shares), float(self.settings.near_close_crypto_updown_taker_fallback_min_ask_depth)),
+            0.0,
+        )
+        if ask_depth < required_depth:
+            raise LiveTradingError(
+                f"Near-close taker blocked: current ask depth {ask_depth:.4f} is below {required_depth:.4f}."
+            )
+
+        checked_at = datetime.now(timezone.utc)
+        signal_created_at = metadata.get("signal_created_at")
+        signal_age_sec: float | None = None
+        seconds_left: float | None = None
+        if signal_created_at:
+            try:
+                signal_at = datetime.fromisoformat(str(signal_created_at).replace("Z", "+00:00"))
+                if signal_at.tzinfo is None:
+                    signal_at = signal_at.replace(tzinfo=timezone.utc)
+                signal_age_sec = max((checked_at - signal_at).total_seconds(), 0.0)
+                seconds_left = float(metadata.get("time_to_resolution_sec")) - signal_age_sec
+            except (TypeError, ValueError):
+                raise LiveTradingError("Near-close taker blocked: invalid signal timestamp metadata.")
+        if seconds_left is not None:
+            min_seconds = float(metadata.get("entry_window_min_seconds") or 0.0)
+            max_seconds = float(metadata.get("entry_window_max_seconds") or float("inf"))
+            if seconds_left < min_seconds or seconds_left > max_seconds:
+                raise LiveTradingError(
+                    f"Near-close taker blocked: refreshed time-to-resolution {seconds_left:.2f}s "
+                    f"is outside {min_seconds:.2f}-{max_seconds:.2f}s."
+                )
+
+        return {
+            "checked_at": checked_at.isoformat(),
+            "signal_age_sec": signal_age_sec,
+            "time_to_resolution_sec": seconds_left,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "ask_depth_to_max_price": ask_depth,
+            "min_price": min_price,
+            "max_price": max_price,
+        }
 
     def _resolve_tick_size(self, client: ClobClient, token_id: str, order_book: object) -> str:
         candidates: list[Decimal] = []

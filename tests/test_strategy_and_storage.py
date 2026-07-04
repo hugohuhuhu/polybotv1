@@ -9,6 +9,8 @@ from app.storage.backups import consolidate_sqlite_backups
 from app.models.core import (
     BookLevel,
     EventRecord,
+    ExecutionLeg,
+    ExecutionPlan,
     LiveExecutionLegResult,
     LiveExecutionResult,
     MarketRecord,
@@ -63,6 +65,179 @@ def make_books() -> dict[str, OrderBookSnapshot]:
             updated_at=datetime.now(timezone.utc),
         ),
     }
+
+
+def test_pending_submission_reconciles_large_fill_price_move(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "pending-reconciliation.db"))
+    plan = ExecutionPlan(
+        opportunity_id="pending-opportunity",
+        summary="near-close taker",
+        legs=[
+            ExecutionLeg(
+                action="BUY",
+                token_id="token-down",
+                market_slug="btc-updown-5m-123",
+                outcome_label="Down",
+                target_price=0.90,
+                size=5.0,
+                order_type="FAK",
+                metadata={
+                    "strategy_variant": "near_close_maker",
+                    "entry_execution_mode": "taker_fallback",
+                    "trade_autopsy_id": "ta_pending_reconciliation",
+                },
+            )
+        ],
+        max_slippage_bps=10.0,
+        cancel_conditions=[],
+        live_trading_allowed=True,
+    )
+    repository.save_live_submission_pending(plan, claim_key="claim-1", source="watch")
+    before = repository.connection.fetchone(
+        "SELECT id, order_id, status FROM live_trades WHERE opportunity_id = ?",
+        (plan.opportunity_id,),
+    )
+
+    activities = [
+        {
+            "type": "TRADE",
+            "proxyWallet": "0xabc",
+            "asset": "token-down",
+            "side": "BUY",
+            "transactionHash": "0xreconciled",
+            "price": 0.1342,
+            "size": 33.52941,
+            "timestamp": int(datetime.now(timezone.utc).timestamp()),
+            "slug": "btc-updown-5m-123",
+            "outcome": "Down",
+        }
+    ]
+    inserted = repository.save_polymarket_activity_trades(
+        activities,
+        wallet_address="0xabc",
+    )
+    after = repository.connection.fetchone(
+        "SELECT id, opportunity_id, requested_size, status, response_json FROM live_trades WHERE id = ?",
+        (before["id"],),
+    )
+
+    assert before["order_id"] is None
+    assert before["status"] == "submission_pending"
+    assert inserted == 1
+    assert after["id"] == before["id"]
+    assert after["opportunity_id"] == plan.opportunity_id
+    assert after["requested_size"] == 33.52941
+    assert after["status"] == "CONFIRMED"
+    assert json.loads(after["response_json"])["actual_fill_price"] == 0.1342
+    assert repository.save_polymarket_activity_trades(activities, wallet_address="0xabc") == 0
+    fill_events = repository.connection.fetchone(
+        "SELECT COUNT(*) AS count FROM execution_audit_log WHERE status = 'trade_autopsy_fill'"
+    )
+    assert fill_events["count"] == 1
+
+
+def test_activity_redeem_zero_sets_all_in_settled_loss(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "activity-settlement.db"))
+    wallet = "0xabc"
+    slug = "btc-updown-5m-1782963900"
+    token_id = "token-down"
+    activities = [
+        {
+            "type": "REDEEM",
+            "proxyWallet": wallet,
+            "slug": slug,
+            "transactionHash": "0xredeem-zero",
+            "timestamp": 1782964724,
+            "size": 0,
+            "usdcSize": 0,
+        },
+        {
+            "type": "TRADE",
+            "proxyWallet": wallet,
+            "asset": token_id,
+            "side": "BUY",
+            "transactionHash": "0xbuy-loss",
+            "price": 0.1342105036,
+            "size": 33.52941,
+            "usdcSize": 4.772719,
+            "timestamp": 1782964183,
+            "slug": slug,
+            "outcome": "Down",
+        },
+    ]
+
+    assert repository.save_polymarket_activity_trades(activities, wallet_address=wallet) == 2
+    row = repository.connection.fetchone(
+        "SELECT status, response_json FROM live_trades WHERE market_slug = ?",
+        (slug,),
+    )
+    order = next(item for item in repository.recent_live_orders(limit=20) if item["market_slug"] == slug)
+
+    assert row["status"] == "SETTLED_LOST"
+    assert json.loads(row["response_json"])["settlement_source"] == "polymarket_activity"
+    assert order["status"] == "finished"
+    assert order["notional"] == 4.772719
+    assert order["current_value"] == 0.0
+    assert order["pnl"] == -4.772719
+    assert repository.save_polymarket_activity_trades(activities, wallet_address=wallet) == 0
+
+
+def test_expire_stale_pending_submission_after_market_end(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "stale-pending.db"))
+    plan = ExecutionPlan(
+        opportunity_id="stale-pending",
+        summary="stale",
+        legs=[
+            ExecutionLeg(
+                action="BUY",
+                token_id="token-down",
+                market_slug="btc-updown-5m-1782969300",
+                outcome_label="Down",
+                target_price=0.90,
+                size=5.0,
+                order_type="GTD",
+            )
+        ],
+        max_slippage_bps=10.0,
+        cancel_conditions=[],
+        live_trading_allowed=True,
+    )
+    assert repository.claim_execution(
+        claim_key="stale-claim",
+        opportunity_id=plan.opportunity_id,
+        source="watch",
+        mode="live",
+    )
+    repository.save_live_submission_pending(plan, claim_key="stale-claim", source="watch")
+    repository.connection.execute(
+        "UPDATE live_trades SET created_at = ? WHERE opportunity_id = ?",
+        ("2026-07-02T05:19:26+00:00", plan.opportunity_id),
+    )
+
+    assert repository.expire_stale_live_submissions(older_than_sec=300.0) == 1
+    row = repository.connection.fetchone(
+        "SELECT status, response_json FROM live_trades WHERE opportunity_id = ?",
+        (plan.opportunity_id,),
+    )
+    assert row["status"] == "reconciliation_failed"
+    assert json.loads(row["response_json"])["submission_state"] == "reconciliation_failed"
+    claim = repository.connection.fetchone(
+        "SELECT status FROM execution_claims WHERE opportunity_id = ?",
+        (plan.opportunity_id,),
+    )
+    assert claim["status"] == "reconciliation_failed"
+    assert repository.near_close_active_orders_for_market() == []
+
+    repository.connection.execute(
+        "UPDATE execution_claims SET status = 'claimed' WHERE opportunity_id = ?",
+        (plan.opportunity_id,),
+    )
+    assert repository.expire_stale_live_submissions(older_than_sec=300.0) == 0
+    repaired_claim = repository.connection.fetchone(
+        "SELECT status FROM execution_claims WHERE opportunity_id = ?",
+        (plan.opportunity_id,),
+    )
+    assert repaired_claim["status"] == "reconciliation_failed"
 
 
 def test_ranker_puts_higher_score_first() -> None:
@@ -305,6 +480,183 @@ def test_execution_planner_handles_near_close_taker_fallback_leg() -> None:
     assert plan.legs[0].order_type == "FAK"
     assert plan.live_trading_allowed is True
     assert plan.legs[0].metadata["entry_execution_mode"] == "taker_fallback"
+
+
+def test_recent_live_orders_classifies_maker_and_taker_execution_roles(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "execution-role.db"))
+    created_at = datetime.now(timezone.utc)
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="maker-entry",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=created_at,
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="maker-token",
+                    market_slug="btc-updown-5m-test",
+                    outcome_label="Down",
+                    target_price=0.90,
+                    requested_size=5.0,
+                    order_id="0xmaker",
+                    status="submitted",
+                    response={"order_type": "GTD", "post_only": True, "submission_kind": "limit"},
+                )
+            ],
+        )
+    )
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="taker-entry",
+            status="submitted",
+            message="ok",
+            order_type="FAK",
+            created_at=created_at + timedelta(seconds=1),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="taker-token",
+                    market_slug="eth-updown-5m-test",
+                    outcome_label="Up",
+                    target_price=0.90,
+                    requested_size=5.0,
+                    order_id="0xtaker",
+                    status="submitted",
+                    response={
+                        "order_type": "FAK",
+                        "post_only": False,
+                        "submission_kind": "market",
+                        "entry_execution_mode": "taker_fallback",
+                    },
+                )
+            ],
+        )
+    )
+
+    orders = repository.recent_live_orders(limit=5)
+    by_order_id = {order["order_id"]: order for order in orders}
+
+    assert by_order_id["0xmaker"]["execution_role"] == "maker"
+    assert by_order_id["0xmaker"]["order_type"] == "GTD"
+    assert by_order_id["0xmaker"]["post_only"] is True
+    assert by_order_id["0xtaker"]["execution_role"] == "taker"
+    assert by_order_id["0xtaker"]["order_type"] == "FAK"
+    assert by_order_id["0xtaker"]["post_only"] is False
+
+
+def test_clob_partial_maker_fills_accumulate_without_double_counting(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "partial-maker-fills.db"))
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="partial-maker-entry",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="partial-token",
+                    market_slug="sol-updown-5m-partial",
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="0xpartialmaker",
+                    status="submitted",
+                )
+            ],
+        )
+    )
+    fills = [
+        {
+            "id": "partial-fill-1",
+            "transactionHash": "0xpartialtx1",
+            "taker_order_id": "0xtaker1",
+            "asset_id": "counterparty-token-1",
+            "side": "SELL",
+            "size": "10",
+            "price": "0.1",
+            "status": "CONFIRMED",
+            "maker_orders": [
+                {
+                    "order_id": "0xpartialmaker",
+                    "maker_address": "0xabc",
+                    "asset_id": "partial-token",
+                    "side": "BUY",
+                    "matched_amount": "2",
+                    "price": "0.9",
+                    "outcome": "Up",
+                }
+            ],
+        },
+        {
+            "id": "partial-fill-2",
+            "transactionHash": "0xpartialtx2",
+            "taker_order_id": "0xtaker2",
+            "asset_id": "counterparty-token-2",
+            "side": "SELL",
+            "size": "9.6",
+            "price": "0.13",
+            "status": "CONFIRMED",
+            "maker_orders": [
+                {
+                    "order_id": "0xpartialmaker",
+                    "maker_address": "0xabc",
+                    "asset_id": "partial-token",
+                    "side": "BUY",
+                    "matched_amount": "3",
+                    "price": "0.9",
+                    "outcome": "Up",
+                }
+            ],
+        },
+    ]
+
+    assert repository.save_clob_fills(fills, wallet_address="0xABC") == 2
+    assert repository.save_clob_fills(fills, wallet_address="0xABC") == 2
+
+    row = repository.connection.fetchone(
+        "SELECT requested_size, response_json FROM live_trades WHERE order_id = ?",
+        ("0xpartialmaker",),
+    )
+    response = json.loads(row["response_json"])
+    order = next(item for item in repository.recent_live_orders(limit=5) if item["order_id"] == "0xpartialmaker")
+
+    assert float(row["requested_size"]) == 5.0
+    assert float(response["actual_matched_size"]) == 5.0
+    assert float(response["actual_fill_notional"]) == 4.5
+    assert float(response["actual_fill_price"]) == 0.9
+    assert len(response["matched_fills"]) == 2
+    assert order["requested_size"] == 5.0
+    assert order["notional"] == 4.5
+
+    assert repository.save_polymarket_activity_trades(
+        [
+            {
+                "type": "TRADE",
+                "proxyWallet": "0xabc",
+                "asset": "partial-token",
+                "side": "BUY",
+                "transactionHash": "0xpartialtx2",
+                "price": 0.9,
+                "size": 3.0,
+                "usdcSize": 2.7,
+                "timestamp": int(datetime.now(timezone.utc).timestamp()),
+                "slug": "sol-updown-5m-partial",
+                "outcome": "Up",
+            }
+        ],
+        wallet_address="0xABC",
+    ) == 1
+    activity_order = next(
+        item for item in repository.recent_live_orders(limit=5) if item["order_id"] == "0xpartialmaker"
+    )
+    assert activity_order["notional"] == 4.5
 
 
 def test_repository_runtime_controls_claims_and_reporting(tmp_path) -> None:
@@ -1433,6 +1785,117 @@ def test_live_trade_groups_offset_settled_lost_entry_with_stop_exit_sell(tmp_pat
     assert round(float(journal["open_size_total"]), 2) == 0.0
 
 
+def test_near_close_performance_report_splits_modes_buckets_and_risk_recovery(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "near-close-performance.db"))
+    created_at = datetime.now(timezone.utc).replace(microsecond=0)
+    rows = [
+        (
+            "maker-win",
+            "BUY",
+            "btc-up",
+            "btc-updown-5m-maker-win",
+            "Up",
+            0.90,
+            5.0,
+            "0xmakerwin",
+            "REDEEMED",
+            {"strategy_variant": "near_close_maker", "order_type": "GTD", "post_only": True},
+            created_at,
+        ),
+        (
+            "taker-stop",
+            "BUY",
+            "eth-down",
+            "eth-updown-5m-taker-stop",
+            "Down",
+            0.87,
+            5.0,
+            "0xtakerstopentry",
+            "SETTLED_LOST",
+            {
+                "strategy_variant": "near_close_maker",
+                "entry_execution_mode": "taker_fallback",
+                "order_type": "FAK",
+                "post_only": False,
+            },
+            created_at + timedelta(minutes=5),
+        ),
+        (
+            "stop-exit:eth-updown-5m-taker-stop:eth-down",
+            "SELL",
+            "eth-down",
+            "eth-updown-5m-taker-stop",
+            "Down",
+            0.25,
+            5.0,
+            "0xtakerstopexit",
+            "MATCHED",
+            {"strategy_variant": "near_close_stop_exit", "order_type": "FAK", "post_only": False},
+            created_at + timedelta(minutes=5, seconds=20),
+        ),
+        (
+            "taker-zero",
+            "BUY",
+            "sol-up",
+            "sol-updown-5m-taker-zero",
+            "Up",
+            0.86,
+            5.0,
+            "0xtakerzero",
+            "SETTLED_LOST",
+            {
+                "strategy_variant": "near_close_maker",
+                "fee_rate_bps": "1000",
+            },
+            created_at + timedelta(minutes=10),
+        ),
+    ]
+    with repository.connection.transaction():
+        for index, row in enumerate(rows, start=1):
+            repository.connection.execute(
+                """
+                INSERT INTO live_trades (
+                    opportunity_id, leg_index, action, token_id, market_slug, outcome_label,
+                    target_price, requested_size, order_id, status, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row[0],
+                    index,
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    json.dumps(row[9]),
+                    row[10].isoformat(),
+                ),
+            )
+    report = repository.near_close_performance_report(taker_fee_rate=0.07)
+    summary = report["periods"]["all"]["summary"]
+    maker = report["periods"]["all"]["modes"]["maker"]
+    taker = report["periods"]["all"]["modes"]["taker"]
+    buckets = {bucket["key"]: bucket for bucket in report["periods"]["all"]["price_buckets"]}
+
+    assert summary["count"] == 3
+    assert summary["zero_loss_count"] == 1
+    assert round(float(summary["zero_loss_rate"]), 6) == round(1 / 3, 6)
+    assert summary["risk_exit_count"] == 1
+    assert round(float(summary["risk_recovered"]), 2) == 1.25
+    assert summary["ci95_low"] is not None
+    assert summary["ci95_high"] is not None
+    assert maker["count"] == 1
+    assert round(float(maker["net_pnl"]), 2) == 0.50
+    assert taker["count"] == 2
+    assert taker["estimated_fees"] > 0
+    assert buckets["0.86-0.87"]["count"] == 2
+    assert buckets["0.89-0.90"]["count"] == 1
+    assert report["periods"]["today"]["summary"]["count"] == 3
+
+
 def test_recent_live_orders_do_not_use_entry_prediction_as_settlement_winner(tmp_path) -> None:
     repository = ScannerRepository(connect_db(tmp_path / "ended-response-winner-order.db"))
     token_id = "eth-up"
@@ -1550,6 +2013,54 @@ def test_near_close_live_exposure_counts_open_confirmed_positions(tmp_path) -> N
     assert exposure["total"] == 4.85
     assert exposure["by_market"]["eth-updown"] == 4.85
     assert exposure["by_position"]["eth-updown:yes:Yes"]["open_size"] == 5.0
+
+
+def test_near_close_live_exposure_ignores_positions_from_ended_markets(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "ended-near-close.db"))
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    ended_slug = f"btc-updown-5m-{now_ts - 600}"
+    active_slug = f"eth-updown-5m-{now_ts + 300}"
+    repository.save_live_execution(
+        LiveExecutionResult(
+            opportunity_id="mixed-near-close",
+            status="submitted",
+            message="ok",
+            order_type="GTD",
+            created_at=datetime.now(timezone.utc),
+            leg_results=[
+                LiveExecutionLegResult(
+                    leg_index=1,
+                    action="BUY",
+                    token_id="btc-yes",
+                    market_slug=ended_slug,
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="ended-confirmed",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                ),
+                LiveExecutionLegResult(
+                    leg_index=2,
+                    action="BUY",
+                    token_id="eth-yes",
+                    market_slug=active_slug,
+                    outcome_label="Up",
+                    target_price=0.9,
+                    requested_size=5.0,
+                    order_id="active-confirmed",
+                    status="CONFIRMED",
+                    response={"strategy_variant": "near_close_maker"},
+                ),
+            ],
+        )
+    )
+
+    exposure = repository.near_close_live_exposure()
+
+    assert exposure["total"] == 4.5
+    assert ended_slug not in exposure["by_market"]
+    assert exposure["by_market"][active_slug] == 4.5
 
 
 def test_near_close_live_exposure_offsets_matched_stop_exit_sells(tmp_path) -> None:
@@ -2013,6 +2524,15 @@ def test_candidate_autopsy_records_each_near_close_observation_and_reports_hold_
         "ask_depth_at_best": 24,
         "crypto_start_distance": 0.0012,
         "crypto_winning_outcome": "Up",
+        "volatility_shadow_enabled": True,
+        "volatility_shadow_ratio_threshold": 1.25,
+        "volatility_shadow_window_sec": 60,
+        "volatility_shadow_source": "binance_1s_range",
+        "volatility_shadow_data_available": True,
+        "volatility_shadow_range_bps": 12.0,
+        "volatility_shadow_sample_count": 60,
+        "volatility_shadow_ratio": 1.0,
+        "volatility_shadow_would_block": True,
         "tradable_live": True,
         "post_only": True,
         "effective_order_size": 5,
@@ -2064,13 +2584,20 @@ def test_candidate_autopsy_records_each_near_close_observation_and_reports_hold_
 
     events = repository.candidate_autopsy_events(limit=5)
     report = repository.candidate_autopsy_report(limit=5)
-    first_observation = next(row for row in report["rows"] if float(row["entry_price"]) == 0.89)
+    first_observation = report["rows"][0]
 
     assert len(events) == 2
+    assert len(report["rows"]) == 1
+    assert report["summary"]["observation_count"] == 2
     assert events[0]["candidate_autopsy_id"].startswith("oa_")
+    assert float(first_observation["entry_price"]) == 0.89
     assert first_observation["fillability"] == "likely_fill"
+    assert first_observation["fillability_weight"] is None
+    assert first_observation["fillability_weight_source"] == "insufficient_actual_samples"
     assert first_observation["candidate_quality"] == "would_profit"
     assert first_observation["did_bought_outcome_win"] is True
+    assert first_observation["volatility_shadow_would_block"] is True
+    assert float(first_observation["volatility_shadow_ratio"]) == 1.0
     assert round(float(first_observation["hypothetical_hold_pnl"]), 6) == 0.55
 
 
@@ -2129,3 +2656,187 @@ def test_candidate_autopsy_marks_missing_settlement_metadata(tmp_path) -> None:
     assert row["final_outcome"] is None
     assert row["candidate_quality"] == "pending_settlement"
     assert repository.autopsy_market_slugs_needing_settlement_refresh(limit=5) == [market_slug]
+
+
+def test_candidate_autopsy_maker_does_not_treat_best_bid_as_fill_evidence(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "candidate-maker-bid-touch.db"))
+    observed_at = datetime(2026, 6, 28, 10, 0, 10, tzinfo=timezone.utc)
+    market_slug = "btc-updown-maker-bid-touch"
+    token_id = "btc-up-maker"
+    opportunity = Opportunity(
+        opportunity_id="candidate-maker-bid-touch",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="BTC Up/Down | near-close maker Up",
+        summary="Near-close maker candidate.",
+        market_slugs=[market_slug],
+        market_ids=["maker-bid-market"],
+        token_ids=[token_id],
+        prices={"entry_bid": 0.90, "entry_ask": 0.97},
+        gross_edge=0.10,
+        estimated_fees=0.0,
+        slippage_estimate=0.0,
+        net_edge=0.09,
+        max_safe_size=5.0,
+        available_liquidity=30.0,
+        confidence_score=0.9,
+        timestamp=observed_at,
+        suggested_action="Paper observe",
+        details={
+            "strategy_variant": "near_close_maker",
+            "outcome_label": "Up",
+            "market_slug": market_slug,
+            "token_id": token_id,
+            "entry_price": 0.90,
+            "best_bid": 0.95,
+            "best_ask": 0.97,
+            "ask_depth_at_best": 20,
+            "effective_order_size": 5,
+            "entry_execution_mode": "maker",
+            "resolution_bucket_key": "maker-bid-touch-bucket",
+            "rank": 1,
+        },
+    )
+    repository.save_opportunities([opportunity])
+    repository.save_orderbooks(
+        [
+            OrderBookSnapshot(
+                token_id=token_id,
+                market_id="maker-bid-market",
+                bids=[BookLevel(price=0.99, size=100)],
+                asks=[BookLevel(price=0.96, size=20)],
+                updated_at=observed_at + timedelta(seconds=5),
+            )
+        ]
+    )
+
+    row = repository.candidate_autopsy_report(limit=5)["rows"][0]
+
+    assert row["fillability"] == "unfillable"
+    assert row["fillability_evidence"]["reason"] == "maker_best_ask_never_reached_bid"
+
+
+def test_candidate_autopsy_taker_uses_immediate_ask_depth(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "candidate-taker-depth.db"))
+    observed_at = datetime(2026, 6, 28, 10, 5, 10, tzinfo=timezone.utc)
+    opportunity = Opportunity(
+        opportunity_id="candidate-taker-depth",
+        strategy_type=StrategyType.LATE_RESOLUTION,
+        direction=SignalDirection.BUY_BASKET,
+        title="SOL Up/Down | near-close taker Down",
+        summary="Near-close taker candidate.",
+        market_slugs=["sol-updown-taker-depth"],
+        market_ids=["taker-depth-market"],
+        token_ids=["sol-down-taker"],
+        prices={"entry_bid": 0.86, "entry_ask": 0.87},
+        gross_edge=0.13,
+        estimated_fees=0.0,
+        slippage_estimate=0.0,
+        net_edge=0.12,
+        max_safe_size=5.0,
+        available_liquidity=20.0,
+        confidence_score=0.9,
+        timestamp=observed_at,
+        suggested_action="Paper observe",
+        details={
+            "strategy_variant": "near_close_maker",
+            "outcome_label": "Down",
+            "market_slug": "sol-updown-taker-depth",
+            "token_id": "sol-down-taker",
+            "entry_price": 0.87,
+            "best_bid": 0.86,
+            "best_ask": 0.87,
+            "ask_depth_at_best": 29.61,
+            "effective_order_size": 5,
+            "entry_execution_mode": "taker_fallback",
+            "resolution_bucket_key": "taker-depth-bucket",
+            "rank": 1,
+        },
+    )
+    repository.save_opportunities([opportunity])
+
+    row = repository.candidate_autopsy_report(limit=5)["rows"][0]
+
+    assert row["fillability"] == "likely_fill"
+    assert row["fillability_evidence"]["reason"] == "taker_immediate_ask_depth_sufficient"
+
+
+def test_candidate_autopsy_prefers_actual_order_and_calibrates_from_fill_results(tmp_path) -> None:
+    repository = ScannerRepository(connect_db(tmp_path / "candidate-calibration.db"))
+    base_time = datetime(2026, 6, 28, 11, 0, 10, tzinfo=timezone.utc)
+    for index in range(6):
+        opportunity_id = f"candidate-calibration-{index}"
+        opportunity = Opportunity(
+            opportunity_id=opportunity_id,
+            strategy_type=StrategyType.LATE_RESOLUTION,
+            direction=SignalDirection.BUY_BASKET,
+            title="ETH Up/Down | near-close taker Up",
+            summary="Near-close taker calibration candidate.",
+            market_slugs=[f"eth-updown-calibration-{index}"],
+            market_ids=[f"calibration-market-{index}"],
+            token_ids=[f"eth-up-{index}"],
+            prices={"entry_bid": 0.86, "entry_ask": 0.87},
+            gross_edge=0.13,
+            estimated_fees=0.0,
+            slippage_estimate=0.0,
+            net_edge=0.12,
+            max_safe_size=5.0,
+            available_liquidity=20.0,
+            confidence_score=0.9,
+            timestamp=base_time + timedelta(minutes=5 * index),
+            suggested_action="Paper observe",
+            details={
+                "strategy_variant": "near_close_maker",
+                "outcome_label": "Up",
+                "market_slug": f"eth-updown-calibration-{index}",
+                "token_id": f"eth-up-{index}",
+                "entry_price": 0.87,
+                "best_bid": 0.86,
+                "best_ask": 0.87,
+                "ask_depth_at_best": 20,
+                "effective_order_size": 5,
+                "entry_execution_mode": "taker_fallback",
+                "resolution_bucket_key": f"calibration-bucket-{index}",
+                "rank": 1,
+            },
+        )
+        repository.save_opportunities([opportunity])
+        if index < 5:
+            filled = index < 3
+            repository.save_live_execution(
+                LiveExecutionResult(
+                    opportunity_id=opportunity_id,
+                    status="confirmed" if filled else "failed",
+                    message="calibration",
+                    order_type="FAK",
+                    created_at=base_time + timedelta(minutes=5 * index, seconds=1),
+                    leg_results=[
+                        LiveExecutionLegResult(
+                            leg_index=1,
+                            action="BUY",
+                            token_id=f"eth-up-{index}",
+                            market_slug=f"eth-updown-calibration-{index}",
+                            outcome_label="Up",
+                            target_price=0.87,
+                            requested_size=5.0,
+                            order_id=f"0xcalibration{index}" if filled else None,
+                            status="confirmed" if filled else "failed",
+                            response={
+                                "status": "MATCHED" if filled else "FAILED",
+                                "actual_fill_price": 0.87 if filled else None,
+                                "actual_matched_size": 5.0 if filled else None,
+                            },
+                        )
+                    ],
+                )
+            )
+
+    report = repository.candidate_autopsy_report(limit=10)
+    unattempted = next(row for row in report["rows"] if row["opportunity_id"] == "candidate-calibration-5")
+    filled = next(row for row in report["rows"] if row["opportunity_id"] == "candidate-calibration-0")
+
+    assert unattempted["fillability_weight"] == 0.6
+    assert unattempted["fillability_weight_source"] == "mode_and_fillability"
+    assert filled["actual_order_filled"] is True
+    assert filled["fillability_weight"] == 1.0
+    assert filled["fillability_evidence"]["source"] == "actual_live_fill"
