@@ -4,8 +4,8 @@ import asyncio
 from datetime import datetime, timezone
 
 from app.clients.websocket_client import OrderBookState
-from app.main import _merge_timestamped_last_trade_observations
 from app.models.core import BookLevel, OrderBookSnapshot
+from app.orchestration import merge_timestamped_last_trade_observations
 
 
 def test_last_trade_event_preserves_exchange_timestamp_across_book_updates() -> None:
@@ -19,6 +19,7 @@ def test_last_trade_event_preserves_exchange_timestamp_across_book_updates() -> 
                 "asset_id": "token-yes",
                 "market": "condition-1",
                 "price": "0.456",
+                "side": "BUY",
                 "timestamp": str(timestamp_ms),
             }
         )
@@ -38,6 +39,7 @@ def test_last_trade_event_preserves_exchange_timestamp_across_book_updates() -> 
     snapshot = state.books["token-yes"]
     assert snapshot.last_trade_price == 0.456
     assert snapshot.last_trade_at == datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
+    assert snapshot.last_trade_side == "BUY"
 
 
 def test_last_trade_without_exchange_timestamp_is_not_treated_as_fresh() -> None:
@@ -66,10 +68,11 @@ def test_fast_monitor_rest_book_receives_timestamped_websocket_last_trade() -> N
         last_trade_price=0.9,
     )
 
-    _merge_timestamped_last_trade_observations(
+    merge_timestamped_last_trade_observations(
         {"token-yes": rest_book},
-        {"token-yes": (0.47, last_trade_at)},
+        {"token-yes": (0.47, last_trade_at, "SELL")},
     )
 
     assert rest_book.last_trade_price == 0.47
     assert rest_book.last_trade_at == last_trade_at
+    assert rest_book.last_trade_side == "SELL"

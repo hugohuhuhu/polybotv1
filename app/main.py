@@ -25,6 +25,7 @@ from app.orchestration import (
     collect_previous_midpoints,
     execute_monitor_cycle,
     execute_scan_cycle,
+    merge_timestamped_last_trade_observations,
     persist_monitor_cycle,
     persist_scan_cycle,
     shortlist_markets,
@@ -53,21 +54,6 @@ WATCH_LIVENESS_FILE = RUNTIME_LOG_DIR / "watch.liveness"
 LIVE_FILL_ACTIVITY_LIMIT = 50
 WATCH_AUXILIARY_TIMEOUT_SEC = 12.0
 CRYPTO_UPDOWN_RESOLUTION_BUCKET_SEC = 300.0
-
-
-def _merge_timestamped_last_trade_observations(
-    books: dict[str, Any],
-    observations: dict[str, tuple[float | None, datetime | None]],
-) -> None:
-    for token_id, (last_trade_price, last_trade_at) in observations.items():
-        book = books.get(token_id)
-        if book is None or last_trade_price is None or last_trade_at is None:
-            continue
-        current_last_trade_at = getattr(book, "last_trade_at", None)
-        if isinstance(current_last_trade_at, datetime) and current_last_trade_at > last_trade_at:
-            continue
-        book.last_trade_price = last_trade_price
-        book.last_trade_at = last_trade_at
 
 
 def _read_pid(pid_file: Path) -> int | None:
@@ -977,7 +963,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         websocket_task = asyncio.create_task(websocket_client.subscribe_forever(normalized_asset_ids))
 
     async def run_fast_monitor_worker(
-        last_trade_observations: dict[str, tuple[float | None, datetime | None]],
+        last_trade_observations: dict[str, tuple[float | None, datetime | None, str | None]],
     ) -> None:
         with closing(connect_db(settings)) as connection:
             repository = ScannerRepository(connection)
@@ -1001,7 +987,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             await clob.close()
         if not open_position_books:
             return
-        _merge_timestamped_last_trade_observations(open_position_books, last_trade_observations)
+        merge_timestamped_last_trade_observations(open_position_books, last_trade_observations)
 
         worker_live_trader = PolymarketLiveTradingAdapter(runtime_settings)
         with closing(connect_db(settings)) as connection:
@@ -1014,7 +1000,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
             )
 
     def run_fast_monitor_worker_sync(
-        last_trade_observations: dict[str, tuple[float | None, datetime | None]],
+        last_trade_observations: dict[str, tuple[float | None, datetime | None, str | None]],
     ) -> None:
         if not fast_monitor_lock.acquire(blocking=False):
             return
@@ -1043,7 +1029,7 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         monitor_interval = max(float(settings.near_close_open_position_monitor_sec), 0.5)
         monitor_timeout = min(max(monitor_interval, 1.0), 3.0)
         last_trade_observations = {
-            token_id: (snapshot.last_trade_price, snapshot.last_trade_at)
+            token_id: (snapshot.last_trade_price, snapshot.last_trade_at, snapshot.last_trade_side)
             for token_id, snapshot in book_state.books.items()
             if snapshot.last_trade_at is not None
         }
@@ -1126,6 +1112,11 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
         shortlist_diagnostics: dict[str, object] | None = None,
     ) -> Any:
         async def run_scan() -> Any:
+            last_trade_observations = {
+                token_id: (snapshot.last_trade_price, snapshot.last_trade_at, snapshot.last_trade_side)
+                for token_id, snapshot in book_state.books.items()
+                if snapshot.last_trade_at is not None
+            }
             with closing(connect_db(settings)) as connection:
                 repository = ScannerRepository(connection)
                 if monitored_markets is not None:
@@ -1134,12 +1125,14 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         monitored_markets,
                         previous_midpoints=previous_midpoints,
                         shortlist_diagnostics=shortlist_diagnostics,
+                        last_trade_observations=last_trade_observations,
                     )
                 return await execute_scan_cycle(
                     settings,
                     limit=args.limit,
                     previous_midpoints=previous_midpoints,
                     repository=repository,
+                    last_trade_observations=last_trade_observations,
                 )
 
         task = asyncio.create_task(run_scan())
@@ -1452,10 +1445,16 @@ async def _cmd_watch_impl(settings: Settings, args: argparse.Namespace) -> None:
                         raise
                     logger.warning("watch heartbeat skipped because SQLite is locked: %s", exc)
 
-                # Refresh the monitored universe every cycle so watch pool follows the latest shortlist.
+                last_trade_observations = {
+                    token_id: (snapshot.last_trade_price, snapshot.last_trade_at, snapshot.last_trade_side)
+                    for token_id, snapshot in book_state.books.items()
+                    if snapshot.last_trade_at is not None
+                }
+                # Refresh the monitored universe while preserving timestamped trade evidence.
                 book_state.books = {}
                 for snapshot in cycle.books.values():
                     book_state.upsert_snapshot(snapshot)
+                merge_timestamped_last_trade_observations(book_state.books, last_trade_observations)
                 if cycle.books:
                     monitored_markets = list(cycle.shortlisted_markets)
                     monitored_shortlist_diagnostics = dict(cycle.shortlist_diagnostics)

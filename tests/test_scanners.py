@@ -13,11 +13,24 @@ from app.scanners.stale_price_scanner import StalePriceScanner
 from app.scanners.sum_arb_scanner import BinarySumArbScanner
 
 
-def make_book(token_id: str, *, bid: float, ask: float, size: float = 200, updated_at: datetime | None = None) -> OrderBookSnapshot:
+def make_book(
+    token_id: str,
+    *,
+    bid: float,
+    ask: float,
+    size: float = 200,
+    updated_at: datetime | None = None,
+    last_trade_price: float | None = None,
+    last_trade_at: datetime | None = None,
+    last_trade_side: str | None = None,
+) -> OrderBookSnapshot:
     return OrderBookSnapshot(
         token_id=token_id,
         bids=[BookLevel(price=bid, size=size)],
         asks=[BookLevel(price=ask, size=size)],
+        last_trade_price=last_trade_price,
+        last_trade_at=last_trade_at,
+        last_trade_side=last_trade_side,
         updated_at=updated_at or datetime.now(timezone.utc),
     )
 
@@ -760,11 +773,114 @@ def test_late_resolution_scanner_uses_crypto_updown_taker_fallback_in_tight_wind
     assert opportunity.details["order_type"] == "FAK"
     assert opportunity.details["entry_price"] == 0.90
     assert opportunity.details["taker_fallback_price"] == 0.90
-    assert opportunity.details["taker_fallback_trigger"] == "tight_taker_window"
+    assert opportunity.details["taker_fallback_trigger"] == "confirmed_taker_signal"
     assert opportunity.details["taker_fallback_reasons"] == []
     assert opportunity.prices["entry_bid"] == 0.90
     assert opportunity.prices["taker_fallback_price"] == 0.90
     assert opportunity.available_liquidity == 80
+
+
+def test_confirmed_taker_only_requires_live_confirmation_and_never_falls_back_to_maker() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_DYNAMIC_START_DISTANCE_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_ONLY_ENABLED=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_SECONDS=15,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SECONDS=45,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_PRICE=0.90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MAX_SPREAD=0.02,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_START_DISTANCE_RATIO=2,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_MIN_ASK_DEPTH_MULTIPLIER=1.25,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_MIN_BID_DEPTH_MULTIPLIER=2,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_SPOT_MAX_AGE_SEC=15,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_RECENT_TRADE_MAX_AGE_SEC=2,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_BUY_TRADE=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_MOMENTUM=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_VOLATILITY_DATA=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_BLOCK_VOLATILITY_SHADOW=True,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_START_DISTANCE=0.00085,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_BEST_ASK=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_MIDPOINT=0.84,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_SPREAD=0.05,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_ENTRY_PRICE=0.86,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MAX_ENTRY_PRICE=0.90,
+        NEAR_CLOSE_CRYPTO_UPDOWN_MIN_DEPTH=18,
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=15,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=45,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=0.4, start_distance=0.002)
+    market.raw.update(
+        {
+            "near_close_crypto_spot_age_sec": 1.0,
+            "near_close_crypto_momentum_short_bps": 1.2,
+            "near_close_crypto_momentum_long_bps": 2.4,
+            "near_close_volatility_shadow_would_block": False,
+        }
+    )
+    book = make_book(
+        "dynamic_up",
+        bid=0.89,
+        ask=0.90,
+        size=80,
+        last_trade_price=0.90,
+        last_trade_at=datetime.now(timezone.utc) - timedelta(seconds=0.5),
+        last_trade_side="BUY",
+    )
+
+    opportunities = scanner.scan(
+        [market],
+        {"dynamic_up": book, "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11)},
+    )
+
+    assert len(opportunities) == 1
+    opportunity = opportunities[0]
+    assert opportunity.details["entry_execution_mode"] == "taker_fallback"
+    assert opportunity.details["taker_only_enabled"] is True
+    assert opportunity.details["order_type"] == "FAK"
+    assert opportunity.details["post_only"] is False
+    assert opportunity.details["entry_price"] == 0.90
+    assert opportunity.details["last_trade_side"] == "BUY"
+    assert opportunity.details["taker_fallback_thresholds"]["min_bid_depth"] == 18
+    assert opportunity.details["taker_fallback_thresholds"]["min_ask_depth"] == 6.25
+
+    stale_rejections: dict[str, int] = {}
+    stale_book = book.model_copy(update={"last_trade_at": datetime.now(timezone.utc) - timedelta(seconds=3)})
+    stale_opportunities = scanner.scan(
+        [market],
+        {"dynamic_up": stale_book, "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11)},
+        rejection_counts=stale_rejections,
+    )
+
+    assert stale_opportunities == []
+    assert stale_rejections == {"taker_confirmation_recent_trade_stale": 1}
+
+
+def test_confirmed_taker_only_blocks_new_entry_inside_final_fifteen_seconds() -> None:
+    settings = Settings(
+        NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_ONLY_ENABLED=True,
+        NEAR_CLOSE_ENTRY_MIN_SECONDS=15,
+        NEAR_CLOSE_ENTRY_MAX_SECONDS=45,
+        CANDIDATE_MIN_NET_EDGE=-0.0035,
+    )
+    scanner = LateResolutionScanner(settings, LiquidityFilter(settings))
+    market = _make_crypto_updown_market(minutes_left=0.23, start_distance=0.01)
+    rejections: dict[str, int] = {}
+
+    opportunities = scanner.scan(
+        [market],
+        {
+            "dynamic_up": make_book("dynamic_up", bid=0.89, ask=0.90),
+            "dynamic_down": make_book("dynamic_down", bid=0.10, ask=0.11),
+        },
+        rejection_counts=rejections,
+    )
+
+    assert opportunities == []
+    assert rejections == {"entry_after_window": 1}
 
 
 def test_late_resolution_scanner_keeps_maker_when_taker_fallback_window_missed() -> None:

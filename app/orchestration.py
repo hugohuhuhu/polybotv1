@@ -48,6 +48,22 @@ class MarketShortlistProfile:
     assigned_bucket: str | None = None
 
 
+def merge_timestamped_last_trade_observations(
+    books: dict[str, OrderBookSnapshot],
+    observations: dict[str, tuple[float | None, datetime | None, str | None]],
+) -> None:
+    for token_id, (last_trade_price, last_trade_at, last_trade_side) in observations.items():
+        book = books.get(token_id)
+        if book is None or last_trade_price is None or last_trade_at is None:
+            continue
+        current_last_trade_at = book.last_trade_at
+        if isinstance(current_last_trade_at, datetime) and current_last_trade_at > last_trade_at:
+            continue
+        book.last_trade_price = last_trade_price
+        book.last_trade_at = last_trade_at
+        book.last_trade_side = last_trade_side
+
+
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(value, upper))
 
@@ -243,7 +259,7 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         return
     client = crypto_price_client_from_settings(settings)
     try:
-        prices_task = client.get_prices(symbols)
+        prices_task = client.get_price_observations(symbols)
         start_prices_task = (
             client.get_open_prices_for_requests(start_price_requests) if start_price_requests else asyncio.sleep(0, result={})
         )
@@ -257,7 +273,7 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
             if volatility_requests
             else asyncio.sleep(0, result={})
         )
-        prices, start_prices, volatility_observations = await asyncio.gather(
+        price_observations, start_prices, volatility_observations = await asyncio.gather(
             prices_task,
             start_prices_task,
             volatility_task,
@@ -269,15 +285,18 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         parsed = parsed_by_market.get(market.market_id)
         if parsed is not None:
             symbol, side, strike = parsed
-            spot = prices.get(symbol)
-            if spot is None or strike <= 0:
+            price_observation = price_observations.get(symbol)
+            if price_observation is None or strike <= 0:
                 continue
+            spot = price_observation.price
             condition_true = spot > strike if side == "above" else spot < strike
             market.raw["near_close_crypto_variant"] = "fixed_strike"
             market.raw["near_close_crypto_symbol"] = symbol
             market.raw["near_close_crypto_side"] = side
             market.raw["near_close_crypto_spot_price"] = spot
             market.raw["near_close_crypto_spot_source"] = price_source
+            market.raw["near_close_crypto_spot_updated_at"] = price_observation.updated_at
+            market.raw["near_close_crypto_spot_age_sec"] = max(now.timestamp() - price_observation.updated_at, 0.0)
             market.raw["near_close_crypto_strike_price"] = strike
             market.raw["near_close_crypto_strike_distance"] = abs(spot - strike) / strike
             market.raw["near_close_crypto_winning_outcome"] = "Yes" if condition_true else "No"
@@ -300,7 +319,11 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         if volatility is not None:
             market.raw["near_close_volatility_shadow_range_bps"] = volatility.range_bps
             market.raw["near_close_volatility_shadow_sample_count"] = volatility.sample_count
-        spot = prices.get(symbol)
+            market.raw["near_close_crypto_momentum_short_bps"] = volatility.short_change_bps
+            market.raw["near_close_crypto_momentum_long_bps"] = volatility.long_change_bps
+            market.raw["near_close_crypto_momentum_latest_close"] = volatility.latest_close
+        price_observation = price_observations.get(symbol)
+        spot = price_observation.price if price_observation is not None else None
         start_price = start_prices.get(market.market_id)
         if spot is None or start_price is None or start_price <= 0:
             continue
@@ -309,6 +332,8 @@ async def enrich_crypto_near_close_markets(settings: Settings, markets: list[Mar
         market.raw["near_close_crypto_side"] = "updown"
         market.raw["near_close_crypto_spot_price"] = spot
         market.raw["near_close_crypto_spot_source"] = price_source
+        market.raw["near_close_crypto_spot_updated_at"] = price_observation.updated_at
+        market.raw["near_close_crypto_spot_age_sec"] = max(now.timestamp() - price_observation.updated_at, 0.0)
         market.raw["near_close_crypto_start_price"] = start_price
         market.raw["near_close_crypto_start_price_source"] = price_source
         market.raw["near_close_crypto_start_time"] = start_time.isoformat()
@@ -876,6 +901,7 @@ async def execute_scan_cycle(
     limit: int | None = None,
     previous_midpoints: dict[str, float] | None = None,
     repository: ScannerRepository | None = None,
+    last_trade_observations: dict[str, tuple[float | None, datetime | None, str | None]] | None = None,
 ) -> ScanCycleResult:
     discovery_limit = limit
     if settings.near_close_scan_pool_enabled and settings.near_close_maker_enabled:
@@ -907,6 +933,7 @@ async def execute_scan_cycle(
         repository.positive_edge_candidates_24h() if repository is not None else sum(positive_edge_hits.values())
     )
     books = await fetch_books(settings, shortlisted)
+    merge_timestamped_last_trade_observations(books, last_trade_observations or {})
     scan_diagnostics: dict[str, object] = {}
     opportunities = run_scanners(settings, shortlisted, books, previous_midpoints, diagnostics=scan_diagnostics)
     shortlist_diagnostics.update(scan_diagnostics)
@@ -935,8 +962,10 @@ async def execute_monitor_cycle(
     *,
     previous_midpoints: dict[str, float] | None = None,
     shortlist_diagnostics: dict[str, object] | None = None,
+    last_trade_observations: dict[str, tuple[float | None, datetime | None, str | None]] | None = None,
 ) -> ScanCycleResult:
     books = await fetch_books(settings, shortlisted_markets)
+    merge_timestamped_last_trade_observations(books, last_trade_observations or {})
     scan_diagnostics: dict[str, object] = {}
     opportunities = run_scanners(settings, shortlisted_markets, books, previous_midpoints, diagnostics=scan_diagnostics)
     diagnostics = dict(shortlist_diagnostics or {})

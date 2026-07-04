@@ -650,24 +650,29 @@ def _trading_parameters_payload(
                     {"label": "進場價上限", "value": settings.near_close_crypto_updown_max_entry_price},
                     {"label": "最低 depth", "value": settings.near_close_crypto_updown_min_depth},
                     {"label": "midpoint discount", "value": settings.near_close_crypto_updown_midpoint_discount},
+                    {"label": "確認型 Taker", "value": "開" if settings.near_close_crypto_updown_taker_fallback_enabled else "關"},
+                    {"label": "Taker only", "value": "開" if settings.near_close_crypto_updown_taker_only_enabled else "關"},
                     {
-                        "label": "taker fallback",
-                        "value": "開" if settings.near_close_crypto_updown_taker_fallback_enabled else "關",
-                    },
-                    {
-                        "label": "fallback 秒窗",
+                        "label": "Taker 秒窗",
                         "value": (
                             f"{settings.near_close_crypto_updown_taker_fallback_min_seconds:g}-"
                             f"{settings.near_close_crypto_updown_taker_fallback_max_seconds:g}"
                         ),
                         "unit": "秒",
                     },
-                    {"label": "fallback 最高價", "value": settings.near_close_crypto_updown_taker_fallback_max_price},
-                    {"label": "fallback spread", "value": settings.near_close_crypto_updown_taker_fallback_max_spread},
+                    {"label": "Taker 最高價", "value": settings.near_close_crypto_updown_taker_fallback_max_price},
+                    {"label": "Taker spread", "value": settings.near_close_crypto_updown_taker_fallback_max_spread},
                     {
-                        "label": "fallback start ratio",
+                        "label": "Taker start ratio",
                         "value": settings.near_close_crypto_updown_taker_fallback_min_start_distance_ratio,
                     },
+                    {"label": "ask depth 倍數", "value": settings.near_close_crypto_updown_taker_min_ask_depth_multiplier},
+                    {"label": "bid depth 倍數", "value": settings.near_close_crypto_updown_taker_min_bid_depth_multiplier},
+                    {"label": "Chainlink 最大年齡", "value": settings.near_close_crypto_updown_taker_spot_max_age_sec, "unit": "秒"},
+                    {"label": "成交最大年齡", "value": settings.near_close_crypto_updown_taker_recent_trade_max_age_sec, "unit": "秒"},
+                    {"label": "主動 BUY 確認", "value": "開" if settings.near_close_crypto_updown_taker_require_buy_trade else "關"},
+                    {"label": "3/8 秒動能", "value": "開" if settings.near_close_crypto_updown_taker_require_momentum else "關"},
+                    {"label": "動盪影子阻擋", "value": "開" if settings.near_close_crypto_updown_taker_block_volatility_shadow else "關"},
                 ],
             },
             *_scan_rejection_parameter_groups(summary),

@@ -127,3 +127,6 @@ def test_recent_range_observation_uses_binance_one_second_klines() -> None:
 
     assert observations["market-1"].sample_count == 3
     assert round(observations["market-1"].range_bps, 6) == 70.0
+    assert observations["market-1"].latest_close == 99.9
+    assert round(observations["market-1"].short_change_bps or 0.0, 6) == -19.98002
+    assert round(observations["market-1"].long_change_bps or 0.0, 6) == -19.98002

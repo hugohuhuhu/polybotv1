@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from hashlib import md5
 
@@ -12,7 +13,7 @@ from app.utils.time_utils import minutes_to
 
 
 class LateResolutionScanner:
-    """Detect conservative near-close maker bids on highly likely outcomes."""
+    """Detect tightly confirmed near-close entries on highly likely outcomes."""
 
     def __init__(self, settings: Settings, liquidity_filter: LiquidityFilter) -> None:
         self.settings = settings
@@ -213,19 +214,34 @@ class LateResolutionScanner:
         taker_fallback_reasons: list[str] = []
         taker_fallback_thresholds: dict[str, float | bool] | None = None
         taker_fallback_trigger: str | None = None
+        last_trade_age_sec: float | None = None
+        if isinstance(book.last_trade_at, datetime):
+            last_trade_age_sec = max(
+                (utc_now() - book.last_trade_at.astimezone(timezone.utc)).total_seconds(),
+                0.0,
+            )
         if decision.variant == "crypto_updown":
             taker_fallback_thresholds = self._crypto_updown_taker_fallback_thresholds(
                 order_size=order_size,
                 required_start_distance=required_start_distance,
+                min_bid_depth=min_depth,
             )
             taker_fallback_reasons = self._crypto_updown_taker_fallback_reasons(
                 seconds_left=seconds_left,
                 best_ask=best_ask,
+                best_bid=best_bid,
                 spread=spread,
                 ask_depth=ask_depth,
+                bid_depth=bid_depth,
                 order_size=order_size,
                 crypto_start_distance=crypto_start_distance,
                 required_start_distance=required_start_distance,
+                last_trade_price=book.last_trade_price,
+                last_trade_age_sec=last_trade_age_sec,
+                last_trade_side=book.last_trade_side,
+                outcome_label=outcome_label,
+                market=market,
+                min_bid_depth=min_depth,
             )
         taker_fallback_eligible = decision.variant == "crypto_updown" and not taker_fallback_reasons
         entry_price = entry_bid
@@ -238,12 +254,15 @@ class LateResolutionScanner:
             entry_price = best_ask
             entry_bid = best_ask
             entry_execution_mode = "taker_fallback"
-            taker_fallback_trigger = "would_cross_post_only" if maker_would_cross else "tight_taker_window"
+            taker_fallback_trigger = "confirmed_taker_signal"
             order_type = "FAK"
             post_only = False
             expiration_sec = None
             execution_depth = ask_depth
-            entry_formula = f"{entry_formula}; taker fallback best_ask"
+            entry_formula = "confirmed taker FAK at best_ask with hard max price"
+        elif decision.variant == "crypto_updown" and self.settings.near_close_crypto_updown_taker_only_enabled:
+            reject(taker_fallback_reasons[0] if taker_fallback_reasons else "confirmed_taker_not_eligible")
+            return None
         elif maker_would_cross:
             reject("would_cross_post_only")
             return None
@@ -290,6 +309,10 @@ class LateResolutionScanner:
             "midpoint": midpoint,
             "bid_depth_at_best": bid_depth,
             "ask_depth_at_best": ask_depth,
+            "last_trade_price": book.last_trade_price,
+            "last_trade_at": book.last_trade_at.isoformat() if isinstance(book.last_trade_at, datetime) else None,
+            "last_trade_age_sec": last_trade_age_sec,
+            "last_trade_side": book.last_trade_side,
             "market_slug": market.slug,
             "token_id": book.token_id,
             "entry_bid": entry_price,
@@ -323,6 +346,8 @@ class LateResolutionScanner:
             "effective_max_spread": max_spread,
             "restricted": bool(market.restricted),
             "crypto_spot_price": market.raw.get("near_close_crypto_spot_price"),
+            "crypto_spot_updated_at": market.raw.get("near_close_crypto_spot_updated_at"),
+            "crypto_spot_age_sec": market.raw.get("near_close_crypto_spot_age_sec"),
             "crypto_strike_price": market.raw.get("near_close_crypto_strike_price"),
             "crypto_strike_distance": market.raw.get("near_close_crypto_strike_distance"),
             "crypto_start_price": market.raw.get("near_close_crypto_start_price"),
@@ -349,6 +374,8 @@ class LateResolutionScanner:
             "volatility_shadow_sample_count": market.raw.get("near_close_volatility_shadow_sample_count"),
             "volatility_shadow_ratio": market.raw.get("near_close_volatility_shadow_ratio"),
             "volatility_shadow_would_block": market.raw.get("near_close_volatility_shadow_would_block"),
+            "crypto_momentum_short_bps": market.raw.get("near_close_crypto_momentum_short_bps"),
+            "crypto_momentum_long_bps": market.raw.get("near_close_crypto_momentum_long_bps"),
             "crypto_winning_outcome": market.raw.get("near_close_crypto_winning_outcome"),
             "taker_fallback_enabled": bool(self.settings.near_close_crypto_updown_taker_fallback_enabled)
             if decision.variant == "crypto_updown"
@@ -358,6 +385,9 @@ class LateResolutionScanner:
             "taker_fallback_reasons": taker_fallback_reasons if decision.variant == "crypto_updown" else None,
             "taker_fallback_thresholds": taker_fallback_thresholds,
             "taker_fallback_price": best_ask if taker_fallback_eligible else None,
+            "taker_only_enabled": bool(self.settings.near_close_crypto_updown_taker_only_enabled)
+            if decision.variant == "crypto_updown"
+            else None,
             "tradable_live": bool(
                 self.settings.near_close_maker_live_enabled
                 and live_distance_allowed
@@ -392,13 +422,13 @@ class LateResolutionScanner:
         }
         if entry_execution_mode == "taker_fallback":
             summary = (
-                f"Near-close taker FAK buy {entry_price:.3f} on {outcome_label}; "
-                f"{minutes_left:.1f} minutes to close; strict crypto Up/Down fallback."
+                f"Near-close confirmed taker FAK buy {entry_price:.3f} on {outcome_label}; "
+                f"{seconds_left:.1f} seconds to resolution."
             )
-            title_suffix = "near-close taker fallback"
+            title_suffix = "near-close confirmed taker"
             suggested_action = (
                 f"Submit FAK taker buy {entry_price:.3f} on {outcome_label}; "
-                "strict fallback is live-eligible only inside the 30-45 second window."
+                "price, bid support, recent trade, momentum, and volatility confirmation passed."
             )
         else:
             summary = (
@@ -446,6 +476,7 @@ class LateResolutionScanner:
         *,
         order_size: float,
         required_start_distance: float | None,
+        min_bid_depth: float = 0.0,
     ) -> dict[str, float | bool]:
         min_seconds = max(float(self.settings.near_close_crypto_updown_taker_fallback_min_seconds), 0.0)
         max_seconds = max(float(self.settings.near_close_crypto_updown_taker_fallback_max_seconds), min_seconds)
@@ -462,10 +493,36 @@ class LateResolutionScanner:
             "max_spread": float(self.settings.near_close_crypto_updown_taker_fallback_max_spread),
             "min_ask_depth": max(
                 float(self.settings.near_close_crypto_updown_taker_fallback_min_ask_depth),
-                float(order_size),
+                float(order_size) * max(
+                    float(self.settings.near_close_crypto_updown_taker_min_ask_depth_multiplier),
+                    0.0,
+                ),
+            ),
+            "min_bid_depth": max(
+                float(min_bid_depth),
+                float(order_size) * max(
+                    float(self.settings.near_close_crypto_updown_taker_min_bid_depth_multiplier),
+                    0.0,
+                ),
             ),
             "min_start_distance_ratio": min_start_ratio,
             "min_start_distance": required_distance * min_start_ratio,
+            "spot_max_age_sec": max(
+                float(self.settings.near_close_crypto_updown_taker_spot_max_age_sec),
+                0.0,
+            ),
+            "recent_trade_max_age_sec": max(
+                float(self.settings.near_close_crypto_updown_taker_recent_trade_max_age_sec),
+                0.0,
+            ),
+            "require_buy_trade": bool(self.settings.near_close_crypto_updown_taker_require_buy_trade),
+            "require_momentum": bool(self.settings.near_close_crypto_updown_taker_require_momentum),
+            "require_volatility_data": bool(
+                self.settings.near_close_crypto_updown_taker_require_volatility_data
+            ),
+            "block_volatility_shadow": bool(
+                self.settings.near_close_crypto_updown_taker_block_volatility_shadow
+            ),
         }
 
     def _crypto_updown_taker_fallback_reasons(
@@ -473,15 +530,24 @@ class LateResolutionScanner:
         *,
         seconds_left: float,
         best_ask: float,
+        best_bid: float,
         spread: float,
         ask_depth: float,
+        bid_depth: float,
         order_size: float,
         crypto_start_distance: float | None,
         required_start_distance: float | None,
+        last_trade_price: float | None = None,
+        last_trade_age_sec: float | None = None,
+        last_trade_side: str | None = None,
+        outcome_label: str = "",
+        market: MarketRecord | None = None,
+        min_bid_depth: float = 0.0,
     ) -> list[str]:
         thresholds = self._crypto_updown_taker_fallback_thresholds(
             order_size=order_size,
             required_start_distance=required_start_distance,
+            min_bid_depth=min_bid_depth,
         )
         reasons: list[str] = []
         if not thresholds["enabled"]:
@@ -496,11 +562,52 @@ class LateResolutionScanner:
             reasons.append("taker_fallback_spread_above_max")
         if ask_depth < float(thresholds["min_ask_depth"]):
             reasons.append("taker_fallback_ask_depth_below_min")
+        if bid_depth < float(thresholds["min_bid_depth"]):
+            reasons.append("taker_confirmation_bid_depth_below_min")
         required_distance = float(thresholds["min_start_distance"])
         observed_distance = float(crypto_start_distance or 0.0)
         if required_distance > 0 and observed_distance < required_distance:
             reasons.append("taker_fallback_start_distance_below_ratio")
+        raw = market.raw if market is not None else {}
+        spot_age_sec = self._float_or_none(raw.get("near_close_crypto_spot_age_sec"))
+        spot_max_age_sec = float(thresholds["spot_max_age_sec"])
+        if spot_max_age_sec > 0 and (spot_age_sec is None or spot_age_sec > spot_max_age_sec):
+            reasons.append("taker_confirmation_spot_stale")
+        if bool(thresholds["require_volatility_data"]) and not bool(
+            raw.get("near_close_volatility_shadow_data_available")
+        ):
+            reasons.append("taker_confirmation_volatility_missing")
+        if bool(thresholds["block_volatility_shadow"]) and raw.get(
+            "near_close_volatility_shadow_would_block"
+        ) is True:
+            reasons.append("taker_confirmation_volatility_blocked")
+        if bool(thresholds["require_momentum"]):
+            short_momentum = self._float_or_none(raw.get("near_close_crypto_momentum_short_bps"))
+            long_momentum = self._float_or_none(raw.get("near_close_crypto_momentum_long_bps"))
+            expects_up = str(outcome_label).strip().lower() == "up"
+            momentum_valid = bool(
+                short_momentum is not None
+                and long_momentum is not None
+                and ((short_momentum > 0 and long_momentum > 0) if expects_up else (short_momentum < 0 and long_momentum < 0))
+            )
+            if not momentum_valid:
+                reasons.append("taker_confirmation_momentum_not_aligned")
+        recent_trade_max_age_sec = float(thresholds["recent_trade_max_age_sec"])
+        if recent_trade_max_age_sec > 0:
+            if last_trade_age_sec is None or last_trade_age_sec > recent_trade_max_age_sec:
+                reasons.append("taker_confirmation_recent_trade_stale")
+            if last_trade_price is None or last_trade_price < best_bid:
+                reasons.append("taker_confirmation_recent_trade_below_bid")
+        if bool(thresholds["require_buy_trade"]) and str(last_trade_side or "").upper() != "BUY":
+            reasons.append("taker_confirmation_recent_trade_not_buy")
         return reasons
+
+    @staticmethod
+    def _float_or_none(value: object) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _make_id(slug: str, token_id: str) -> str:

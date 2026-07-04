@@ -552,12 +552,28 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
             if (self._level_value(level, "price") or 0.0) <= max_price
         )
         required_depth = max(
-            min(float(desired_shares), float(self.settings.near_close_crypto_updown_taker_fallback_min_ask_depth)),
-            0.0,
+            float(thresholds.get("min_ask_depth") or 0.0)
+            if isinstance(thresholds, dict)
+            else float(self.settings.near_close_crypto_updown_taker_fallback_min_ask_depth),
+            float(desired_shares),
         )
         if ask_depth < required_depth:
             raise LiveTradingError(
                 f"Near-close taker blocked: current ask depth {ask_depth:.4f} is below {required_depth:.4f}."
+            )
+        bid_depth = sum(
+            self._level_value(level, "size") or 0.0
+            for level in bids
+            if (self._level_value(level, "price") or 0.0) >= best_bid
+        )
+        required_bid_depth = max(
+            float(thresholds.get("min_bid_depth") or 0.0) if isinstance(thresholds, dict) else 0.0,
+            float(desired_shares),
+        )
+        if bid_depth < required_bid_depth:
+            raise LiveTradingError(
+                f"Near-close taker blocked: current best-bid depth {bid_depth:.4f} "
+                f"is below {required_bid_depth:.4f}."
             )
 
         checked_at = datetime.now(timezone.utc)
@@ -590,6 +606,9 @@ class PolymarketLiveTradingAdapter(LiveTradingAdapter):
             "best_ask": best_ask,
             "spread": spread,
             "ask_depth_to_max_price": ask_depth,
+            "bid_depth_at_best": bid_depth,
+            "required_ask_depth": required_depth,
+            "required_bid_depth": required_bid_depth,
             "min_price": min_price,
             "max_price": max_price,
         }

@@ -197,7 +197,11 @@ def _near_close_taker_plan() -> ExecutionPlan:
         "entry_window_max_seconds": 45.0,
         "min_entry_price": 0.86,
         "max_entry_price": 0.90,
-        "taker_fallback_thresholds": {"max_spread": 0.02},
+        "taker_fallback_thresholds": {
+            "max_spread": 0.02,
+            "min_ask_depth": 6.25,
+            "min_bid_depth": 10.0,
+        },
     }
     return ExecutionPlan(
         opportunity_id="near-close-taker",
@@ -287,6 +291,35 @@ def test_near_close_taker_uses_refreshed_valid_best_ask(monkeypatch) -> None:
     assert fake_client.market_orders[0].price == pytest.approx(0.87)
     assert fake_client.market_orders[0].amount == pytest.approx(4.35)
     assert result.leg_results[0].response["pre_submit_snapshot"]["best_ask"] == pytest.approx(0.87)
+
+
+def test_near_close_taker_blocks_when_bid_support_is_pulled(monkeypatch) -> None:
+    fake_client = _FakeClient()
+    monkeypatch.setattr(
+        fake_client,
+        "get_order_book",
+        lambda _token_id: SimpleNamespace(
+            tick_size="0.01",
+            neg_risk=False,
+            bids=[SimpleNamespace(price="0.89", size="5")],
+            asks=[SimpleNamespace(price="0.90", size="50")],
+        ),
+    )
+    adapter = PolymarketLiveTradingAdapter(
+        Settings(
+            ENABLE_LIVE_TRADING=True,
+            POLYMARKET_PRIVATE_KEY="0x" + "1" * 64,
+            LIVE_ORDER_TYPE="FAK",
+            LIVE_MAX_ORDER_SIZE=25.0,
+        )
+    )
+    monkeypatch.setattr(adapter, "_get_authenticated_client", lambda: fake_client)
+
+    result = adapter._execute_sync(_near_close_taker_plan())
+
+    assert result.status == "failed"
+    assert "best-bid depth 5.0000 is below 10.0000" in result.message
+    assert fake_client.market_orders == []
 
 
 def test_preflight_reports_legacy_stack_before_cutover(monkeypatch) -> None:

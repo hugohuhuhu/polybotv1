@@ -57,6 +57,9 @@ class CryptoRangeObservation:
     sample_count: int
     window_start_ms: int
     window_end_ms: int
+    latest_close: float | None = None
+    short_change_bps: float | None = None
+    long_change_bps: float | None = None
 
 
 def _parse_chainlink_feeds(value: str | dict[str, str] | None) -> dict[str, str]:
@@ -242,11 +245,29 @@ class CryptoPriceClient:
                         return (symbol, end_ms), None
                     high = max(float(row[2]) for row in samples)
                     low = min(float(row[3]) for row in samples)
+                    closes = [(int(row[0]), float(row[4])) for row in samples if len(row) >= 5]
+                    latest_close = closes[-1][1] if closes else None
+
+                    def change_bps(seconds: int) -> float | None:
+                        if latest_close is None or latest_close <= 0 or not closes:
+                            return None
+                        target_ms = int(end_ms) - (seconds * 1000)
+                        reference = next(
+                            (close for timestamp, close in reversed(closes) if timestamp <= target_ms),
+                            closes[0][1],
+                        )
+                        if reference <= 0:
+                            return None
+                        return ((latest_close - reference) / reference) * 10_000.0
+
                     return (symbol, end_ms), CryptoRangeObservation(
                         range_bps=((high - low) / reference_price) * 10_000.0,
                         sample_count=len(samples),
                         window_start_ms=start_ms,
                         window_end_ms=int(end_ms),
+                        latest_close=latest_close,
+                        short_change_bps=change_bps(3),
+                        long_change_bps=change_bps(8),
                     )
                 except (httpx.HTTPError, IndexError, TypeError, ValueError):
                     return (symbol, end_ms), None

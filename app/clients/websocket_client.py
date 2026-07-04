@@ -101,6 +101,7 @@ class OrderBookState:
             asks=normalise_book_levels(payload.get("asks", []), "ask"),
             last_trade_price=current.last_trade_price if current else None,
             last_trade_at=current.last_trade_at if current else None,
+            last_trade_side=current.last_trade_side if current else None,
             updated_at=datetime.now(timezone.utc),
             source="ws",
         )
@@ -165,6 +166,7 @@ class OrderBookState:
         current = self.books.get(token_id) or OrderBookSnapshot(token_id=token_id, market_id=payload.get("market"))
         current.last_trade_price = safe_float(payload.get("price"))
         current.last_trade_at = self._event_timestamp(payload.get("timestamp"))
+        current.last_trade_side = str(payload.get("side") or "").upper() or None
         current.updated_at = datetime.now(timezone.utc)
         current.source = "ws"
         self.books[token_id] = current

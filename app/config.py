@@ -402,6 +402,42 @@ class Settings(BaseSettings):
         default=2.0,
         alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_FALLBACK_MIN_START_DISTANCE_RATIO",
     )
+    near_close_crypto_updown_taker_only_enabled: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_ONLY_ENABLED",
+    )
+    near_close_crypto_updown_taker_min_ask_depth_multiplier: float = Field(
+        default=1.25,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_MIN_ASK_DEPTH_MULTIPLIER",
+    )
+    near_close_crypto_updown_taker_min_bid_depth_multiplier: float = Field(
+        default=2.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_MIN_BID_DEPTH_MULTIPLIER",
+    )
+    near_close_crypto_updown_taker_spot_max_age_sec: float = Field(
+        default=0.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_SPOT_MAX_AGE_SEC",
+    )
+    near_close_crypto_updown_taker_recent_trade_max_age_sec: float = Field(
+        default=0.0,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_RECENT_TRADE_MAX_AGE_SEC",
+    )
+    near_close_crypto_updown_taker_require_buy_trade: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_BUY_TRADE",
+    )
+    near_close_crypto_updown_taker_require_momentum: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_MOMENTUM",
+    )
+    near_close_crypto_updown_taker_require_volatility_data: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_REQUIRE_VOLATILITY_DATA",
+    )
+    near_close_crypto_updown_taker_block_volatility_shadow: bool = Field(
+        default=False,
+        alias="NEAR_CLOSE_CRYPTO_UPDOWN_TAKER_BLOCK_VOLATILITY_SHADOW",
+    )
     near_close_post_fill_hedge_enabled: bool = Field(
         default=False,
         alias="NEAR_CLOSE_POST_FILL_HEDGE_ENABLED",
